@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .confirmation import handle_direct_user_instruction
+from .directives import handle_direct_user_instruction
 from .doctor import run_doctor
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
@@ -21,7 +21,14 @@ from .memory_eval import (
     load_memory_quality_cases,
 )
 from .paths import db_path, memassist_home
-from .policy import PolicyEngine, append_protected_path, default_policy_yaml, load_policy, remove_protected_path
+from .policy import (
+    PolicyEngine,
+    append_protected_path,
+    default_policy_yaml,
+    load_policy,
+    remove_protected_path,
+    remove_sensitive_path,
+)
 from .project import detect_project
 from .rag_eval import RagCase, RagExpectation, evaluate_rag, load_rag_cases
 from .retrieval import build_memory_pack, render_prompt_context
@@ -72,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     mem_add.add_argument("--path", action="append", default=[])
     mem_add.add_argument("--importance", type=float, default=0.5)
     mem_add.add_argument("--confidence", type=float, default=0.8)
-    mem_add.add_argument("--enforcement", choices=["none", "warn", "require_approval", "block"], default="none")
+    mem_add.add_argument("--enforcement", choices=["none", "warn", "block"], default="none")
     mem_add.set_defaults(func=cmd_memory_add)
 
     mem_list = memory_sub.add_parser("list", help="list memories")
@@ -108,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     mem_supersede.add_argument("old_id")
     mem_supersede.add_argument("new_id")
     mem_supersede.set_defaults(func=cmd_memory_supersede)
-    mem_rollback = memory_sub.add_parser("rollback", help="reject a memory and remove its protected path if present")
+    mem_rollback = memory_sub.add_parser("rollback", help="reject a memory and remove its policy path if present")
     mem_rollback.add_argument("id")
     mem_rollback.add_argument("--protected-path")
     mem_rollback.set_defaults(func=cmd_memory_rollback)
@@ -117,17 +124,17 @@ def build_parser() -> argparse.ArgumentParser:
     mem_links.add_argument("--json", action="store_true")
     mem_links.set_defaults(func=cmd_memory_links)
 
-    mem_review = memory_sub.add_parser("review", help="list draft memories")
-    mem_review.add_argument("--json", action="store_true")
-    mem_review.set_defaults(func=cmd_memory_review)
+    mem_drafts = memory_sub.add_parser("drafts", help="list draft memories")
+    mem_drafts.add_argument("--json", action="store_true")
+    mem_drafts.set_defaults(func=cmd_memory_drafts)
 
-    mem_approve = memory_sub.add_parser("approve", help="activate a draft memory")
-    mem_approve.add_argument("id")
-    mem_approve.set_defaults(func=cmd_memory_approve)
+    mem_activate = memory_sub.add_parser("activate", help="activate a memory")
+    mem_activate.add_argument("id")
+    mem_activate.set_defaults(func=cmd_memory_activate)
 
-    mem_reject = memory_sub.add_parser("reject", help="disable a draft memory")
-    mem_reject.add_argument("id")
-    mem_reject.set_defaults(func=cmd_memory_reject)
+    mem_deactivate = memory_sub.add_parser("deactivate", help="disable a memory")
+    mem_deactivate.add_argument("id")
+    mem_deactivate.set_defaults(func=cmd_memory_deactivate)
 
     mem_cleanup = memory_sub.add_parser("cleanup", help="expire stale memories")
     mem_cleanup.add_argument("--json", action="store_true")
@@ -424,11 +431,14 @@ def cmd_memory_rollback(args: argparse.Namespace) -> int:
             return 1
         path = args.protected_path or (memory.paths[0] if memory.paths else None)
         if path:
-            removed = remove_protected_path(project.root, path)
+            if memory.enforcement == "warn" or memory.status == "warn_policy":
+                removed = remove_sensitive_path(project.root, path)
+            else:
+                removed = remove_protected_path(project.root, path)
         store.update_status(args.id, "rejected")
     print(f"rolled back {args.id}")
     if args.protected_path or removed:
-        print(("removed" if removed else "not present") + f" protected path: {args.protected_path or path}")
+        print(("removed" if removed else "not present") + f" policy path: {args.protected_path or path}")
     return 0
 
 
@@ -446,7 +456,7 @@ def cmd_memory_links(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_memory_review(args: argparse.Namespace) -> int:
+def cmd_memory_drafts(args: argparse.Namespace) -> int:
     project = detect_project()
     with _store() as store:
         memories = store.list_memories(project_id=project.id, include_global=True, status="draft")
@@ -457,17 +467,17 @@ def cmd_memory_review(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_memory_approve(args: argparse.Namespace) -> int:
+def cmd_memory_activate(args: argparse.Namespace) -> int:
     with _store() as store:
         store.update_status(args.id, "active")
-    print(f"approved {args.id}")
+    print(f"activated {args.id}")
     return 0
 
 
-def cmd_memory_reject(args: argparse.Namespace) -> int:
+def cmd_memory_deactivate(args: argparse.Namespace) -> int:
     with _store() as store:
         store.update_status(args.id, "disabled")
-    print(f"rejected {args.id}")
+    print(f"deactivated {args.id}")
     return 0
 
 
@@ -521,7 +531,7 @@ def cmd_policy_check(args: argparse.Namespace) -> int:
         payload["path"] = args.path
     decision = engine.check_pre_tool(tool=args.tool, args=payload)
     _print_json(decision.as_dict())
-    return 1 if decision.action == "deny" else 0
+    return 1 if decision.action in {"deny", "block"} else 0
 
 
 def cmd_policy_promote(args: argparse.Namespace) -> int:
@@ -534,7 +544,8 @@ def cmd_policy_promote(args: argparse.Namespace) -> int:
         changed = append_protected_path(project.root, args.protected_path)
         paths = list(dict.fromkeys([*memory.paths, args.protected_path]))
         store.update_paths(args.memory_id, paths)
-        store.update_status(args.memory_id, "policy_active")
+        store.update_enforcement(args.memory_id, "block")
+        store.update_status(args.memory_id, "block_policy")
     print(("added" if changed else "already present") + f" protected path: {args.protected_path}")
     return 0
 
@@ -962,12 +973,12 @@ def _codex_pre_tool_use_output(action: str, reason: str) -> dict[str, Any]:
                 "permissionDecisionReason": reason,
             }
         }
-    if action == "require_approval":
+    if action == "block":
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": f"{reason}; explicit user approval required before retrying.",
+                "permissionDecisionReason": f"{reason}; blocked by autonomous memory policy.",
             }
         }
     if action == "warn":

@@ -74,10 +74,13 @@ def process_session_lifecycle(
                 "draft",
                 "auto_active",
                 "active",
-                "policy_active",
+                "warn_policy",
+                "block_policy",
                 "pinned",
                 "ephemeral",
                 "long_term",
+                "durable",
+                "decaying",
             ),
         )
         if duplicate:
@@ -161,7 +164,8 @@ def process_session_lifecycle(
 
 
 def cleanup_memories(store: Store) -> CleanupResult:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="seconds")
     rows = store.conn.execute(
         """
         SELECT id FROM memories
@@ -174,10 +178,34 @@ def cleanup_memories(store: Store) -> CleanupResult:
     expired = [str(row["id"]) for row in rows]
     for memory_id in expired:
         store.update_status(memory_id, "expired")
+    decay_rows = store.conn.execute(
+        """
+        SELECT id, created_at, updated_at, last_used_at, strength, half_life_days, status
+        FROM memories
+        WHERE status IN ('active', 'auto_active', 'long_term', 'durable', 'decaying')
+        """
+    ).fetchall()
+    for row in decay_rows:
+        status = str(row["status"])
+        half_life_days = max(float(row["half_life_days"] or 30.0), 1.0)
+        anchor = row["last_used_at"] or row["updated_at"] or row["created_at"]
+        try:
+            anchor_dt = datetime.fromisoformat(str(anchor))
+        except ValueError:
+            continue
+        if anchor_dt.tzinfo is None:
+            anchor_dt = anchor_dt.replace(tzinfo=timezone.utc)
+        age_days = max((now_dt - anchor_dt).total_seconds() / 86400.0, 0.0)
+        decayed_strength = float(row["strength"] or 0.0) * (0.5 ** (age_days / half_life_days))
+        if status == "decaying" and decayed_strength < 0.15:
+            store.update_status(str(row["id"]), "expired")
+            expired.append(str(row["id"]))
+        elif status not in {"durable", "long_term"} and decayed_strength < 0.25:
+            store.update_status(str(row["id"]), "decaying")
     stale_rows = store.conn.execute(
         """
         SELECT id FROM memories
-        WHERE status = 'candidate'
+        WHERE status IN ('candidate', 'decaying')
           AND updated_at <= datetime('now', '-14 days')
         """
     ).fetchall()
@@ -194,8 +222,8 @@ def cleanup_memories(store: Store) -> CleanupResult:
          AND old.type = new.type
          AND lower(old.content) = lower(new.content)
          AND old.id != new.id
-        WHERE old.status IN ('active', 'auto_active', 'long_term')
-          AND new.status IN ('active', 'auto_active', 'long_term')
+        WHERE old.status IN ('active', 'auto_active', 'long_term', 'durable', 'warn_policy', 'block_policy')
+          AND new.status IN ('active', 'auto_active', 'long_term', 'durable', 'warn_policy', 'block_policy')
           AND old.updated_at < new.updated_at
         """
     ).fetchall()

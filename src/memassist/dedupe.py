@@ -6,15 +6,16 @@ from dataclasses import dataclass
 from .models import Memory
 
 
-ACTIVE_STRONG_STATUSES = {"active", "auto_active", "long_term", "policy_active", "pinned"}
+ACTIVE_STRONG_STATUSES = {"active", "auto_active", "long_term", "durable", "warn_policy", "block_policy", "pinned"}
 INACTIVE_STATUSES = {"candidate", "draft", "stale"}
 PROTECTIVE_TERMS = {
-    "approval",
-    "approve",
-    "confirmation",
-    "승인",
     "확인",
     "허락",
+    "block",
+    "forbid",
+    "protect",
+    "금지",
+    "막아",
 }
 
 SYNONYMS = {
@@ -24,8 +25,7 @@ SYNONYMS = {
     "정책": "policy",
     "변경": "change",
     "수정": "change",
-    "승인": "approval",
-    "확인": "approval",
+    "확인": "policy",
     "인증": "auth",
     "세션": "session",
 }
@@ -78,7 +78,7 @@ def find_semantic_duplicate(
 def should_suppress_candidate(candidate_status: str, duplicate: Memory) -> bool:
     if candidate_status in INACTIVE_STATUSES and duplicate.status in ACTIVE_STRONG_STATUSES:
         return True
-    if candidate_status == "candidate" and duplicate.status == "policy_active":
+    if candidate_status == "candidate" and duplicate.status in {"warn_policy", "block_policy"}:
         return True
     return False
 
@@ -97,14 +97,16 @@ def _is_stronger(memory_status: str, candidate_status: str) -> bool:
         "active": 2,
         "auto_active": 2,
         "long_term": 3,
-        "policy_active": 4,
+        "durable": 4,
+        "warn_policy": 4,
+        "block_policy": 4,
         "pinned": 5,
     }
     return rank.get(memory_status, 0) > rank.get(candidate_status, 0)
 
 
 def _is_protective(content: str, enforcement: str) -> bool:
-    if enforcement in {"require_approval", "block"}:
+    if enforcement in {"warn", "block"}:
         return True
     text = content.lower()
     return any(term in text for term in PROTECTIVE_TERMS)

@@ -14,7 +14,7 @@
         },
         {
           "type": "preference",
-          "content": "Do not touch refresh token policy without confirmation.",
+          "content": "Keep refresh token policy changes as an internal blocked memory policy.",
           "tags": ["auth", "token"],
           "status": "candidate",
           "importance": 0.9

@@ -55,8 +55,8 @@ PROTECTION_TERMS = [
     "don't",
     "never",
     "must not",
-    "without approval",
-    "승인 없이",
+    "without asking",
+    "묻지 않고",
     "건드리지",
     "수정하지",
     "바꾸지",
@@ -114,8 +114,8 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
             memory_kind=memory_kind,
             enforcement="none",
             reason=(
-                "Potentially strong or risky memory is kept as an inactive candidate; "
-                "only direct user policy instructions can activate enforcement."
+                "Potentially strong or risky inferred memory is kept inactive; "
+                "autonomous policy escalation only comes from direct user directives."
             ),
         )
 

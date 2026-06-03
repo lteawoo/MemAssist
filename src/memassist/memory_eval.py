@@ -5,12 +5,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .eval_seed import SeedMemory, insert_seed_memories, remove_seed_memories, seed_from_value
+from .eval_seed import (
+    SeedMemory,
+    insert_seed_memories,
+    remove_seed_memories,
+    remove_seed_memories_by_source,
+    seed_from_value,
+)
 from .models import Memory
 from .storage import Store
 
 
-ACTIVE_STATUSES = {"active", "auto_active", "long_term", "policy_active", "pinned"}
+ACTIVE_STATUSES = {"active", "auto_active", "long_term", "durable", "warn_policy", "block_policy", "pinned"}
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,7 @@ def evaluate_memory_quality(
     stale_hits = 0
 
     for case in cases:
+        remove_seed_memories_by_source(store, project_id=project_id, source_kind="memory_eval_seed")
         seed_ids = insert_seed_memories(
             store,
             project_id=project_id,
@@ -96,13 +103,16 @@ def evaluate_memory_quality(
             forbidden_hits = _matched_terms(retrieved, case.forbid, set(case.forbid_statuses))
             stale = [memory.id for memory in retrieved if memory.status in {"stale", "expired", "superseded", "disabled"}]
             wrong_policy = [
-                term for term in case.forbid for memory in retrieved if memory.status == "policy_active" and _contains(memory, term)
+                term
+                for term in case.forbid
+                for memory in retrieved
+                if memory.status in {"warn_policy", "block_policy"} and _contains(memory, term)
             ]
             wrong_promotion = [
                 term
                 for term in case.forbid
                 for memory in retrieved
-                if memory.status in {"long_term", "policy_active", "pinned"} and _contains(memory, term)
+                if memory.status in {"long_term", "durable", "warn_policy", "block_policy", "pinned"} and _contains(memory, term)
             ]
         finally:
             remove_seed_memories(store, seed_ids)

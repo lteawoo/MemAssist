@@ -262,7 +262,9 @@ def _api_memories(query: dict[str, str]) -> dict[str, Any]:
             {where}
             ORDER BY
               CASE status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-              CASE status WHEN 'policy_active' THEN 1 ELSE 0 END DESC,
+              CASE status WHEN 'block_policy' THEN 1 ELSE 0 END DESC,
+              CASE status WHEN 'warn_policy' THEN 1 ELSE 0 END DESC,
+              CASE status WHEN 'durable' THEN 1 ELSE 0 END DESC,
               importance DESC,
               updated_at DESC
             LIMIT ?
@@ -575,6 +577,11 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         status=str(row["status"]),
         importance=float(row["importance"]),
         confidence=float(row["confidence"]),
+        strength=float(row["strength"]),
+        recurrence=int(row["recurrence"]),
+        retrieval_count=int(row["retrieval_count"]),
+        utility=float(row["utility"]),
+        half_life_days=float(row["half_life_days"]),
         enforcement=str(row["enforcement"]),
         source_kind=str(row["source_kind"]),
         source_ref=row["source_ref"],
@@ -987,7 +994,7 @@ def _dashboard_html() -> str:
     }}
     function decision(value) {{
       if (!value) return "";
-      const klass = value === "deny" || value === "require_approval" ? "bad" : value === "warn" ? "warn" : "";
+      const klass = value === "deny" || value === "block" ? "bad" : value === "warn" ? "warn" : "";
       return `<span class="pill ${{klass}}">${{esc(value)}}</span>`;
     }}
     function risk(value) {{

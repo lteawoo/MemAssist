@@ -12,6 +12,7 @@ MEMORY_TYPES = {
     "lesson",
     "workflow",
     "open_thread",
+    "directive",
 }
 
 MEMORY_STATUSES = {
@@ -20,19 +21,23 @@ MEMORY_STATUSES = {
     "draft",
     "auto_active",
     "long_term",
+    "durable",
     "active",
-    "policy_active",
+    "warn_policy",
+    "block_policy",
     "pinned",
     "ephemeral",
+    "decaying",
     "rejected",
     "stale",
     "superseded",
     "disabled",
     "expired",
     "deleted",
+    "tombstoned",
 }
 
-ENFORCEMENTS = {"none", "warn", "require_approval", "block"}
+ENFORCEMENTS = {"none", "warn", "block"}
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,11 @@ class Memory:
     status: str
     importance: float
     confidence: float
+    strength: float
+    recurrence: int
+    retrieval_count: int
+    utility: float
+    half_life_days: float
     enforcement: str
     source_kind: str
     source_ref: str | None
@@ -72,6 +82,11 @@ class Memory:
             "status": self.status,
             "importance": self.importance,
             "confidence": self.confidence,
+            "strength": self.strength,
+            "recurrence": self.recurrence,
+            "retrieval_count": self.retrieval_count,
+            "utility": self.utility,
+            "half_life_days": self.half_life_days,
             "enforcement": self.enforcement,
             "source_kind": self.source_kind,
             "source_ref": self.source_ref,

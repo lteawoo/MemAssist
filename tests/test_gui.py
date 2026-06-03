@@ -247,11 +247,11 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                 scope_type="project",
                 project_id=project.id,
                 type="rule",
-                content="Do not edit locked files without approval.",
+                content="Blocked memory policy for locked files.",
                 tags=["policy"],
                 paths=["src/locked.py"],
-                status="policy_active",
-                enforcement="require_approval",
+                status="block_policy",
+                enforcement="block",
             )
             store.add_trace_event(
                 session_id="sess_gui_readonly",

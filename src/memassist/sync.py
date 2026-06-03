@@ -28,7 +28,11 @@ def export_memories(store: Store, *, project_id: str, path: Path, include_all: b
     )
     payload = {
         "schema_version": SYNC_SCHEMA_VERSION,
-        "memories": [_exportable(memory) for memory in memories if include_all or memory.status in {"active", "pinned"}],
+        "memories": [
+            _exportable(memory)
+            for memory in memories
+            if include_all or memory.status in {"active", "auto_active", "long_term", "durable", "warn_policy", "block_policy", "pinned"}
+        ],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -72,6 +76,11 @@ def import_memories(store: Store, *, project_id: str, path: Path, activate: bool
             status="active" if activate else "draft",
             importance=memory["importance"],
             confidence=memory["confidence"],
+            strength=memory["strength"],
+            recurrence=memory["recurrence"],
+            retrieval_count=memory["retrieval_count"],
+            utility=memory["utility"],
+            half_life_days=memory["half_life_days"],
             enforcement=memory["enforcement"],
             source_kind="import",
             source_ref=str(path),
@@ -92,6 +101,11 @@ def _exportable(memory: Memory) -> dict[str, object]:
         "status",
         "importance",
         "confidence",
+        "strength",
+        "recurrence",
+        "retrieval_count",
+        "utility",
+        "half_life_days",
         "enforcement",
         "source_kind",
         "source_ref",
@@ -116,6 +130,11 @@ def _normalize_import(raw: dict[str, object]) -> dict[str, object]:
         "paths": _string_list(raw.get("paths")),
         "importance": _float(raw.get("importance"), 0.5),
         "confidence": _float(raw.get("confidence"), 0.6),
+        "strength": _float(raw.get("strength"), 0.6),
+        "recurrence": int(_float(raw.get("recurrence"), 1)),
+        "retrieval_count": int(_float(raw.get("retrieval_count"), 0)),
+        "utility": _float(raw.get("utility"), 0.0),
+        "half_life_days": _float(raw.get("half_life_days"), 30.0),
         "enforcement": enforcement if enforcement in ENFORCEMENTS else "none",
     }
 

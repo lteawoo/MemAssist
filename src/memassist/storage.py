@@ -58,6 +58,11 @@ class Store:
               status TEXT NOT NULL,
               importance REAL NOT NULL,
               confidence REAL NOT NULL,
+              strength REAL NOT NULL DEFAULT 0.5,
+              recurrence INTEGER NOT NULL DEFAULT 1,
+              retrieval_count INTEGER NOT NULL DEFAULT 0,
+              utility REAL NOT NULL DEFAULT 0.0,
+              half_life_days REAL NOT NULL DEFAULT 30.0,
               enforcement TEXT NOT NULL,
               source_kind TEXT NOT NULL,
               source_ref TEXT,
@@ -106,6 +111,7 @@ class Store:
             );
             """
         )
+        self._ensure_memory_lifecycle_columns()
         try:
             self.conn.execute(
                 """
@@ -124,6 +130,19 @@ class Store:
                 """
             )
         self.conn.commit()
+
+    def _ensure_memory_lifecycle_columns(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(memories)").fetchall()}
+        defaults = {
+            "strength": "REAL NOT NULL DEFAULT 0.5",
+            "recurrence": "INTEGER NOT NULL DEFAULT 1",
+            "retrieval_count": "INTEGER NOT NULL DEFAULT 0",
+            "utility": "REAL NOT NULL DEFAULT 0.0",
+            "half_life_days": "REAL NOT NULL DEFAULT 30.0",
+        }
+        for name, definition in defaults.items():
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
 
     def upsert_project(self, project: Project) -> None:
         ts = now_iso()
@@ -154,6 +173,11 @@ class Store:
         status: str = "active",
         importance: float = 0.5,
         confidence: float = 0.8,
+        strength: float | None = None,
+        recurrence: int = 1,
+        retrieval_count: int = 0,
+        utility: float = 0.0,
+        half_life_days: float | None = None,
         enforcement: str = "none",
         source_kind: str = "manual",
         source_ref: str | None = None,
@@ -171,15 +195,17 @@ class Store:
         ts = now_iso()
         tags = tags or []
         paths = paths or []
+        strength = _clamp(strength if strength is not None else (importance + confidence) / 2)
+        half_life_days = half_life_days if half_life_days is not None else _default_half_life_days(type, status, enforcement)
         self.conn.execute(
             """
             INSERT INTO memories (
               id, scope_type, project_id, session_id, type, content, reason,
               tags_json, paths_json, status, importance, confidence,
-              enforcement, source_kind, source_ref, created_at, updated_at,
-              expires_at
+              strength, recurrence, retrieval_count, utility, half_life_days,
+              enforcement, source_kind, source_ref, created_at, updated_at, expires_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory_id,
@@ -194,6 +220,11 @@ class Store:
                 status,
                 importance,
                 confidence,
+                strength,
+                recurrence,
+                retrieval_count,
+                utility,
+                half_life_days,
                 enforcement,
                 source_kind,
                 source_ref,
@@ -309,7 +340,7 @@ class Store:
         project_id: str | None,
         limit: int = 10,
     ) -> list[Memory]:
-        active_statuses = ("active", "auto_active", "long_term", "policy_active", "pinned")
+        active_statuses = ("active", "auto_active", "long_term", "durable", "warn_policy", "block_policy", "pinned")
         scope_clause = "(m.scope_type = 'global' OR m.project_id = ?)"
         params: list[Any] = [_fts_query(query), project_id, *active_statuses]
         try:
@@ -320,12 +351,16 @@ class Store:
                 JOIN memories m ON m.id = memory_fts.memory_id
                 WHERE memory_fts MATCH ?
                   AND {scope_clause}
-                  AND m.status IN (?, ?, ?, ?, ?)
+                  AND m.status IN (?, ?, ?, ?, ?, ?, ?)
                 ORDER BY
                   CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'policy_active' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'block_policy' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'warn_policy' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'durable' THEN 1 ELSE 0 END DESC,
                   CASE m.status WHEN 'long_term' THEN 1 ELSE 0 END DESC,
                   text_score ASC,
+                  m.strength DESC,
+                  m.utility DESC,
                   m.confidence DESC,
                   m.importance DESC
                 LIMIT ?
@@ -340,11 +375,15 @@ class Store:
                 FROM memories m
                 WHERE (m.content LIKE ? OR m.tags_json LIKE ?)
                   AND {scope_clause}
-                  AND m.status IN (?, ?, ?, ?, ?)
+                  AND m.status IN (?, ?, ?, ?, ?, ?, ?)
                 ORDER BY
                   CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'policy_active' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'block_policy' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'warn_policy' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'durable' THEN 1 ELSE 0 END DESC,
                   CASE m.status WHEN 'long_term' THEN 1 ELSE 0 END DESC,
+                  m.strength DESC,
+                  m.utility DESC,
                   m.confidence DESC,
                   m.importance DESC,
                   m.updated_at DESC
@@ -398,7 +437,14 @@ class Store:
 
     def touch_memory(self, memory_id: str) -> None:
         self.conn.execute(
-            "UPDATE memories SET last_used_at = ? WHERE id = ?",
+            """
+            UPDATE memories
+            SET last_used_at = ?,
+                retrieval_count = retrieval_count + 1,
+                utility = min(1.0, utility + 0.02),
+                strength = min(1.0, strength + 0.01)
+            WHERE id = ?
+            """,
             (now_iso(), memory_id),
         )
         self.conn.commit()
@@ -546,16 +592,20 @@ class Store:
             return None
         confidence = min(1.0, memory.confidence + confidence_delta)
         importance = min(1.0, memory.importance + importance_delta)
+        strength = min(1.0, memory.strength + 0.08)
+        recurrence = memory.recurrence + 1
         status = memory.status
-        if status in {"auto_active", "active"} and confidence >= 0.85 and importance >= 0.75:
-            status = "long_term"
+        if status in {"auto_active", "active", "long_term"} and (
+            confidence >= 0.85 and importance >= 0.75 and recurrence >= 2
+        ):
+            status = "durable"
         self.conn.execute(
             """
             UPDATE memories
-            SET confidence = ?, importance = ?, status = ?, updated_at = ?
+            SET confidence = ?, importance = ?, strength = ?, recurrence = ?, status = ?, updated_at = ?
             WHERE id = ?
             """,
-            (confidence, importance, status, now_iso(), memory_id),
+            (confidence, importance, strength, recurrence, status, now_iso(), memory_id),
         )
         self.conn.commit()
         return self.get_memory(memory_id)
@@ -673,6 +723,11 @@ class Store:
             status=row["status"],
             importance=row["importance"],
             confidence=row["confidence"],
+            strength=row["strength"],
+            recurrence=row["recurrence"],
+            retrieval_count=row["retrieval_count"],
+            utility=row["utility"],
+            half_life_days=row["half_life_days"],
             enforcement=row["enforcement"],
             source_kind=row["source_kind"],
             source_ref=row["source_ref"],
@@ -703,7 +758,7 @@ def _memory_index_text(
     enforcement: str,
 ) -> str:
     section = "context"
-    if type == "rule" or enforcement in {"warn", "require_approval", "block"}:
+    if type == "rule" or enforcement in {"warn", "block"}:
         section = "policy"
     elif type == "workflow" or set(tags) & {"test", "tests", "verification", "verify", "ci"}:
         section = "verifier"
@@ -721,3 +776,23 @@ def _memory_index_text(
         ]
         if part
     )
+
+
+def _default_half_life_days(type: str, status: str, enforcement: str) -> float:
+    if status in {"pinned", "block_policy"} or enforcement == "block":
+        return 3650.0
+    if status in {"durable", "long_term", "warn_policy"}:
+        return 180.0
+    if type == "workflow":
+        return 120.0
+    if type in {"decision", "preference", "rule", "directive"}:
+        return 90.0
+    if type in {"lesson", "fact"}:
+        return 45.0
+    if type == "open_thread":
+        return 7.0
+    return 30.0
+
+
+def _clamp(value: float) -> float:
+    return max(0.0, min(1.0, value))

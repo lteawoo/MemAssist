@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .eval_seed import SeedMemory, insert_seed_memories, remove_seed_memories, seed_from_value
+from .eval_seed import (
+    SeedMemory,
+    insert_seed_memories,
+    remove_seed_memories,
+    remove_seed_memories_by_source,
+    seed_from_value,
+)
 from .models import Memory
 from .storage import Store
 
@@ -72,6 +78,7 @@ def evaluate_retrieval(
     forbidden_hits = 0
 
     for case in cases:
+        remove_seed_memories_by_source(store, project_id=project_id, source_kind="retrieval_eval_seed")
         seed_ids = insert_seed_memories(
             store,
             project_id=project_id,

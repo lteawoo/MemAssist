@@ -41,7 +41,7 @@ def summarize_session(events: list[Row]) -> SessionSummary:
     for event in events:
         if event["tool_name"]:
             tools.add(str(event["tool_name"]))
-        if event["policy_decision"] in {"deny", "require_approval"}:
+        if event["policy_decision"] in {"block", "deny"}:
             denied_events += 1
         for file in json.loads(event["files_json"] or "[]"):
             files.add(str(file))

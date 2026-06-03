@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 import uuid
 
+from .models import ENFORCEMENTS, MEMORY_STATUSES
 from .storage import Store
 
 
@@ -20,15 +21,17 @@ class SeedMemory:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "SeedMemory":
+        status = str(value.get("status") or "active")
+        enforcement = str(value.get("enforcement") or "none")
         return cls(
             type=str(value.get("type") or "fact"),
             content=str(value.get("content", "")),
             tags=_string_list(value.get("tags")),
             paths=_string_list(value.get("paths")),
-            status=str(value.get("status") or "active"),
+            status=status if status in MEMORY_STATUSES else "active",
             importance=float(value.get("importance", 0.8)),
             confidence=float(value.get("confidence", 0.85)),
-            enforcement=str(value.get("enforcement") or "none"),
+            enforcement=enforcement if enforcement in ENFORCEMENTS else "none",
         )
 
 
@@ -71,6 +74,14 @@ def remove_seed_memories(store: Store, memory_ids: list[str]) -> None:
     store.conn.execute(f"DELETE FROM memory_fts WHERE memory_id IN ({placeholders})", memory_ids)
     store.conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", memory_ids)
     store.conn.commit()
+
+
+def remove_seed_memories_by_source(store: Store, *, project_id: str, source_kind: str) -> None:
+    rows = store.conn.execute(
+        "SELECT id FROM memories WHERE project_id = ? AND source_kind = ?",
+        (project_id, source_kind),
+    ).fetchall()
+    remove_seed_memories(store, [str(row["id"]) for row in rows])
 
 
 def _string_list(value: object) -> list[str]:

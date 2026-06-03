@@ -15,6 +15,7 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
     total = _weighted_total(scores)
     status = base.status
     decision = base.decision
+    enforcement = base.enforcement
     reason = base.reason
 
     if status == "candidate" and decision != "keep_candidate" and total >= 0.68:
@@ -22,9 +23,9 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
         decision = "auto_activate"
         reason = "Candidate met the memory quality threshold after evidence and specificity scoring."
     elif status == "auto_active" and scores["repeat_score"] >= 0.75 and total >= 0.78:
-        status = "long_term"
-        decision = "promote_long_term"
-        reason = "Repeated high-quality memory was promoted to long-term memory."
+        status = "durable"
+        decision = "promote_durable"
+        reason = "Repeated high-quality memory was promoted to durable memory."
     elif decision == "keep_candidate" and scores["conflict_score"] < 0.35:
         status = "rejected"
         decision = "reject_conflict"
@@ -33,8 +34,19 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
         status = "rejected"
         decision = "reject_low_quality"
         reason = "Risky candidate did not meet minimum evidence quality for inactive storage."
+    elif decision == "keep_candidate" and candidate.type in {"rule", "lesson"} and total >= 0.72:
+        enforcement = "warn"
+        reason = "Risky inferred memory is retained as a reminder with warning semantics, not a gate."
 
-    return replace(base, decision=decision, status=status, reason=reason, scores=scores, total_score=total)
+    return replace(
+        base,
+        decision=decision,
+        status=status,
+        enforcement=enforcement,
+        reason=reason,
+        scores=scores,
+        total_score=total,
+    )
 
 
 def _score_candidate(candidate: MemoryCandidate, *, existing_memories: list[Memory]) -> dict[str, float]:

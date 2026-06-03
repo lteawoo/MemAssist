@@ -36,7 +36,7 @@ def simulate_protected_path(project_root: Path, path: str) -> PolicySimulationRe
         args={"command": command},
     )
     return PolicySimulationResult(
-        passed=decision.action in {"require_approval", "deny"},
+        passed=decision.action in {"block", "deny", "warn"},
         path=path,
         action=decision.action,
         reason=decision.reason,

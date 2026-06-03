@@ -9,10 +9,12 @@ from .models import Memory
 from .storage import Store
 
 
-ACTIVE_STATUSES = {"active", "auto_active", "long_term", "policy_active", "pinned"}
+ACTIVE_STATUSES = {"active", "auto_active", "long_term", "durable", "warn_policy", "block_policy", "pinned"}
 STATUS_WEIGHT = {
     "pinned": 1.0,
-    "policy_active": 0.95,
+    "block_policy": 0.98,
+    "warn_policy": 0.92,
+    "durable": 0.90,
     "long_term": 0.85,
     "auto_active": 0.70,
     "active": 0.65,
@@ -97,7 +99,7 @@ MEDIUM_RISK_TERMS = {
     "rank",
 }
 VERIFIER_TERMS = {"test", "tests", "verify", "verification", "ci", "coverage", "run", "assert", "failing"}
-POLICY_TERMS = {"policy", "rule", "approval", "block", "warn", "permission", "security", "secret", "auth"}
+POLICY_TERMS = {"policy", "rule", "block", "warn", "permission", "security", "secret", "auth", "protect"}
 
 
 @dataclass(frozen=True)
@@ -285,7 +287,7 @@ def _metadata_channel(query: str, intent: QueryIntent, memories: list[Memory]) -
         memory
         for memory in memories
         if _metadata_score(query, intent, memory) > 0
-        or memory.status in {"pinned", "long_term"}
+        or memory.status in {"pinned", "long_term", "durable"}
         or memory.type in {"lesson", "decision", "open_thread"}
     ]
     return sorted(relevant, key=lambda memory: _metadata_score(query, intent, memory), reverse=True)[:20]
@@ -297,7 +299,7 @@ def _policy_channel(query: str, intent: QueryIntent, memories: list[Memory]) -> 
     policy_memories = [
         memory
         for memory in memories
-        if memory.type == "rule" or memory.enforcement in {"warn", "require_approval", "block"}
+        if memory.type == "rule" or memory.enforcement in {"warn", "block"} or memory.status in {"warn_policy", "block_policy"}
     ]
     return sorted(policy_memories, key=lambda memory: _section_score(query, intent, memory, "policy"), reverse=True)[:12]
 
@@ -358,7 +360,7 @@ def _section_memories(
 
 def _belongs_to_section(memory: Memory, section: str) -> bool:
     if section == "policy":
-        return memory.type == "rule" or memory.enforcement in {"warn", "require_approval", "block"}
+        return memory.type == "rule" or memory.enforcement in {"warn", "block"} or memory.status in {"warn_policy", "block_policy"}
     if section == "verifier":
         return _is_verifier_memory(memory)
     return memory.type != "rule" or memory.enforcement == "none" or memory.type in {"lesson", "decision", "open_thread"}
@@ -388,8 +390,6 @@ def _section_score(query: str, intent: QueryIntent, memory: Memory, section: str
     if section == "policy":
         if memory.enforcement == "block":
             base += 1.5
-        elif memory.enforcement == "require_approval":
-            base += 1.2
         elif memory.enforcement == "warn":
             base += 0.8
         if memory.type == "rule":

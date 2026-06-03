@@ -31,10 +31,10 @@
         {
           "section": "policy",
           "type": "rule",
-          "content": "Refresh token policy requires explicit approval before edits.",
+          "content": "Refresh token policy edits are blocked by autonomous memory policy.",
           "tags": ["auth", "security", "refresh", "token", "policy"],
           "paths": ["src/auth/refresh-token-policy.ts"],
-          "enforcement": "require_approval"
+          "enforcement": "block"
         }
       ],
       "expect": [

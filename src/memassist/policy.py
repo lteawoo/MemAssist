@@ -85,45 +85,66 @@ def load_policy(project_root: Path) -> PolicyConfig:
 
 
 def append_protected_path(project_root: Path, path: str) -> bool:
+    return _append_policy_path(project_root, "protected_paths", path)
+
+
+def append_sensitive_path(project_root: Path, path: str) -> bool:
+    return _append_policy_path(project_root, "sensitive_paths", path)
+
+
+def _append_policy_path(project_root: Path, key: str, path: str) -> bool:
     policy_path = project_root / ".memassist" / "policy.yaml"
     policy_path.parent.mkdir(parents=True, exist_ok=True)
     if not policy_path.exists():
         policy_path.write_text(default_policy_yaml(), encoding="utf-8")
     text = policy_path.read_text(encoding="utf-8")
     config = load_policy(project_root)
-    if path in config.protected_paths:
+    existing_paths = config.protected_paths if key == "protected_paths" else config.sensitive_paths
+    if path in existing_paths:
         return False
     lines = text.splitlines()
     for index, line in enumerate(lines):
-        if line.strip() == "protected_paths: []":
-            lines[index] = "protected_paths:"
+        if line.strip() == f"{key}: []":
+            lines[index] = f"{key}:"
             lines.insert(index + 1, f'  - "{path}"')
             policy_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
             return True
-        if line.strip() == "protected_paths:":
+        if line.strip() == f"{key}:":
             insert_at = index + 1
             while insert_at < len(lines) and lines[insert_at].startswith("  - "):
                 insert_at += 1
             lines.insert(insert_at, f'  - "{path}"')
             policy_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
             return True
-    policy_path.write_text(text.rstrip() + f'\n\nprotected_paths:\n  - "{path}"\n', encoding="utf-8")
+    policy_path.write_text(text.rstrip() + f'\n\n{key}:\n  - "{path}"\n', encoding="utf-8")
     return True
 
 
 def remove_protected_path(project_root: Path, path: str) -> bool:
+    return _remove_policy_path(project_root, "protected_paths", path)
+
+
+def remove_sensitive_path(project_root: Path, path: str) -> bool:
+    return _remove_policy_path(project_root, "sensitive_paths", path)
+
+
+def _remove_policy_path(project_root: Path, key: str, path: str) -> bool:
     policy_path = project_root / ".memassist" / "policy.yaml"
     if not policy_path.exists():
         return False
     config = load_policy(project_root)
-    if path not in config.protected_paths:
+    existing_paths = config.protected_paths if key == "protected_paths" else config.sensitive_paths
+    if path not in existing_paths:
         return False
     lines = policy_path.read_text(encoding="utf-8").splitlines()
     changed = False
     next_lines: list[str] = []
+    in_target_section = False
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("-"):
+        if line and not line.startswith(" ") and stripped.endswith(":"):
+            in_target_section = stripped == f"{key}:"
+        if in_target_section and stripped.startswith("-"):
             value = stripped[1:].strip().strip('"').strip("'")
             if value == path:
                 changed = True
@@ -144,19 +165,19 @@ class PolicyEngine:
             command = str(args.get("command", ""))
             for pattern in self.config.dangerous_commands:
                 if re.search(pattern, command):
-                    return PolicyDecision("deny", f"dangerous command matched: {pattern}")
+                    return PolicyDecision("block", f"dangerous command matched: {pattern}")
         path = args.get("path") or args.get("file") or args.get("target")
         if path:
             path_text = str(path)
             if _matches_any(path_text, self.config.protected_paths):
-                return PolicyDecision("require_approval", f"protected path: {path_text}")
+                return PolicyDecision("block", f"protected path: {path_text}")
             if _matches_any(path_text, self.config.sensitive_paths):
                 return PolicyDecision("warn", f"sensitive path: {path_text}")
         command_text = str(args.get("command", ""))
         if tool_name in {"apply_patch", "edit", "write"} and command_text:
             protected_path = _first_embedded_match(command_text, self.config.protected_paths)
             if protected_path:
-                return PolicyDecision("require_approval", f"protected path: {protected_path}")
+                return PolicyDecision("block", f"protected path: {protected_path}")
             sensitive_path = _first_embedded_match(command_text, self.config.sensitive_paths)
             if sensitive_path:
                 return PolicyDecision("warn", f"sensitive path: {sensitive_path}")

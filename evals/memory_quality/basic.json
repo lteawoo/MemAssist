@@ -15,7 +15,7 @@
         },
         {
           "type": "preference",
-          "content": "Do not touch refresh token policy without confirmation.",
+          "content": "Keep refresh token policy changes as an internal blocked memory policy.",
           "tags": ["auth", "token"],
           "status": "candidate",
           "importance": 0.9
@@ -28,15 +28,15 @@
       "query": "refresh token protected path",
       "expect": ["refresh token"],
       "forbid": ["temporary branch"],
-      "expect_statuses": ["policy_active", "long_term", "active", "auto_active", "pinned"],
+      "expect_statuses": ["block_policy", "warn_policy", "durable", "long_term", "active", "auto_active", "pinned"],
       "seed": [
         {
           "type": "rule",
-          "content": "Refresh token policy requires explicit approval before edits.",
+          "content": "Refresh token policy edits are blocked by autonomous memory policy.",
           "tags": ["auth", "security", "refresh", "token", "policy"],
           "paths": ["src/auth/refresh-token-policy.ts"],
-          "status": "policy_active",
-          "enforcement": "require_approval",
+          "status": "block_policy",
+          "enforcement": "block",
           "importance": 0.9
         },
         {

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from .eval_seed import remove_seed_memories_by_source
 from .retrieval import MemoryPack, build_memory_pack
 from .storage import Store
 
@@ -119,6 +120,7 @@ def evaluate_rag(store: Store, *, project_id: str, cases: list[RagCase]) -> RagE
     passed_cases = 0
 
     for case in cases:
+        remove_seed_memories_by_source(store, project_id=project_id, source_kind="rag_eval_seed")
         seed_ids = _insert_seed_memories(store, project_id=project_id, seed=case.seed)
         try:
             pack = build_memory_pack(store, query=case.query, project_id=project_id)
@@ -235,14 +237,14 @@ def _default_type(section: str) -> str:
 
 def _default_status(section: str) -> str:
     if section == "policy":
-        return "policy_active"
+        return "block_policy"
     if section == "verifier":
-        return "long_term"
+        return "durable"
     return "active"
 
 
 def _default_enforcement(section: str) -> str:
-    return "require_approval" if section == "policy" else "none"
+    return "block" if section == "policy" else "none"
 
 
 def _insert_seed_memories(store: Store, *, project_id: str, seed: list[RagSeedMemory]) -> list[str]:

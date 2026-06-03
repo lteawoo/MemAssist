@@ -8,8 +8,7 @@ from sqlite3 import Row
 from typing import Any
 
 from .models import Memory
-from .policy import append_protected_path
-from .policy_simulator import PolicySimulationResult, simulate_protected_path
+from .policy import append_protected_path, append_sensitive_path
 from .storage import Store
 
 
@@ -18,23 +17,31 @@ DIRECTIVE_TERMS = {
     "always",
     "must",
     "require",
+    "ask before",
+    "tell me before",
     "앞으로",
     "항상",
     "기억",
     "해야",
     "받아야",
+    "묻지",
+    "하지마",
+    "하지 마",
 }
 
-APPROVAL_POLICY_TERMS = {
-    "approval",
-    "approve",
-    "confirmation",
-    "승인",
+GATE_WORDING_TERMS = {
+    "approv",
+    "confirm",
+    "permission",
+    "ask",
+    "tell me",
+    "check with me",
+    "허락",
     "확인",
 }
 
 @dataclass(frozen=True)
-class ConfirmationResult:
+class DirectiveResult:
     action: str
     applied: list[str]
     rejected: list[str]
@@ -58,54 +65,55 @@ def handle_direct_user_instruction(
     project_id: str,
     session_id: str,
     prompt: str,
-) -> ConfirmationResult:
+) -> DirectiveResult:
     content = _direct_instruction_content(prompt)
     if not content:
-        return ConfirmationResult("none", [], [], [], None)
-    enforcement = "require_approval" if _is_protective_instruction(content) else "none"
+        return DirectiveResult("none", [], [], [], None)
+    enforcement = _directive_enforcement(content)
 
     existing = store.find_memory(
         project_id=project_id,
         content=content,
-        type="preference",
+        type="directive",
         statuses=(
             "candidate",
             "draft",
             "auto_active",
             "active",
-            "policy_active",
+            "warn_policy",
+            "block_policy",
             "pinned",
             "long_term",
+            "durable",
         ),
     )
     if existing:
-        if enforcement == "none" and existing.status in {"active", "policy_active", "pinned", "long_term"}:
-            return ConfirmationResult("direct_already_applied", [existing.id], [], [], None)
-        if enforcement != "none" and existing.status == "policy_active":
-            return ConfirmationResult("direct_already_applied", [existing.id], [], [], None)
+        if enforcement == "none" and existing.status in {"active", "warn_policy", "block_policy", "pinned", "long_term", "durable"}:
+            return DirectiveResult("directive_already_recorded", [existing.id], [], [], None)
+        if enforcement != "none" and existing.status in {"warn_policy", "block_policy"}:
+            return DirectiveResult("directive_already_recorded", [existing.id], [], [], None)
         if enforcement != "none" and existing.enforcement != enforcement:
             store.update_enforcement(existing.id, enforcement)
             refreshed = store.get_memory(existing.id)
             if refreshed:
                 existing = refreshed
-        applied, simulation, decision = _apply_approved_memory(
+        applied, policy_events, decision = _apply_directive_memory(
             store,
             project_root=project_root,
             project_id=project_id,
             memory=existing,
         )
-        simulations = [simulation.as_dict()] if simulation else []
-        _record_confirmation_lifecycle(store, project_id=project_id, memory=existing, decision=decision)
-        message = "Direct memassist instruction was applied." if applied else "Direct memassist instruction could not be applied."
-        return ConfirmationResult("direct_apply", [existing.id] if applied else [], [], simulations, message)
+        _record_directive_lifecycle(store, project_id=project_id, memory=existing, decision=decision)
+        message = "Direct memassist directive was recorded." if applied else "Direct memassist directive was recorded without a policy path."
+        return DirectiveResult("directive_recorded", [existing.id], [], policy_events, message)
 
     memory_id = store.add_memory(
         scope_type="project",
         project_id=project_id,
         session_id=session_id,
-        type="preference",
+        type="directive",
         content=content,
-        reason="User directly instructed memassist to remember this rule.",
+        reason="User directly instructed memassist to remember this directive.",
         tags=_instruction_tags(content),
         status="active",
         importance=0.9,
@@ -116,55 +124,56 @@ def handle_direct_user_instruction(
     )
     memory = store.get_memory(memory_id)
     if not memory:
-        return ConfirmationResult("none", [], [], [], None)
+        return DirectiveResult("none", [], [], [], None)
     if enforcement == "none":
         store.add_lifecycle_event(
             session_id=session_id,
             project_id=project_id,
             memory_id=memory_id,
             candidate=memory.as_dict(),
-            decision="user_prompt_active",
+            decision="user_directive_active",
             risk="low",
-            reason="User directly instructed memassist to remember this low-risk rule.",
+            reason="User directly instructed memassist to remember this low-risk directive.",
         )
-        return ConfirmationResult("direct_apply", [memory_id], [], [], "Direct memassist instruction was remembered.")
+        return DirectiveResult("directive_recorded", [memory_id], [], [], "Direct memassist directive was remembered.")
 
-    applied, simulation, decision = _apply_approved_memory(
+    applied, policy_events, decision = _apply_directive_memory(
         store,
         project_root=project_root,
         project_id=project_id,
         memory=memory,
     )
-    simulations = [simulation.as_dict()] if simulation else []
-    _record_confirmation_lifecycle(store, project_id=project_id, memory=memory, decision=decision)
-    message = "Direct memassist instruction was applied." if applied else "Direct memassist instruction could not be applied."
-    return ConfirmationResult("direct_apply", [memory_id] if applied else [], [], simulations, message)
+    _record_directive_lifecycle(store, project_id=project_id, memory=memory, decision=decision)
+    message = "Direct memassist directive was recorded." if applied else "Direct memassist directive was recorded without a policy path."
+    return DirectiveResult("directive_recorded", [memory_id], [], policy_events, message)
 
 
-def _apply_approved_memory(
+def _apply_directive_memory(
     store: Store,
     *,
     project_root: Path,
     project_id: str,
     memory: Memory,
-) -> tuple[bool, PolicySimulationResult | None, str]:
-    if memory.enforcement in {"require_approval", "block"}:
+) -> tuple[bool, list[dict[str, object]], str]:
+    if memory.enforcement in {"warn", "block"}:
         protected_path = _infer_protected_path(store, memory, project_root)
         if protected_path:
-            append_protected_path(project_root, protected_path)
-            simulation = simulate_protected_path(project_root, protected_path)
-            if simulation.passed:
-                store.update_status(memory.id, "policy_active")
-                return True, simulation, "confirmation_policy_active"
-            store.update_status(memory.id, "active")
-            return False, simulation, "confirmation_policy_failed"
+            changed = (
+                append_protected_path(project_root, protected_path)
+                if memory.enforcement == "block"
+                else append_sensitive_path(project_root, protected_path)
+            )
+            store.update_paths(memory.id, list(dict.fromkeys([*memory.paths, protected_path])))
+            policy_status = "block_policy" if memory.enforcement == "block" else "warn_policy"
+            store.update_status(memory.id, policy_status)
+            return True, [_policy_event(memory.enforcement, protected_path, changed)], f"directive_{policy_status}"
         store.update_status(memory.id, "active")
-        return True, None, "confirmation_active_no_path"
+        return False, [], "directive_active_no_path"
     store.update_status(memory.id, "active")
-    return True, None, "confirmation_active"
+    return True, [], "directive_active"
 
 
-def _record_confirmation_lifecycle(
+def _record_directive_lifecycle(
     store: Store,
     *,
     project_id: str,
@@ -178,8 +187,17 @@ def _record_confirmation_lifecycle(
         candidate=memory.as_dict(),
         decision=decision,
         risk="high" if memory.enforcement != "none" else "medium",
-        reason="User directly approved this memory instruction.",
+        reason="User directly supplied this memory directive.",
     )
+
+
+def _policy_event(enforcement: str, path: str, changed: bool) -> dict[str, object]:
+    return {
+        "path": path,
+        "action": enforcement,
+        "changed": changed,
+        "reason": f"Direct directive mapped {path} to {enforcement} policy.",
+    }
 
 
 def _infer_protected_path(store: Store, memory: Memory, project_root: Path) -> str | None:
@@ -218,7 +236,6 @@ def _path_terms(path: str) -> list[str]:
         "세션": "session",
         "쿠키": "cookie",
         "인증": "auth",
-        "승인": "approval",
     }
     for korean, english in synonyms.items():
         if korean in text and english not in terms:
@@ -288,28 +305,52 @@ def _direct_instruction_content(prompt: str) -> str:
 
 def _looks_like_new_user_directive(text: str) -> bool:
     has_directive = any(term in text for term in DIRECTIVE_TERMS)
-    has_approval_policy = any(term in text for term in APPROVAL_POLICY_TERMS) and any(
+    has_gate_wording = any(term in text for term in GATE_WORDING_TERMS) and any(
         term in text for term in {"before", "change", "edit", "변경", "수정", "전에", "전"}
     )
-    return has_directive or has_approval_policy
+    return has_directive or has_gate_wording
 
 
-def _is_protective_instruction(content: str) -> bool:
+def _directive_enforcement(content: str) -> str:
     lowered = content.lower()
-    return any(term in lowered for term in APPROVAL_POLICY_TERMS) and any(
+    block_terms = {
+        "do not",
+        "don't",
+        "never",
+        "must not",
+        "block",
+        "forbid",
+        "without asking",
+        "without approv",
+        "금지",
+        "막아",
+        "건드리지",
+        "수정하지",
+        "바꾸지",
+    }
+    warn_terms = {"warn", "warning", "remind", "careful", "주의", "경고", "알려"}
+    gate_before_change = any(term in lowered for term in GATE_WORDING_TERMS) and any(
         term in lowered for term in {"before", "change", "edit", "modify", "변경", "수정", "전에", "전"}
     )
+    if any(term in lowered for term in block_terms):
+        return "block"
+    if gate_before_change or any(term in lowered for term in warn_terms):
+        return "warn"
+    return "none"
 
 
 def _instruction_tags(content: str) -> list[str]:
     lowered = content.lower()
-    tags = ["explicit", "user_prompt"]
+    tags = ["directive", "explicit", "user_prompt"]
+    enforcement = _directive_enforcement(content)
+    if enforcement != "none":
+        tags.append(enforcement)
     if any(term in lowered for term in {"auth", "인증", "token", "토큰", "refresh", "리프레시"}):
         tags.append("auth")
     if any(term in lowered for term in {"token", "토큰"}):
         tags.append("token")
     if any(term in lowered for term in {"refresh", "리프레시"}):
         tags.append("refresh")
-    if any(term in lowered for term in {"policy", "정책", "approval", "승인"}):
+    if any(term in lowered for term in {"policy", "정책"}):
         tags.append("policy")
     return list(dict.fromkeys(tags))
