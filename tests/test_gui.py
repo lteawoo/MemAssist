@@ -268,7 +268,10 @@ class GuiReadOnlyApiTest(unittest.TestCase):
         self.assertIn("관련도", html)
         self.assertIn("priorityTooltip", html)
         self.assertIn("relevanceTooltip", html)
+        self.assertIn('class="tooltip"', html)
+        self.assertIn("importanceTooltip", html)
         self.assertNotIn('["Type", "Content", "Paths", "Score", "Updated"]', html)
+        self.assertNotIn('help("confidenceTooltip")', html)
 
     def test_localization_dictionary_covers_english_and_korean_metric_terms(self) -> None:
         i18n = getattr(self.gui, "GUI_I18N")

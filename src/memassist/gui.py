@@ -1081,6 +1081,11 @@ def _dashboard_html() -> str:
       gap: 4px;
       flex-wrap: wrap;
     }}
+    .help-wrap {{
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+    }}
     .help {{
       display: inline-flex;
       align-items: center;
@@ -1094,6 +1099,37 @@ def _dashboard_html() -> str:
       font-size: 11px;
       line-height: 1;
       cursor: help;
+    }}
+    .tooltip {{
+      position: absolute;
+      top: calc(100% + 6px);
+      right: 0;
+      width: min(360px, 72vw);
+      padding: 10px 11px;
+      border: 1px solid #b9c4ca;
+      border-radius: 6px;
+      background: #ffffff;
+      color: var(--text);
+      box-shadow: 0 8px 24px rgba(31, 35, 40, 0.14);
+      font-size: 12px;
+      font-weight: 400;
+      line-height: 1.45;
+      text-align: left;
+      white-space: normal;
+      z-index: 5;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(-2px);
+      transition: opacity 120ms ease, transform 120ms ease;
+    }}
+    .tooltip div + div {{
+      margin-top: 5px;
+    }}
+    .help-wrap:hover .tooltip,
+    .help-wrap:focus-within .tooltip {{
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
     }}
     .metric-primary {{
       font-size: 22px;
@@ -1179,12 +1215,13 @@ def _dashboard_html() -> str:
       }}
       refreshVisible();
     }}
-    function help(key) {{
-      const text = t(key);
-      return `<span class="help" tabindex="0" role="button" aria-label="${{esc(t("metricHelp"))}}: ${{esc(text)}}" title="${{esc(text)}}">?</span>`;
+    function help(key, detailKeys=[]) {{
+      const lines = [key].concat(detailKeys).map(item => `<div>${{esc(t(item))}}</div>`).join("");
+      const text = [key].concat(detailKeys).map(item => t(item)).join(" ");
+      return `<span class="help-wrap"><span class="help" tabindex="0" role="button" aria-label="${{esc(t("metricHelp"))}}: ${{esc(text)}}">?</span><span class="tooltip" role="tooltip">${{lines}}</span></span>`;
     }}
-    function th(labelKey, tooltipKey=null) {{
-      return `<span class="th-label">${{esc(t(labelKey))}}${{tooltipKey ? help(tooltipKey) : ""}}</span>`;
+    function th(labelKey, tooltipKey=null, detailKeys=[]) {{
+      return `<span class="th-label">${{esc(t(labelKey))}}${{tooltipKey ? help(tooltipKey, detailKeys) : ""}}</span>`;
     }}
     const params = values => {{
       const q = new URLSearchParams();
@@ -1309,6 +1346,7 @@ def _dashboard_html() -> str:
       const metricKey = data.metric === "relevance" ? "relevance" : "priority";
       const metricLabel = metricKey === "relevance" ? "relevance" : "priority";
       const metricTip = metricKey === "relevance" ? "relevanceTooltip" : "priorityTooltip";
+      const metricDetails = ["confidenceTooltip", "strengthTooltip", "utilityTooltip", "usesTooltip", "recurrenceTooltip", "importanceTooltip"];
       const rows = (data.memories || []).map(m => `<tr>
         <td style="width: 12%">${{esc(m.type)}}<br><span class="muted">${{esc(m.status)}}</span></td>
         <td class="content">${{esc(m.content)}}<div>${{(m.tags || []).map(tag => `<span class="pill">${{esc(tag)}}</span>`).join("")}}</div></td>
@@ -1316,7 +1354,7 @@ def _dashboard_html() -> str:
         <td style="width: 14%">${{metricCell(m, metricKey)}}<br><span class="muted">${{esc(m.enforcement)}}</span></td>
         <td style="width: 16%"><span class="muted">${{esc(m.updated_at)}}</span><br>${{esc(m.id)}}</td>
       </tr>`).join("");
-      el("memories").innerHTML = table([th("type"), th("content"), th("paths"), th(metricLabel, metricTip), th("updated")], rows);
+      el("memories").innerHTML = table([th("type"), th("content"), th("paths"), th(metricLabel, metricTip, metricDetails), th("updated")], rows);
     }}
     function metricCell(memory, metricKey) {{
       const metrics = memory.metrics || {{}};
@@ -1324,11 +1362,11 @@ def _dashboard_html() -> str:
       const value = metricKey === "relevance" ? metrics.relevance : metrics.priority;
       return `<div class="metric-primary">${{Number(value ?? 0).toFixed(0)}}</div>
         <div class="evidence">
-          <span class="metric-line">${{esc(t("confidence"))}} ${{Number(evidence.confidence ?? 0).toFixed(2)}} ${{help("confidenceTooltip")}}</span>
-          <span class="metric-line">${{esc(t("strength"))}} ${{Number(evidence.strength ?? 0).toFixed(2)}} ${{help("strengthTooltip")}}</span>
-          <span class="metric-line">${{esc(t("utility"))}} ${{Number(evidence.utility ?? 0).toFixed(2)}} ${{help("utilityTooltip")}}</span>
-          <span class="metric-line">${{esc(t("uses"))}} ${{Number(evidence.uses ?? 0).toFixed(0)}} ${{help("usesTooltip")}}</span>
-          <span class="metric-line">${{esc(t("recurrence"))}} ${{Number(evidence.recurrence ?? 0).toFixed(0)}} ${{help("recurrenceTooltip")}}</span>
+          <span class="metric-line">${{esc(t("confidence"))}} ${{Number(evidence.confidence ?? 0).toFixed(2)}}</span>
+          <span class="metric-line">${{esc(t("strength"))}} ${{Number(evidence.strength ?? 0).toFixed(2)}}</span>
+          <span class="metric-line">${{esc(t("utility"))}} ${{Number(evidence.utility ?? 0).toFixed(2)}}</span>
+          <span class="metric-line">${{esc(t("uses"))}} ${{Number(evidence.uses ?? 0).toFixed(0)}}</span>
+          <span class="metric-line">${{esc(t("recurrence"))}} ${{Number(evidence.recurrence ?? 0).toFixed(0)}}</span>
         </div>`;
     }}
     async function loadTraces() {{
