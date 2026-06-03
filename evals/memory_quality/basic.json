@@ -5,6 +5,22 @@
       "query": "session timeout npm verification",
       "expect": ["npm test"],
       "forbid": ["refresh token"],
+      "seed": [
+        {
+          "type": "workflow",
+          "content": "Run npm test -- auth session after session timeout changes.",
+          "tags": ["verification", "test", "auth", "session", "timeout"],
+          "status": "long_term",
+          "importance": 0.8
+        },
+        {
+          "type": "preference",
+          "content": "Do not touch refresh token policy without confirmation.",
+          "tags": ["auth", "token"],
+          "status": "candidate",
+          "importance": 0.9
+        }
+      ],
       "limit": 5
     },
     {
@@ -13,6 +29,24 @@
       "expect": ["refresh token"],
       "forbid": ["temporary branch"],
       "expect_statuses": ["policy_active", "long_term", "active", "auto_active", "pinned"],
+      "seed": [
+        {
+          "type": "rule",
+          "content": "Refresh token policy requires explicit approval before edits.",
+          "tags": ["auth", "security", "refresh", "token", "policy"],
+          "paths": ["src/auth/refresh-token-policy.ts"],
+          "status": "policy_active",
+          "enforcement": "require_approval",
+          "importance": 0.9
+        },
+        {
+          "type": "workflow",
+          "content": "Delete temporary branch after release cleanup.",
+          "tags": ["git", "cleanup"],
+          "status": "candidate",
+          "importance": 0.4
+        }
+      ],
       "limit": 5
     }
   ]

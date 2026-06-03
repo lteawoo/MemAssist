@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .eval_seed import SeedMemory, insert_seed_memories, remove_seed_memories, seed_from_value
 from .models import Memory
 from .storage import Store
 
@@ -20,6 +21,7 @@ class MemoryQualityCase:
     forbid: list[str]
     expect_statuses: list[str]
     forbid_statuses: list[str]
+    seed: list[SeedMemory]
     limit: int = 10
 
     @classmethod
@@ -31,6 +33,7 @@ class MemoryQualityCase:
             forbid=_string_list(value.get("forbid")),
             expect_statuses=_string_list(value.get("expect_statuses")) or sorted(ACTIVE_STATUSES),
             forbid_statuses=_string_list(value.get("forbid_statuses")) or sorted(ACTIVE_STATUSES),
+            seed=seed_from_value(value.get("seed")),
             limit=int(value.get("limit", 10)),
         )
 
@@ -81,19 +84,28 @@ def evaluate_memory_quality(
     stale_hits = 0
 
     for case in cases:
-        retrieved = store.search_memories(case.query, project_id=project_id, limit=case.limit)
-        expected_hits = _matched_terms(retrieved, case.expect, set(case.expect_statuses))
-        forbidden_hits = _matched_terms(retrieved, case.forbid, set(case.forbid_statuses))
-        stale = [memory.id for memory in retrieved if memory.status in {"stale", "expired", "superseded", "disabled"}]
-        wrong_policy = [
-            term for term in case.forbid for memory in retrieved if memory.status == "policy_active" and _contains(memory, term)
-        ]
-        wrong_promotion = [
-            term
-            for term in case.forbid
-            for memory in retrieved
-            if memory.status in {"long_term", "policy_active", "pinned"} and _contains(memory, term)
-        ]
+        seed_ids = insert_seed_memories(
+            store,
+            project_id=project_id,
+            seed=case.seed,
+            source_kind="memory_eval_seed",
+        )
+        try:
+            retrieved = store.search_memories(case.query, project_id=project_id, limit=case.limit)
+            expected_hits = _matched_terms(retrieved, case.expect, set(case.expect_statuses))
+            forbidden_hits = _matched_terms(retrieved, case.forbid, set(case.forbid_statuses))
+            stale = [memory.id for memory in retrieved if memory.status in {"stale", "expired", "superseded", "disabled"}]
+            wrong_policy = [
+                term for term in case.forbid for memory in retrieved if memory.status == "policy_active" and _contains(memory, term)
+            ]
+            wrong_promotion = [
+                term
+                for term in case.forbid
+                for memory in retrieved
+                if memory.status in {"long_term", "policy_active", "pinned"} and _contains(memory, term)
+            ]
+        finally:
+            remove_seed_memories(store, seed_ids)
         recall = len(expected_hits) / len(case.expect) if case.expect else 1.0
         precision = 1.0 if not forbidden_hits else 0.0
         recall_total += recall

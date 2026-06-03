@@ -756,6 +756,7 @@ def cmd_eval_retrieval(args: argparse.Namespace) -> int:
                 query=args.query,
                 expect=args.expect,
                 forbid=args.forbid,
+                seed=[],
                 limit=args.limit,
             )
         ]
@@ -788,6 +789,7 @@ def cmd_eval_memory(args: argparse.Namespace) -> int:
                 forbid=args.forbid,
                 expect_statuses=sorted(MEMORY_EVAL_ACTIVE_STATUSES),
                 forbid_statuses=sorted(MEMORY_EVAL_ACTIVE_STATUSES),
+                seed=[],
                 limit=args.limit,
             )
         ]

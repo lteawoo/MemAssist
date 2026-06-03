@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .eval_seed import SeedMemory, insert_seed_memories, remove_seed_memories, seed_from_value
 from .models import Memory
 from .storage import Store
 
@@ -14,6 +15,7 @@ class RetrievalCase:
     query: str
     expect: list[str]
     forbid: list[str]
+    seed: list[SeedMemory]
     limit: int = 5
 
     @classmethod
@@ -22,6 +24,7 @@ class RetrievalCase:
             query=str(value.get("query", "")),
             expect=_string_list(value.get("expect")),
             forbid=_string_list(value.get("forbid")),
+            seed=seed_from_value(value.get("seed")),
             limit=int(value.get("limit", 5)),
         )
 
@@ -69,9 +72,18 @@ def evaluate_retrieval(
     forbidden_hits = 0
 
     for case in cases:
-        retrieved = store.search_memories(case.query, project_id=project_id, limit=case.limit)
-        hit_indexes = _hit_indexes(retrieved, case.expect)
-        forbidden = _matched_terms(retrieved, case.forbid)
+        seed_ids = insert_seed_memories(
+            store,
+            project_id=project_id,
+            seed=case.seed,
+            source_kind="retrieval_eval_seed",
+        )
+        try:
+            retrieved = store.search_memories(case.query, project_id=project_id, limit=case.limit)
+            hit_indexes = _hit_indexes(retrieved, case.expect)
+            forbidden = _matched_terms(retrieved, case.forbid)
+        finally:
+            remove_seed_memories(store, seed_ids)
         recall = 1.0 if case.expect and len(hit_indexes) == len(case.expect) else 0.0
         precision = (len(hit_indexes) / len(retrieved)) if retrieved else 0.0
         reciprocal_rank = (1.0 / (min(hit_indexes) + 1)) if hit_indexes else 0.0
