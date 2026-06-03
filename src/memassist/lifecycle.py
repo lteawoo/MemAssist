@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .classifier import CandidateDecision
+from .dedupe import find_semantic_duplicate, should_suppress_candidate
 from .evaluator import evaluate_candidate
 from .extraction import extract_candidates
 from .storage import Store
@@ -96,6 +97,32 @@ def process_session_lifecycle(
                 ),
             )
             continue
+        semantic_duplicate = find_semantic_duplicate(
+            candidate.content,
+            candidate_type=candidate.type,
+            candidate_tags=candidate.tags,
+            candidate_status=decision.status,
+            candidate_enforcement=decision.enforcement,
+            existing_memories=existing,
+        )
+        if semantic_duplicate and should_suppress_candidate(decision.status, semantic_duplicate.memory):
+            duplicates += 1
+            reinforced = store.reinforce_memory(semantic_duplicate.memory.id, confidence_delta=0.02, importance_delta=0.01)
+            store.add_lifecycle_event(
+                session_id=session_id,
+                project_id=project_id,
+                memory_id=semantic_duplicate.memory.id,
+                candidate=candidate.as_dict(),
+                decision="suppress_semantic_duplicate",
+                risk=decision.risk,
+                reason=(
+                    f"Weaker candidate duplicates stronger memory {semantic_duplicate.memory.id}; "
+                    f"{semantic_duplicate.reason} (score={semantic_duplicate.score})."
+                    if reinforced
+                    else f"Weaker candidate duplicates stronger memory {semantic_duplicate.memory.id}."
+                ),
+            )
+            continue
 
         memory_id = _store_decision(store, decision, session_id=session_id, project_id=project_id)
         store.link_related_memories(memory_id, project_id=project_id)
@@ -179,6 +206,33 @@ def cleanup_memories(store: Store) -> CleanupResult:
             continue
         store.supersede(memory_id, str(row["new_id"]))
         superseded.append(memory_id)
+    semantic_candidates = store.conn.execute(
+        """
+        SELECT * FROM memories
+        WHERE status = 'candidate'
+        ORDER BY updated_at ASC
+        """
+    ).fetchall()
+    for row in semantic_candidates:
+        candidate = store._row_to_memory(row)
+        if not candidate:
+            continue
+        existing = [
+            memory
+            for memory in store.list_memories(project_id=candidate.project_id, include_global=True, status=None)
+            if memory.id != candidate.id
+        ]
+        duplicate = find_semantic_duplicate(
+            candidate.content,
+            candidate_type=candidate.type,
+            candidate_tags=candidate.tags,
+            candidate_status=candidate.status,
+            candidate_enforcement=candidate.enforcement,
+            existing_memories=existing,
+        )
+        if duplicate and should_suppress_candidate(candidate.status, duplicate.memory):
+            store.supersede(candidate.id, duplicate.memory.id)
+            superseded.append(candidate.id)
     return CleanupResult(expired=expired, stale=stale, superseded=superseded)
 
 

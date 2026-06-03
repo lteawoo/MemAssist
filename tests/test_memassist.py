@@ -1326,6 +1326,87 @@ class MemassistTest(unittest.TestCase):
                 memory = store.get_memory(memory_id)
                 self.assertEqual(memory.status, "long_term")  # type: ignore[union-attr]
 
+    def test_lifecycle_suppresses_policy_paraphrase_candidate(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                policy_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="preference",
+                    content="앞으로 리프레시토큰 변경은 내 승인없이하지마",
+                    tags=["explicit", "user_prompt", "auth", "token", "refresh", "policy"],
+                    status="policy_active",
+                    importance=0.9,
+                    confidence=0.95,
+                    enforcement="require_approval",
+                    source_kind="user_prompt_directive",
+                )
+                store.add_trace_event(
+                    session_id="sess_paraphrase",
+                    project_id=project.id,
+                    event_type="stop",
+                    tool_name=None,
+                    input_json={
+                        "last_assistant_message": "앞으로 리프레시 토큰 관련 변경은 먼저 명시적으로 승인받고 진행하겠습니다."
+                    },
+                )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["daemon", "once", "--session", "sess_paraphrase", "--json"])
+            self.assertEqual(code, 0)
+            result = json.loads(out.getvalue())
+            self.assertEqual(result["lifecycle"]["duplicates"], 1)
+            with Store() as store:
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                self.assertEqual([memory.id for memory in memories if memory.status == "candidate"], [])
+                self.assertEqual(store.get_memory(policy_id).status, "policy_active")  # type: ignore[union-attr]
+
+    def test_cleanup_supersedes_existing_policy_paraphrase_candidate(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                policy_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="preference",
+                    content="앞으로 리프레시토큰 변경은 내 승인없이하지마",
+                    tags=["explicit", "user_prompt", "auth", "token", "refresh", "policy"],
+                    status="policy_active",
+                    importance=0.9,
+                    confidence=0.95,
+                    enforcement="require_approval",
+                    source_kind="user_prompt_directive",
+                )
+                candidate_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="preference",
+                    content="앞으로 리프레시 토큰 관련 변경은 먼저 명시적으로 승인받고 진행하겠습니다.",
+                    tags=["explicit", "preference", "semantic", "high"],
+                    status="candidate",
+                    importance=0.7,
+                    confidence=0.8,
+                    enforcement="none",
+                    source_kind="lifecycle",
+                )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["daemon", "once", "--session", "missing", "--json"])
+            self.assertEqual(code, 0)
+            result = json.loads(out.getvalue())
+            self.assertIn(candidate_id, result["cleanup"]["superseded"])
+            with Store() as store:
+                candidate = store.get_memory(candidate_id)
+                self.assertEqual(candidate.status, "superseded")  # type: ignore[union-attr]
+                self.assertEqual(candidate.superseded_by, policy_id)  # type: ignore[union-attr]
+
 
 if __name__ == "__main__":
     unittest.main()
