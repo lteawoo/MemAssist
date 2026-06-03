@@ -16,6 +16,7 @@ from .paths import db_path, memassist_home
 from .policy import PolicyEngine, append_protected_path, default_policy_yaml, load_policy
 from .project import detect_project
 from .retrieval import build_memory_pack, render_prompt_context
+from .retrieval_eval import RetrievalCase, evaluate_retrieval, load_cases
 from .session import summarize_session
 from .storage import Store
 from .sync import export_memories, import_memories
@@ -176,6 +177,14 @@ def build_parser() -> argparse.ArgumentParser:
     eval_run.add_argument("--session", default="latest")
     eval_run.add_argument("--json", action="store_true")
     eval_run.set_defaults(func=cmd_eval_run)
+    eval_retrieval = eval_sub.add_parser("retrieval", help="evaluate memory retrieval cases")
+    eval_retrieval.add_argument("--case-file")
+    eval_retrieval.add_argument("--query")
+    eval_retrieval.add_argument("--expect", action="append", default=[])
+    eval_retrieval.add_argument("--forbid", action="append", default=[])
+    eval_retrieval.add_argument("--limit", type=int, default=5)
+    eval_retrieval.add_argument("--json", action="store_true")
+    eval_retrieval.set_defaults(func=cmd_eval_retrieval)
 
     daemon = sub.add_parser("daemon", help="run maintenance tasks")
     daemon_sub = daemon.add_subparsers(required=True)
@@ -593,6 +602,35 @@ def cmd_eval_run(args: argparse.Namespace) -> int:
     else:
         print("PASS" if result.passed else "FAIL")
         print(f"candidate_count: {result.candidate_count}")
+    return 0 if result.passed else 1
+
+
+def cmd_eval_retrieval(args: argparse.Namespace) -> int:
+    project = detect_project()
+    if args.case_file:
+        cases = load_cases(Path(args.case_file))
+    elif args.query and args.expect:
+        cases = [
+            RetrievalCase(
+                query=args.query,
+                expect=args.expect,
+                forbid=args.forbid,
+                limit=args.limit,
+            )
+        ]
+    else:
+        print("Provide --case-file or --query with at least one --expect.")
+        return 1
+    with _store() as store:
+        result = evaluate_retrieval(store, project_id=project.id, cases=cases)
+    if args.json:
+        _print_json(result.as_dict())
+    else:
+        print("PASS" if result.passed else "FAIL")
+        print(f"recall_at_k: {result.recall_at_k:.3f}")
+        print(f"precision_at_k: {result.precision_at_k:.3f}")
+        print(f"mrr: {result.mrr:.3f}")
+        print(f"forbidden_recall_rate: {result.forbidden_recall_rate:.3f}")
     return 0 if result.passed else 1
 
 

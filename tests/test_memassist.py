@@ -118,6 +118,52 @@ class MemassistTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_retrieval_eval_measures_expected_and_forbidden_memory(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Use npm test after session timeout changes.",
+                    tags=["verification", "session", "timeout"],
+                    status="auto_active",
+                    importance=0.7,
+                )
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="preference",
+                    content="Do not touch refresh token policy without confirmation.",
+                    tags=["auth", "token"],
+                    status="pending_confirmation",
+                    importance=0.9,
+                )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(
+                    [
+                        "eval",
+                        "retrieval",
+                        "--query",
+                        "session-timeout npm verification",
+                        "--expect",
+                        "npm test",
+                        "--forbid",
+                        "refresh token",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            result = json.loads(out.getvalue())
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["recall_at_k"], 1.0)
+            self.assertEqual(result["forbidden_recall_rate"], 0.0)
+
     def test_cli_memory_add_and_search(self) -> None:
         with isolated_env():
             main(["init"])

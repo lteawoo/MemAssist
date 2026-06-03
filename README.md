@@ -65,6 +65,20 @@ PYTHONPATH=src python3 -m memassist policy promote <memory-id> --protected-path 
 PYTHONPATH=src python3 -m memassist eval run --session latest --json
 ```
 
+Evaluate retrieval quality with expected and forbidden memory terms:
+
+```bash
+PYTHONPATH=src python3 -m memassist eval retrieval \
+  --query "session timeout npm verification" \
+  --expect "npm test" \
+  --forbid "refresh token" \
+  --json
+```
+
+Retrieval eval reports `recall_at_k`, `precision_at_k`, `mrr`, and
+`forbidden_recall_rate`. Use it to catch noisy or missing memory retrieval
+before retrieved memories are injected into Codex context.
+
 Project memory can be shared without exposing the local SQLite database:
 
 ```bash

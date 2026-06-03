@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -236,7 +237,7 @@ class Store:
     ) -> list[Memory]:
         active_statuses = ("active", "auto_active", "policy_active", "pinned")
         scope_clause = "(m.scope_type = 'global' OR m.project_id = ?)"
-        params: list[Any] = [query, project_id, *active_statuses]
+        params: list[Any] = [_fts_query(query), project_id, *active_statuses]
         try:
             rows = self.conn.execute(
                 f"""
@@ -248,8 +249,8 @@ class Store:
                   AND m.status IN (?, ?, ?, ?)
                 ORDER BY
                   CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-                  m.importance DESC,
-                  text_score ASC
+                  text_score ASC,
+                  m.importance DESC
                 LIMIT ?
                 """,
                 [*params, limit],
@@ -492,3 +493,11 @@ class Store:
             expires_at=row["expires_at"],
             superseded_by=row["superseded_by"],
         )
+
+
+def _fts_query(query: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9_가-힣]+", query.lower())
+    if not tokens:
+        return query
+    deduped = list(dict.fromkeys(tokens))
+    return " OR ".join(f'"{token}"' for token in deduped[:8])
