@@ -17,7 +17,7 @@ hooks로 기록하고, 기억할 만한 후보를 추출하고, 프로젝트 단
 - Codex 도구 사용 내역을 로컬 trace event로 기록합니다.
 - 완료된 세션에서 메모리 후보를 추출합니다.
 - 위험도가 낮은 workflow 또는 preference 메모리를 자동 활성화합니다.
-- 위험하거나 보호 성격이 있는 메모리는 다음 자연어 확인 전까지 보류합니다.
+- 추론된 위험 또는 보호 성격의 메모리는 비활성 후보로 보관합니다.
 - 이후 Codex 프롬프트에 관련 메모리와 검증 reminder를 넣어 줍니다.
 - 위험한 shell 명령을 차단하고, 보호 경로 수정에는 승인을 요구합니다.
 - 세션 검증과 retrieval 평가 명령을 제공합니다.
@@ -33,12 +33,9 @@ flowchart LR
     D --> E{위험도와 유용성 판단}
     E -->|낮은 위험의 workflow/preference| F[auto_active memory]
     E -->|수정 파일 증거| G[ephemeral memory]
-    E -->|위험하거나 보호 성격| H[pending_confirmation]
+    E -->|위험하거나 보호 성격| H[inactive candidate]
     E -->|약한 신호| I[rejected]
-    H --> J[다음 사용자 프롬프트]
-    J -->|yes / 응| K[active 또는 policy_active]
-    J -->|no / 아니| L[rejected]
-    K --> M[미래 메모리 retrieval]
+    H --> J[수동 검토 또는 무시]
     F --> M
     M --> N[관련 context를 Codex prompt에 주입]
 ```
@@ -127,7 +124,7 @@ sequenceDiagram
 
     U->>C: 프롬프트 제출
     C->>M: UserPromptSubmit
-    M-->>C: 보류 확인 + 관련 메모리 context
+    M-->>C: 직접 지시 처리 결과 + 관련 메모리 context
     C->>M: PreToolUse
     M-->>C: 정책 판단
     C->>M: PostToolUse
@@ -149,7 +146,7 @@ Codex CLI에서 `/hooks`를 열고 프로젝트 `.codex` layer와 정확한 hook
 2. `Stop` hook이 마지막 세션 상태를 기록하고 lifecycle을 실행합니다.
 3. `memassist`가 trace event와 마지막 assistant 메시지에서 메모리 후보를 추출합니다.
 4. 위험도가 낮은 후보는 즉시 활성화됩니다.
-5. 위험하거나 보호 성격이 있는 후보는 사용자 확인을 기다립니다.
+5. 추론된 위험 또는 보호 후보는 검토 전까지 비활성 상태로 남습니다.
 6. 이후 프롬프트에는 관련성이 있는 작은 memory pack이 전달됩니다.
 
 현재 lifecycle status는 다음과 같습니다.
@@ -160,8 +157,7 @@ Codex CLI에서 `/hooks`를 열고 프로젝트 `.codex` layer와 정확한 hook
 | `candidate` | 유용할 수 있지만 아직 활성화되지 않은 신호입니다. |
 | `auto_active` | 위험도가 낮아 자동 활성화된 메모리입니다. |
 | `long_term` | 반복 관찰된 고품질 메모리가 장기 retrieval 대상으로 승격되었습니다. |
-| `pending_confirmation` | 짧은 사용자 승인 또는 거절이 필요한 메모리입니다. |
-| `policy_active` | 승인된 보호 메모리가 프로젝트 정책에 추가되고 simulation을 통과했습니다. |
+| `policy_active` | 직접 보호 지시가 프로젝트 정책에 추가되고 simulation을 통과했습니다. |
 | `ephemeral` | 영구 규칙이 아니라 세션 증거로 보관되는 정보입니다. |
 | `rejected` | 거절되었거나 자동 기준에 미달한 메모리입니다. |
 
@@ -174,7 +170,7 @@ memassist memory candidates --session latest --json
 memassist memory list --all
 ```
 
-## 자연어 확인
+## 직접 메모리/정책 지시
 
 사용자가 직접 memory 또는 policy 지시를 하면 memassist는 그 지시를 이미 승인된
 의사로 처리합니다. 예를 들면:
@@ -194,18 +190,10 @@ Refresh token changes must ask for my approval before editing.
 메모리를 `policy_active`로 승격합니다. 경로를 추론하지 못해도 메모리는 active
 상태가 되어 이후 관련 작업 전에 검색됩니다.
 
-메모리가 `pending_confirmation` 상태이면 다음 `UserPromptSubmit` hook에서 해당
-항목을 보여 줍니다. 짧게 답하면 됩니다.
-
-- `yes`, `y`, `ok`, `approve`, `remember`
-- `응`, `그래`, `좋아`, `기억해`, `승인`
-- `no`, `n`, `reject`, `cancel`
-- `아니`, `취소`, `거절`
-
-승인된 낮은 위험도의 pending memory는 `active`가 됩니다. 승인된 보호 메모리는
-메모리 내용, trace의 파일 목록, 프로젝트 파일명에서 보호 경로를 추론합니다.
-그 경로를 `.memassist/policy.yaml`에 추가하고 simulation에서 해당 수정이
-차단되면 메모리는 `policy_active`가 됩니다.
+추론된 위험 또는 보호 후보는 `yes`, `ok`, `응` 같은 짧은 후속 응답으로
+승격되지 않습니다. 해당 후보는 비활성 `candidate`로 남습니다. 정책 enforcement로
+바꾸려면 직접 정책 지시를 하거나, 검토한 메모리를 명시적 보호 경로와 함께
+승격해야 합니다.
 
 ## Policy Protection
 

@@ -25,7 +25,7 @@ class LifecycleResult:
     session_id: str | None
     stored: list[str]
     auto_active: list[str]
-    pending_confirmation: list[str]
+    candidates: list[str]
     ephemeral: list[str]
     rejected: list[str]
     duplicates: int
@@ -37,7 +37,7 @@ class LifecycleResult:
             "session_id": self.session_id,
             "stored": self.stored,
             "auto_active": self.auto_active,
-            "pending_confirmation": self.pending_confirmation,
+            "candidates": self.candidates,
             "ephemeral": self.ephemeral,
             "rejected": self.rejected,
             "duplicates": self.duplicates,
@@ -55,7 +55,7 @@ def process_session_lifecycle(
     events = store.trace_events(session_id) if session_id else []
     stored: list[str] = []
     auto_active: list[str] = []
-    pending_confirmation: list[str] = []
+    candidates: list[str] = []
     ephemeral: list[str] = []
     rejected: list[str] = []
     decisions: list[dict[str, Any]] = []
@@ -72,7 +72,6 @@ def process_session_lifecycle(
                 "candidate",
                 "draft",
                 "auto_active",
-                "pending_confirmation",
                 "active",
                 "policy_active",
                 "pinned",
@@ -103,8 +102,8 @@ def process_session_lifecycle(
         stored.append(memory_id)
         if decision.status == "auto_active":
             auto_active.append(memory_id)
-        elif decision.status == "pending_confirmation":
-            pending_confirmation.append(memory_id)
+        elif decision.status == "candidate":
+            candidates.append(memory_id)
         elif decision.status == "ephemeral":
             ephemeral.append(memory_id)
         elif decision.status == "rejected":
@@ -125,7 +124,7 @@ def process_session_lifecycle(
         session_id=session_id,
         stored=stored,
         auto_active=auto_active,
-        pending_confirmation=pending_confirmation,
+        candidates=candidates,
         ephemeral=ephemeral,
         rejected=rejected,
         duplicates=duplicates,

@@ -234,7 +234,7 @@ class MemassistTest(unittest.TestCase):
                     type="preference",
                     content="Do not touch refresh token policy without confirmation.",
                     tags=["auth", "token"],
-                    status="pending_confirmation",
+                    status="candidate",
                     importance=0.9,
                 )
 
@@ -281,7 +281,7 @@ class MemassistTest(unittest.TestCase):
                     type="preference",
                     content="Do not touch refresh token policy without confirmation.",
                     tags=["auth", "token"],
-                    status="pending_confirmation",
+                    status="candidate",
                     importance=0.9,
                 )
 
@@ -782,7 +782,7 @@ class MemassistTest(unittest.TestCase):
             results = json.loads(out.getvalue())
             self.assertTrue(any("npm test" in memory["content"] for memory in results))
 
-    def test_lifecycle_keeps_risky_lessons_pending_confirmation(self) -> None:
+    def test_lifecycle_keeps_risky_lessons_as_inactive_candidates(self) -> None:
         with isolated_env():
             main(["init"])
             project = detect_project()
@@ -812,7 +812,7 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(code, 0)
             result = json.loads(out.getvalue())
             lifecycle = result["lifecycle"]
-            self.assertGreaterEqual(len(lifecycle["pending_confirmation"]), 1)
+            self.assertGreaterEqual(len(lifecycle["candidates"]), 1)
             self.assertTrue(
                 any(decision["risk"] == "high" for decision in lifecycle["decisions"])
             )
@@ -821,7 +821,7 @@ class MemassistTest(unittest.TestCase):
             with patch("sys.stdout", out):
                 main(["memory", "list", "--all", "--json"])
             memories = json.loads(out.getvalue())
-            self.assertTrue(any(memory["status"] == "pending_confirmation" for memory in memories))
+            self.assertTrue(any(memory["status"] == "candidate" for memory in memories))
 
     def test_extract_explicit_memory_uses_trigger_line(self) -> None:
         with isolated_env():
@@ -842,73 +842,7 @@ class MemassistTest(unittest.TestCase):
             contents = [candidate.content for candidate in candidates]
             self.assertIn("앞으로 refresh token 정책은 승인 없이 수정하지 않습니다.", contents)
 
-    def test_user_prompt_confirmation_applies_pending_policy_memory(self) -> None:
-        with isolated_env() as (_root, project_dir, _home):
-            main(["init"])
-            project = detect_project()
-            with Store() as store:
-                store.upsert_project(project)
-                store.add_trace_event(
-                    session_id="sess_confirm",
-                    project_id=project.id,
-                    event_type="pre_tool_use",
-                    tool_name="apply_patch",
-                    input_json={"command": "*** Update File: src/auth/refresh-token-policy.ts"},
-                    files=[str(project_dir / "src" / "auth" / "refresh-token-policy.ts")],
-                    policy_decision="deny",
-                )
-                pending_id = store.add_memory(
-                    scope_type="project",
-                    project_id=project.id,
-                    session_id="sess_confirm",
-                    type="preference",
-                    content="앞으로 refresh token 정책은 승인 없이 수정하지 않습니다.",
-                    tags=["explicit", "auth", "token"],
-                    status="pending_confirmation",
-                    importance=0.8,
-                    confidence=0.8,
-                    enforcement="require_approval",
-                    source_kind="lifecycle",
-                    source_ref="sess_confirm",
-                )
-
-            payload = {
-                "session_id": "sess_prompt_confirm",
-                "cwd": str(project_dir),
-                "prompt": "응",
-            }
-            stdin = StringIO(json.dumps(payload))
-            stdout = StringIO()
-            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
-                code = main(["hook", "user-prompt-submit"])
-            self.assertEqual(code, 0)
-            output = json.loads(stdout.getvalue())
-            self.assertIn("applied", output["hookSpecificOutput"]["additionalContext"])
-
-            with Store() as store:
-                memory = store.get_memory(pending_id)
-                self.assertEqual(memory.status, "policy_active")  # type: ignore[union-attr]
-            self.assertIn(
-                "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
-            )
-
-            policy_out = StringIO()
-            with patch("sys.stdout", policy_out):
-                code = main(
-                    [
-                        "policy",
-                        "check",
-                        "--tool",
-                        "apply_patch",
-                        "--command",
-                        "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n*** End Patch\n",
-                    ]
-                )
-            self.assertEqual(code, 0)
-            self.assertEqual(json.loads(policy_out.getvalue())["action"], "require_approval")
-
-    def test_user_prompt_confirmation_infers_policy_path_from_project_files(self) -> None:
+    def test_user_prompt_short_approval_does_not_activate_candidate_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
@@ -917,16 +851,16 @@ class MemassistTest(unittest.TestCase):
             project = detect_project()
             with Store() as store:
                 store.upsert_project(project)
-                pending_id = store.add_memory(
+                candidate_id = store.add_memory(
                     scope_type="project",
                     project_id=project.id,
                     type="preference",
                     content="앞으로 refresh token 정책은 승인 없이 수정하지 않습니다.",
                     tags=["explicit", "auth", "token"],
-                    status="pending_confirmation",
+                    status="candidate",
                     importance=0.8,
                     confidence=0.8,
-                    enforcement="require_approval",
+                    enforcement="none",
                 )
 
             payload = {
@@ -939,8 +873,47 @@ class MemassistTest(unittest.TestCase):
                 code = main(["hook", "user-prompt-submit"])
             self.assertEqual(code, 0)
             with Store() as store:
-                memory = store.get_memory(pending_id)
+                memory = store.get_memory(candidate_id)
+                self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
+            self.assertNotIn(
+                "src/auth/refresh-token-policy.ts",
+                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+            )
+
+    def test_direct_policy_instruction_upgrades_existing_candidate_memory(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
+            protected.parent.mkdir(parents=True)
+            protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
+            project = detect_project()
+            content = "리프레시 토큰 관련 변경은 변경전에 나의 승인부터받아야해"
+            with Store() as store:
+                store.upsert_project(project)
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="preference",
+                    content=content,
+                    tags=["explicit", "auth", "token"],
+                    status="candidate",
+                    enforcement="none",
+                )
+
+            payload = {
+                "session_id": "sess_direct_policy_upgrade_candidate",
+                "cwd": str(project_dir),
+                "prompt": content,
+            }
+            stdin = StringIO(json.dumps(payload))
+            with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+                code = main(["hook", "user-prompt-submit"])
+            self.assertEqual(code, 0)
+
+            with Store() as store:
+                memory = store.get_memory(memory_id)
                 self.assertEqual(memory.status, "policy_active")  # type: ignore[union-attr]
+                self.assertEqual(memory.enforcement, "require_approval")  # type: ignore[union-attr]
             self.assertIn(
                 "src/auth/refresh-token-policy.ts",
                 (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
@@ -998,7 +971,7 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(policy_out.getvalue())["action"], "require_approval")
 
-    def test_user_prompt_direct_policy_instruction_does_not_approve_unrelated_pending_memory(self) -> None:
+    def test_user_prompt_direct_policy_instruction_does_not_activate_unrelated_candidate_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
@@ -1007,18 +980,18 @@ class MemassistTest(unittest.TestCase):
             project = detect_project()
             with Store() as store:
                 store.upsert_project(project)
-                pending_id = store.add_memory(
+                candidate_id = store.add_memory(
                     scope_type="project",
                     project_id=project.id,
                     type="preference",
                     content="Remember temporary branch cleanup note.",
                     tags=["explicit"],
-                    status="pending_confirmation",
+                    status="candidate",
                     enforcement="none",
                 )
 
             payload = {
-                "session_id": "sess_direct_policy_with_pending",
+                "session_id": "sess_direct_policy_with_candidate",
                 "cwd": str(project_dir),
                 "prompt": "리프레시 토큰 관련 변경은 변경전에 나의 승인부터받아야해",
             }
@@ -1027,86 +1000,8 @@ class MemassistTest(unittest.TestCase):
                 code = main(["hook", "user-prompt-submit"])
             self.assertEqual(code, 0)
             with Store() as store:
-                pending = store.get_memory(pending_id)
-            self.assertEqual(pending.status, "pending_confirmation")  # type: ignore[union-attr]
-
-    def test_user_prompt_confirmation_ignores_unrelated_trace_file_when_inferring_path(self) -> None:
-        with isolated_env() as (_root, project_dir, _home):
-            main(["init"])
-            protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
-            unrelated = project_dir / "src" / "session" / "session-config.ts"
-            protected.parent.mkdir(parents=True)
-            unrelated.parent.mkdir(parents=True)
-            protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
-            unrelated.write_text("export const sessionTimeoutMinutes = 30;\n", encoding="utf-8")
-            project = detect_project()
-            with Store() as store:
-                store.upsert_project(project)
-                store.add_trace_event(
-                    session_id="sess_unrelated_trace",
-                    project_id=project.id,
-                    event_type="pre_tool_use",
-                    tool_name="apply_patch",
-                    input_json={"command": "*** Update File: src/session/session-config.ts"},
-                    files=["src/session/session-config.ts"],
-                )
-                pending_id = store.add_memory(
-                    scope_type="project",
-                    project_id=project.id,
-                    session_id="sess_unrelated_trace",
-                    type="preference",
-                    content="앞으로 refresh token 정책은 승인 없이 수정하지 않습니다.",
-                    tags=["explicit", "auth", "token"],
-                    status="pending_confirmation",
-                    importance=0.8,
-                    confidence=0.8,
-                    enforcement="require_approval",
-                )
-
-            payload = {
-                "session_id": "sess_prompt_confirm_unrelated",
-                "cwd": str(project_dir),
-                "prompt": "응",
-            }
-            stdin = StringIO(json.dumps(payload))
-            with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
-                code = main(["hook", "user-prompt-submit"])
-            self.assertEqual(code, 0)
-            with Store() as store:
-                memory = store.get_memory(pending_id)
-                self.assertEqual(memory.status, "policy_active")  # type: ignore[union-attr]
-            policy_text = (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8")
-            self.assertIn("src/auth/refresh-token-policy.ts", policy_text)
-            self.assertNotIn("src/session/session-config.ts", policy_text)
-
-    def test_user_prompt_confirmation_rejects_pending_memory(self) -> None:
-        with isolated_env() as (_root, project_dir, _home):
-            main(["init"])
-            project = detect_project()
-            with Store() as store:
-                store.upsert_project(project)
-                pending_id = store.add_memory(
-                    scope_type="project",
-                    project_id=project.id,
-                    type="preference",
-                    content="Remember temporary local branch name.",
-                    tags=["explicit"],
-                    status="pending_confirmation",
-                    enforcement="none",
-                )
-
-            payload = {
-                "session_id": "sess_prompt_reject",
-                "cwd": str(project_dir),
-                "prompt": "아니",
-            }
-            stdin = StringIO(json.dumps(payload))
-            with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
-                code = main(["hook", "user-prompt-submit"])
-            self.assertEqual(code, 0)
-            with Store() as store:
-                memory = store.get_memory(pending_id)
-                self.assertEqual(memory.status, "rejected")  # type: ignore[union-attr]
+                candidate = store.get_memory(candidate_id)
+            self.assertEqual(candidate.status, "candidate")  # type: ignore[union-attr]
 
     def test_memory_review_approve_reject_and_cleanup(self) -> None:
         with isolated_env():

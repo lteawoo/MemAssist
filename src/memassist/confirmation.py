@@ -13,21 +13,6 @@ from .policy_simulator import PolicySimulationResult, simulate_protected_path
 from .storage import Store
 
 
-AFFIRMATIVE = {
-    "yes",
-    "y",
-    "ok",
-    "okay",
-    "approve",
-    "remember",
-    "응",
-    "어",
-    "그래",
-    "좋아",
-    "기억해",
-    "승인",
-}
-
 DIRECTIVE_TERMS = {
     "remember",
     "always",
@@ -48,19 +33,6 @@ APPROVAL_POLICY_TERMS = {
     "확인",
 }
 
-NEGATIVE = {
-    "no",
-    "n",
-    "reject",
-    "cancel",
-    "아니",
-    "아니야",
-    "하지마",
-    "취소",
-    "거절",
-}
-
-
 @dataclass(frozen=True)
 class ConfirmationResult:
     action: str
@@ -79,23 +51,6 @@ class ConfirmationResult:
         }
 
 
-def classify_confirmation_response(prompt: str) -> str | None:
-    normalized = prompt.strip().lower()
-    if not normalized:
-        return None
-    if _looks_like_new_user_directive(normalized):
-        return None
-    if normalized in AFFIRMATIVE:
-        return "approve"
-    if normalized in NEGATIVE:
-        return "reject"
-    if any(word in normalized for word in AFFIRMATIVE) and len(normalized) <= 40:
-        return "approve"
-    if any(word in normalized for word in NEGATIVE) and len(normalized) <= 40:
-        return "reject"
-    return None
-
-
 def handle_direct_user_instruction(
     store: Store,
     *,
@@ -107,6 +62,7 @@ def handle_direct_user_instruction(
     content = _direct_instruction_content(prompt)
     if not content:
         return ConfirmationResult("none", [], [], [], None)
+    enforcement = "require_approval" if _is_protective_instruction(content) else "none"
 
     existing = store.find_memory(
         project_id=project_id,
@@ -116,7 +72,6 @@ def handle_direct_user_instruction(
             "candidate",
             "draft",
             "auto_active",
-            "pending_confirmation",
             "active",
             "policy_active",
             "pinned",
@@ -124,8 +79,15 @@ def handle_direct_user_instruction(
         ),
     )
     if existing:
-        if existing.status in {"active", "policy_active", "pinned", "long_term"}:
+        if enforcement == "none" and existing.status in {"active", "policy_active", "pinned", "long_term"}:
             return ConfirmationResult("direct_already_applied", [existing.id], [], [], None)
+        if enforcement != "none" and existing.status == "policy_active":
+            return ConfirmationResult("direct_already_applied", [existing.id], [], [], None)
+        if enforcement != "none" and existing.enforcement != enforcement:
+            store.update_enforcement(existing.id, enforcement)
+            refreshed = store.get_memory(existing.id)
+            if refreshed:
+                existing = refreshed
         applied, simulation, decision = _apply_approved_memory(
             store,
             project_root=project_root,
@@ -137,7 +99,6 @@ def handle_direct_user_instruction(
         message = "Direct memassist instruction was applied." if applied else "Direct memassist instruction could not be applied."
         return ConfirmationResult("direct_apply", [existing.id] if applied else [], [], simulations, message)
 
-    enforcement = "require_approval" if _is_protective_instruction(content) else "none"
     memory_id = store.add_memory(
         scope_type="project",
         project_id=project_id,
@@ -146,7 +107,7 @@ def handle_direct_user_instruction(
         content=content,
         reason="User directly instructed memassist to remember this rule.",
         tags=_instruction_tags(content),
-        status="pending_confirmation" if enforcement != "none" else "active",
+        status="active",
         importance=0.9,
         confidence=0.95,
         enforcement=enforcement,
@@ -180,61 +141,6 @@ def handle_direct_user_instruction(
     return ConfirmationResult("direct_apply", [memory_id] if applied else [], [], simulations, message)
 
 
-def pending_confirmation_context(memories: list[Memory]) -> str:
-    if not memories:
-        return ""
-    lines = ["Pending memassist confirmation:"]
-    for memory in memories[:3]:
-        lines.append(f"- {memory.content}")
-    lines.append("If the user approves, memassist will apply the memory automatically.")
-    return "\n".join(lines)
-
-
-def handle_pending_confirmation(
-    store: Store,
-    *,
-    project_root: Path,
-    project_id: str,
-    prompt: str,
-) -> ConfirmationResult:
-    response = classify_confirmation_response(prompt)
-    pending = store.list_memories(project_id=project_id, include_global=False, status="pending_confirmation")
-    if not response or not pending:
-        return ConfirmationResult("none", [], [], [], None)
-    if response == "reject":
-        rejected: list[str] = []
-        for memory in pending:
-            store.update_status(memory.id, "rejected")
-            rejected.append(memory.id)
-            store.add_lifecycle_event(
-                session_id=memory.session_id,
-                project_id=project_id,
-                memory_id=memory.id,
-                candidate=memory.as_dict(),
-                decision="confirmation_rejected",
-                risk="medium",
-                reason="User rejected pending memory confirmation.",
-            )
-        return ConfirmationResult("reject", [], rejected, [], "Pending memassist memories were rejected.")
-
-    applied: list[str] = []
-    simulations: list[dict[str, object]] = []
-    for memory in pending:
-        was_applied, simulation, decision = _apply_approved_memory(
-            store,
-            project_root=project_root,
-            project_id=project_id,
-            memory=memory,
-        )
-        if simulation:
-            simulations.append(simulation.as_dict())
-        if was_applied:
-            applied.append(memory.id)
-        _record_confirmation_lifecycle(store, project_id=project_id, memory=memory, decision=decision)
-    message = "Pending memassist memories were applied." if applied else "No pending memories were applied."
-    return ConfirmationResult("approve", applied, [], simulations, message)
-
-
 def _apply_approved_memory(
     store: Store,
     *,
@@ -250,7 +156,7 @@ def _apply_approved_memory(
             if simulation.passed:
                 store.update_status(memory.id, "policy_active")
                 return True, simulation, "confirmation_policy_active"
-            store.update_status(memory.id, "pending_confirmation")
+            store.update_status(memory.id, "active")
             return False, simulation, "confirmation_policy_failed"
         store.update_status(memory.id, "active")
         return True, None, "confirmation_active_no_path"
@@ -272,7 +178,7 @@ def _record_confirmation_lifecycle(
         candidate=memory.as_dict(),
         decision=decision,
         risk="high" if memory.enforcement != "none" else "medium",
-        reason="User approved pending memory confirmation.",
+        reason="User directly approved this memory instruction.",
     )
 
 

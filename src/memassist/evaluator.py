@@ -17,7 +17,7 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
     decision = base.decision
     reason = base.reason
 
-    if status == "candidate" and total >= 0.68:
+    if status == "candidate" and decision != "keep_candidate" and total >= 0.68:
         status = "auto_active"
         decision = "auto_activate"
         reason = "Candidate met the memory quality threshold after evidence and specificity scoring."
@@ -25,14 +25,14 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
         status = "long_term"
         decision = "promote_long_term"
         reason = "Repeated high-quality memory was promoted to long-term memory."
-    elif status == "pending_confirmation" and scores["conflict_score"] < 0.35:
+    elif decision == "keep_candidate" and scores["conflict_score"] < 0.35:
         status = "rejected"
         decision = "reject_conflict"
         reason = "Candidate conflicts with an existing memory and needs to be discarded before activation."
-    elif status == "pending_confirmation" and total < 0.50:
+    elif decision == "keep_candidate" and total < 0.50:
         status = "rejected"
         decision = "reject_low_quality"
-        reason = "Risky candidate did not meet minimum evidence quality for confirmation."
+        reason = "Risky candidate did not meet minimum evidence quality for inactive storage."
 
     return replace(base, decision=decision, status=status, reason=reason, scores=scores, total_score=total)
 

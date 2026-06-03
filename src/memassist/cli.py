@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .confirmation import handle_direct_user_instruction, handle_pending_confirmation, pending_confirmation_context
+from .confirmation import handle_direct_user_instruction
 from .doctor import run_doctor
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
@@ -582,24 +582,12 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
                 session_id=session_id,
                 prompt=query,
             )
-            confirmation = handle_pending_confirmation(
-                store,
-                project_root=project.root,
-                project_id=project.id,
-                prompt=query,
-            )
             pack = build_memory_pack(store, query=query, project_id=project.id)
             _record_memory_injection(store, session_id=session_id, project_id=project.id, query=query, pack=pack)
             context = render_prompt_context(pack)
-            pending = store.list_memories(
-                project_id=project.id,
-                include_global=False,
-                status="pending_confirmation",
-            )
-            pending_context = pending_confirmation_context(pending)
             context_parts = [
                 part
-                for part in [direct_instruction.message, confirmation.message, context, pending_context]
+                for part in [direct_instruction.message, context]
                 if part
             ]
             context = "\n\n".join(context_parts)

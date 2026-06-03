@@ -17,8 +17,7 @@ project conventions without pasting the same context into every session.
 - Records Codex tool activity as local trace events.
 - Extracts memory candidates from completed sessions.
 - Automatically activates low-risk workflow or preference memories.
-- Keeps risky or protective memories pending until the next natural-language
-  confirmation.
+- Keeps risky or protective inferred memories as inactive candidates.
 - Retrieves relevant memories and verification reminders into future Codex
   prompts.
 - Blocks dangerous shell commands and asks for approval around protected paths.
@@ -35,12 +34,9 @@ flowchart LR
     D --> E{Risk and usefulness}
     E -->|low-risk workflow or preference| F[auto_active memory]
     E -->|touched-file evidence| G[ephemeral memory]
-    E -->|risky or protective| H[pending_confirmation]
+    E -->|risky or protective| H[inactive candidate]
     E -->|weak signal| I[rejected]
-    H --> J[Next user prompt]
-    J -->|yes / 응| K[active or policy_active]
-    J -->|no / 아니| L[rejected]
-    K --> M[Future memory retrieval]
+    H --> J[Manual review or ignored]
     F --> M
     M --> N[Relevant context injected into Codex prompt]
 ```
@@ -130,7 +126,7 @@ sequenceDiagram
 
     U->>C: Submit prompt
     C->>M: UserPromptSubmit
-    M-->>C: Pending confirmation + relevant memory context
+    M-->>C: Direct instruction result + relevant memory context
     C->>M: PreToolUse
     M-->>C: Policy decision
     C->>M: PostToolUse
@@ -153,7 +149,7 @@ The normal path is automatic:
 3. `memassist` extracts memory candidates from trace events and the final
    assistant message.
 4. Low-risk candidates become active immediately.
-5. Risky or protective candidates wait for the next user confirmation.
+5. Risky or protective inferred candidates stay inactive unless reviewed.
 6. Future prompts receive a small memory pack when the query is relevant.
 
 Current lifecycle statuses include:
@@ -164,8 +160,7 @@ Current lifecycle statuses include:
 | `candidate` | The signal may be useful but is not active yet. |
 | `auto_active` | A low-risk memory was activated automatically. |
 | `long_term` | A repeated high-quality memory was promoted for durable retrieval. |
-| `pending_confirmation` | The memory needs a short user approval or rejection. |
-| `policy_active` | An approved protective memory was added to project policy and passed simulation. |
+| `policy_active` | A direct protective instruction was added to project policy and passed simulation. |
 | `ephemeral` | Useful trace evidence kept as session context, not a durable rule. |
 | `rejected` | The memory was rejected or fell below the automatic threshold. |
 
@@ -178,7 +173,7 @@ memassist memory candidates --session latest --json
 memassist memory list --all
 ```
 
-## Natural-Language Confirmation
+## Direct Memory And Policy Instructions
 
 If the user directly gives a memory or policy instruction, memassist treats that
 instruction as already approved. For example:
@@ -199,18 +194,10 @@ adds the protected path to `.memassist/policy.yaml`. If the path cannot be
 inferred, the memory still becomes active so it can be retrieved before related
 future work.
 
-When a memory is `pending_confirmation`, the next `UserPromptSubmit` hook shows
-the pending item. A short response is enough:
-
-- `yes`, `y`, `ok`, `approve`, `remember`
-- `응`, `그래`, `좋아`, `기억해`, `승인`
-- `no`, `n`, `reject`, `cancel`
-- `아니`, `취소`, `거절`
-
-Approved low-risk pending memories become `active`. Approved protective memories
-try to infer a project path from memory text, trace files, or project filenames.
-If memassist can add that path to `.memassist/policy.yaml` and the simulated
-policy check blocks the edit, the memory becomes `policy_active`.
+Inferred risky or protective candidates are not promoted by short follow-up
+responses such as `yes`, `ok`, or `응`. They remain inactive candidates. To turn
+one into enforcement, give a direct policy instruction or promote a reviewed
+memory with an explicit protected path.
 
 ## Policy Protection
 

@@ -106,15 +106,17 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
         )
 
     if candidate.type in {"rule", "lesson"} or protective or high_risk:
-        enforcement = "require_approval" if protective or high_risk else "none"
         return CandidateDecision(
             candidate=candidate,
-            decision="pending_confirmation",
-            status="pending_confirmation",
-            risk="high" if high_risk or enforcement != "none" else "medium",
+            decision="keep_candidate",
+            status="candidate",
+            risk="high" if high_risk or protective else "medium",
             memory_kind=memory_kind,
-            enforcement=enforcement,
-            reason="Potentially strong or risky memory requires natural-language confirmation before policy activation.",
+            enforcement="none",
+            reason=(
+                "Potentially strong or risky memory is kept as an inactive candidate; "
+                "only direct user policy instructions can activate enforcement."
+            ),
         )
 
     if candidate.type in {"preference", "decision"}:

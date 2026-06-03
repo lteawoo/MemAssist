@@ -20,7 +20,6 @@ MEMORY_STATUSES = {
     "draft",
     "auto_active",
     "long_term",
-    "pending_confirmation",
     "active",
     "policy_active",
     "pinned",

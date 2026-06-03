@@ -375,6 +375,16 @@ class Store:
         self._refresh_fts(memory_id)
         self.conn.commit()
 
+    def update_enforcement(self, memory_id: str, enforcement: str) -> None:
+        if enforcement not in ENFORCEMENTS:
+            raise ValueError(f"invalid enforcement: {enforcement}")
+        self.conn.execute(
+            "UPDATE memories SET enforcement = ?, updated_at = ? WHERE id = ?",
+            (enforcement, now_iso(), memory_id),
+        )
+        self._refresh_fts(memory_id)
+        self.conn.commit()
+
     def supersede(self, old_id: str, new_id: str) -> None:
         self.conn.execute(
             """
