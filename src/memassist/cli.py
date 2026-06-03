@@ -55,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
 
+    gui = sub.add_parser("gui", help="open the read-only local memory GUI")
+    gui.add_argument("--host", default="127.0.0.1", help="localhost address to bind")
+    gui.add_argument("--port", type=int, default=8765)
+    gui.add_argument("--no-open", action="store_true", help="do not open a browser automatically")
+    gui.set_defaults(func=cmd_gui)
+
     memory = sub.add_parser("memory", help="manage memories")
     memory_sub = memory.add_subparsers(required=True)
     mem_add = memory_sub.add_parser("add", help="add a memory")
@@ -295,6 +301,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for check in report.checks:
             print(f"{check.status.upper()} {check.name}: {check.detail}")
     return 0 if report.passed else 1
+
+
+def cmd_gui(args: argparse.Namespace) -> int:
+    from .gui import run_gui
+
+    return run_gui(host=args.host, port=args.port, open_browser=not args.no_open)
 
 
 def cmd_memory_add(args: argparse.Namespace) -> int:
