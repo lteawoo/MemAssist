@@ -1,11 +1,12 @@
 # memassist
 
-`memassist`는 Codex를 위한 로컬 메모리 어시스턴트입니다. Codex 세션을
-hooks로 기록하고, 기억할 만한 후보를 추출하고, 프로젝트 단위 메모리를
-관리하며, 다음 프롬프트에 관련 기억을 다시 넣어 줍니다. 사용자가 승인한
-보호 규칙은 프로젝트 정책으로 승격할 수도 있습니다.
+`memassist`는 Codex, Claude Code, OpenCode 같은 AI 코딩 도구를 위한 로컬
+메모리 어시스턴트입니다. 각 도구의 native integration으로 세션을 기록하고,
+기억할 만한 후보를 추출하고, 프로젝트 단위 메모리를 관리하며, 다음 프롬프트에
+관련 기억을 다시 넣어 줍니다. 사용자가 승인한 보호 규칙은 프로젝트 정책으로
+승격할 수도 있습니다.
 
-반복해서 같은 프로젝트 규칙과 검증 방법을 Codex에 설명하지 않으려는 일반
+반복해서 같은 프로젝트 규칙과 검증 방법을 코딩 agent에 설명하지 않으려는 일반
 사용자를 위해 만든 도구입니다.
 
 > 현재 상태: 초기 로컬 도구입니다. CLI와 저장 구조는 사용할 수 있지만,
@@ -14,11 +15,11 @@ hooks로 기록하고, 기억할 만한 후보를 추출하고, 프로젝트 단
 
 ## 무엇을 하나요
 
-- Codex 도구 사용 내역을 로컬 trace event로 기록합니다.
+- 코딩 agent 도구 사용 내역을 로컬 trace event로 기록합니다.
 - 완료된 세션에서 메모리 후보를 추출합니다.
 - 위험도가 낮은 workflow 또는 preference 메모리를 자동 활성화합니다.
 - 추론된 위험 또는 보호 성격의 메모리는 비활성 후보로 보관합니다.
-- 이후 Codex 프롬프트에 관련 메모리와 검증 reminder를 넣어 줍니다.
+- 이후 agent 프롬프트에 관련 메모리와 검증 reminder를 넣어 줍니다.
 - 위험한 shell 명령을 차단하고, 보호 경로 수정에는 승인을 요구합니다.
 - 세션 검증과 retrieval 평가 명령을 제공합니다.
 - 로컬 SQLite 데이터베이스를 공유하지 않고 프로젝트 메모리를 export/import할 수 있습니다.
@@ -27,8 +28,8 @@ hooks로 기록하고, 기억할 만한 후보를 추출하고, 프로젝트 단
 
 ```mermaid
 flowchart LR
-    A[Codex 세션] --> B[Hooks가 trace event 기록]
-    B --> C[Stop hook이 lifecycle 실행]
+    A[Agent 세션] --> B[도구 integration이 trace event 기록]
+    B --> C[세션 종료 시 lifecycle 실행]
     C --> D[메모리 후보 추출]
     D --> E{위험도와 유용성 판단}
     E -->|낮은 위험의 workflow/preference| F[auto_active memory]
@@ -37,7 +38,7 @@ flowchart LR
     E -->|약한 신호| I[rejected]
     H --> J[수동 검토 또는 무시]
     F --> M
-    M --> N[관련 context를 Codex prompt에 주입]
+    M --> N[관련 context를 agent prompt에 주입]
 ```
 
 `memassist`는 기본적으로 `~/.memassist` 아래에 데이터를 저장합니다. 프로젝트
@@ -67,7 +68,7 @@ export MEMASSIST_HOME="$HOME/.local/share/memassist"
 
 ## 프로젝트 초기화
 
-Codex가 작업할 프로젝트 루트에서 실행합니다.
+코딩 agent가 작업할 프로젝트 루트에서 실행합니다.
 
 ```bash
 memassist init
@@ -81,11 +82,29 @@ memassist status
 - `.memassist/ignore`: 기록하지 않을 경로 목록.
 - 로컬 memassist 데이터베이스의 프로젝트 레코드.
 
-같은 단계에서 프로젝트 hooks까지 설치하려면 명시적으로 선택합니다.
+같은 단계에서 도구 integration까지 설치하려면 `--tools`를 사용합니다.
 
 ```bash
-memassist init --hooks
+memassist init --tools codex
+memassist init --tools codex,claude,opencode
+memassist init --tools all
 ```
+
+필요한 integration 범위만 설치하려면 `--mode`를 사용합니다.
+
+```bash
+memassist init --tools codex --mode context
+memassist init --tools all --mode full
+```
+
+Mode:
+
+| Mode | 동작 |
+| --- | --- |
+| `full` | 메모리 context, 정책 guard, trace 기록, lifecycle 처리를 모두 설치합니다. |
+| `context` | 메모리 context 주입만 설치합니다. |
+| `trace` | 도구/세션 trace 기록과 lifecycle 처리만 설치합니다. |
+| `guard` | 도구 실행 전 정책 검사만 설치합니다. |
 
 설정 상태는 언제든지 점검할 수 있습니다.
 
@@ -94,56 +113,67 @@ memassist doctor
 memassist doctor --json
 ```
 
-`doctor`는 프로젝트 설정, 로컬 저장소, Codex hook 설치 여부, Codex CLI 존재
-여부를 확인하고, 프로젝트 hooks는 Codex에서 `/hooks`로 신뢰해야 한다는 점을
-알려 줍니다.
+`doctor`는 프로젝트 설정, 로컬 저장소, 설치된 도구 integration, agent CLI 존재
+여부를 확인합니다. 프로젝트 integration은 각 agent 도구에서 신뢰하거나 활성화해야
+trace capture가 동작할 수 있습니다.
 
-## Codex Hooks 설치
+## 도구 Integration 관리
 
-프로젝트 로컬 Codex hooks를 설치합니다.
-
-```bash
-memassist hooks install codex
-memassist hooks status codex
-```
-
-프로젝트 hooks는 `.codex/hooks.json`에 기록됩니다. 여러 프로젝트에서 공통으로
-memassist를 실행하려는 경우에만 user-wide hook을 사용하세요.
+초기화 이후 integration을 바꾸려면 `tools`를 사용합니다.
 
 ```bash
-memassist hooks install codex --scope user
+memassist tools status
+memassist tools install claude
+memassist tools uninstall opencode
+memassist tools repair all
 ```
 
-설치된 hooks는 다음 Codex 이벤트를 사용합니다.
+프로젝트 integration은 각 도구의 native config 위치에 기록됩니다.
+
+| 도구 | 프로젝트 integration 경로 |
+| --- | --- |
+| Codex | `.codex/hooks.json` |
+| Claude Code | `.claude/settings.json` |
+| OpenCode | `.opencode/plugins/memassist.js` |
+
+여러 프로젝트에서 공통으로 memassist를 실행하려는 경우에만 user-wide integration을
+사용하세요.
+
+```bash
+memassist tools install all --scope user
+```
+
+설치된 integration은 각 도구의 lifecycle event를 같은 memassist hook handler로
+정규화합니다.
 
 ```mermaid
 sequenceDiagram
     participant U as 사용자
-    participant C as Codex
+    participant A as Agent
     participant M as memassist
 
-    U->>C: 프롬프트 제출
-    C->>M: UserPromptSubmit
-    M-->>C: 직접 지시 처리 결과 + 관련 메모리 context
-    C->>M: PreToolUse
-    M-->>C: 정책 판단
-    C->>M: PostToolUse
+    U->>A: 프롬프트 제출
+    A->>M: UserPromptSubmit
+    M-->>A: 직접 지시 처리 결과 + 관련 메모리 context
+    A->>M: PreToolUse
+    M-->>A: 정책 판단
+    A->>M: PostToolUse
     M-->>M: trace 증거 저장
-    C->>M: Stop
+    A->>M: Stop
     M-->>M: 세션 검증 및 메모리 lifecycle 실행
 ```
 
-Codex는 hook 신뢰 설정을 요구합니다. 프로젝트 hook을 설치하거나 변경한 뒤에는
-Codex CLI에서 `/hooks`를 열고 프로젝트 `.codex` layer와 정확한 hook 정의를
-신뢰해야 합니다. 자동화에서는 `--dangerously-bypass-hook-trust`도 사용할 수
-있지만, 반복적인 로컬 테스트에는 저장된 trust 설정이 더 안정적입니다.
+Codex는 hook 신뢰 설정을 요구합니다. Codex integration을 설치하거나 변경한
+뒤에는 Codex CLI에서 `/hooks`를 열고 프로젝트 `.codex` layer와 정확한 hook
+정의를 신뢰해야 합니다. Claude Code와 OpenCode는 각자의 native config/plugin
+신뢰 동작을 따릅니다.
 
 ## 자동 메모리 Lifecycle
 
 일반적인 흐름은 자동입니다.
 
-1. Codex가 hooks가 켜진 상태로 실행됩니다.
-2. `Stop` hook이 마지막 세션 상태를 기록하고 lifecycle을 실행합니다.
+1. Agent가 memassist 도구 integration이 켜진 상태로 실행됩니다.
+2. 세션 종료 event가 마지막 상태를 기록하고 lifecycle을 실행합니다.
 3. `memassist`가 trace event와 마지막 assistant 메시지에서 메모리 후보를 추출합니다.
 4. 위험도가 낮은 후보는 즉시 활성화됩니다.
 5. 추론된 위험 또는 보호 후보는 검토 전까지 비활성 상태로 남습니다.
@@ -235,8 +265,9 @@ memassist policy check --tool apply_patch --command "*** Update File: src/auth/r
 memassist policy promote <memory-id> --protected-path src/auth/refresh-token-policy.ts
 ```
 
-Codex hooks에서는 현재 `require_approval`이 deny 응답으로 매핑되며, 이유에는
-명시적 사용자 승인이 필요하다는 문구가 포함됩니다.
+도구 integration에서는 `require_approval`을 해당 도구가 제공하는 가장 강한
+차단 응답으로 매핑합니다. Codex와 OpenCode는 명시적 사용자 승인이 필요하다는
+이유와 함께 tool call을 deny합니다.
 
 ## Retrieval 및 Evaluation
 

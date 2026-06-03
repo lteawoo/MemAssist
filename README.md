@@ -1,11 +1,12 @@
 # memassist
 
-`memassist` is a local memory assistant for Codex. It records Codex sessions
-through hooks, extracts useful memory candidates, keeps project-scoped memory,
+`memassist` is a local memory assistant for AI coding tools such as Codex,
+Claude Code, and OpenCode. It records agent sessions through native tool
+integrations, extracts useful memory candidates, keeps project-scoped memory,
 retrieves relevant reminders into future prompts, and can turn approved
 protective lessons into project policy.
 
-It is designed for ordinary Codex users who want the assistant to remember
+It is designed for coding-agent users who want the assistant to remember
 project conventions without pasting the same context into every session.
 
 > Current status: early local tool. The CLI and storage model are usable, but
@@ -14,11 +15,11 @@ project conventions without pasting the same context into every session.
 
 ## What It Does
 
-- Records Codex tool activity as local trace events.
+- Records coding-agent tool activity as local trace events.
 - Extracts memory candidates from completed sessions.
 - Automatically activates low-risk workflow or preference memories.
 - Keeps risky or protective inferred memories as inactive candidates.
-- Retrieves relevant memories and verification reminders into future Codex
+- Retrieves relevant memories and verification reminders into future agent
   prompts.
 - Blocks dangerous shell commands and asks for approval around protected paths.
 - Provides session verification and retrieval evaluation commands.
@@ -28,8 +29,8 @@ project conventions without pasting the same context into every session.
 
 ```mermaid
 flowchart LR
-    A[Codex session] --> B[Hooks record trace events]
-    B --> C[Stop hook runs lifecycle]
+    A[Agent session] --> B[Tool integration records trace events]
+    B --> C[Session stop runs lifecycle]
     C --> D[Extract memory candidates]
     D --> E{Risk and usefulness}
     E -->|low-risk workflow or preference| F[auto_active memory]
@@ -38,7 +39,7 @@ flowchart LR
     E -->|weak signal| I[rejected]
     H --> J[Manual review or ignored]
     F --> M
-    M --> N[Relevant context injected into Codex prompt]
+    M --> N[Relevant context injected into the agent prompt]
 ```
 
 `memassist` stores data under `~/.memassist` by default. Project configuration
@@ -69,7 +70,7 @@ export MEMASSIST_HOME="$HOME/.local/share/memassist"
 
 ## Initialize A Project
 
-Run this from the project where Codex will work:
+Run this from the project where the coding agent will work:
 
 ```bash
 memassist init
@@ -83,11 +84,29 @@ memassist status
 - `.memassist/ignore` for paths that should not be recorded.
 - A project record in the local memassist database.
 
-If you want project hooks installed in the same step, opt in explicitly:
+Install tool integrations in the same step with `--tools`:
 
 ```bash
-memassist init --hooks
+memassist init --tools codex
+memassist init --tools codex,claude,opencode
+memassist init --tools all
 ```
+
+Use `--mode` to install only part of the integration surface:
+
+```bash
+memassist init --tools codex --mode context
+memassist init --tools all --mode full
+```
+
+Modes:
+
+| Mode | Behavior |
+| --- | --- |
+| `full` | Memory context, policy guard, trace capture, and lifecycle processing. |
+| `context` | Memory context injection only. |
+| `trace` | Tool/session trace capture and lifecycle processing. |
+| `guard` | Policy checks before tool execution. |
 
 Check setup health at any time:
 
@@ -96,56 +115,67 @@ memassist doctor
 memassist doctor --json
 ```
 
-`doctor` checks project config, local storage, Codex hook installation, Codex CLI
-availability, and reminds you that project hooks must still be trusted in Codex
-with `/hooks`.
+`doctor` checks project config, local storage, installed tool integrations, and
+available agent CLIs. Project integrations may still need to be trusted or
+enabled in each agent tool before trace capture runs.
 
-## Install Codex Hooks
+## Manage Tool Integrations
 
-Install project-local Codex hooks:
-
-```bash
-memassist hooks install codex
-memassist hooks status codex
-```
-
-Project hooks are written to `.codex/hooks.json`. Use user-wide hooks only when
-you intentionally want memassist to run across projects:
+Use `tools` after initialization to change integrations:
 
 ```bash
-memassist hooks install codex --scope user
+memassist tools status
+memassist tools install claude
+memassist tools uninstall opencode
+memassist tools repair all
 ```
 
-The installed hooks use these Codex events:
+Project integrations are written to the native config location for each tool:
+
+| Tool | Project integration path |
+| --- | --- |
+| Codex | `.codex/hooks.json` |
+| Claude Code | `.claude/settings.json` |
+| OpenCode | `.opencode/plugins/memassist.js` |
+
+Use user-wide integrations only when you intentionally want memassist to run
+across projects:
+
+```bash
+memassist tools install all --scope user
+```
+
+The integrations normalize these lifecycle events into the same memassist hook
+handler:
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant C as Codex
+    participant A as Agent
     participant M as memassist
 
-    U->>C: Submit prompt
-    C->>M: UserPromptSubmit
-    M-->>C: Direct instruction result + relevant memory context
-    C->>M: PreToolUse
-    M-->>C: Policy decision
-    C->>M: PostToolUse
+    U->>A: Submit prompt
+    A->>M: UserPromptSubmit
+    M-->>A: Direct instruction result + relevant memory context
+    A->>M: PreToolUse
+    M-->>A: Policy decision
+    A->>M: PostToolUse
     M-->>M: Store trace evidence
-    C->>M: Stop
+    A->>M: Stop
     M-->>M: Verify session and run memory lifecycle
 ```
 
-Codex requires hook trust. After installing or changing project hooks, open
-`/hooks` in Codex CLI and trust the project `.codex` layer and exact hook
-definitions. For automation, Codex also has `--dangerously-bypass-hook-trust`,
-but persisted trust is the reliable default for repeated local testing.
+Codex requires hook trust. After installing or changing the Codex integration,
+open `/hooks` in Codex CLI and trust the project `.codex` layer and exact hook
+definitions. Claude Code and OpenCode use their own native config/plugin trust
+behavior.
 
 ## Automatic Memory Lifecycle
 
 The normal path is automatic:
 
-1. Codex runs with hooks enabled.
-2. The `Stop` hook records the final session state and runs the lifecycle.
+1. The agent runs with a memassist tool integration enabled.
+2. The session stop event records the final state and runs the lifecycle.
 3. `memassist` extracts memory candidates from trace events and the final
    assistant message.
 4. Low-risk candidates become active immediately.
@@ -239,8 +269,9 @@ Promote a reviewed memory into protected-path policy:
 memassist policy promote <memory-id> --protected-path src/auth/refresh-token-policy.ts
 ```
 
-In Codex hooks, `require_approval` is currently mapped to a deny response with a
-reason telling Codex that explicit user approval is required.
+In tool integrations, `require_approval` is mapped to the strongest available
+tool-blocking response. Codex and OpenCode deny the tool call with a reason that
+explicit user approval is required.
 
 ## Retrieval And Evaluation
 
