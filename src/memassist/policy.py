@@ -18,7 +18,7 @@ class PolicyDecision:
 
 
 DEFAULT_DANGEROUS_COMMANDS = [
-    r"\brm\s+-rf\b",
+    r"\brm\s+-r[f]?\b",
     r"\bgit\s+reset\s+--hard\b",
     r"\bgit\s+clean\s+-fd\b",
     r"\bchmod\s+-R\s+777\b",
@@ -47,7 +47,7 @@ sensitive_paths:
 protected_paths: []
 
 dangerous_commands:
-  - "\\brm\\s+-rf\\b"
+  - "\\brm\\s+-r[f]?\\b"
   - "\\bgit\\s+reset\\s+--hard\\b"
   - "\\bgit\\s+clean\\s+-fd\\b"
 
@@ -89,6 +89,7 @@ class PolicyEngine:
         self.config = config
 
     def check_pre_tool(self, *, tool: str, args: dict[str, Any]) -> PolicyDecision:
+        tool_name = tool.lower()
         if tool in {"shell", "bash", "Bash"}:
             command = str(args.get("command", ""))
             for pattern in self.config.dangerous_commands:
@@ -101,12 +102,34 @@ class PolicyEngine:
                 return PolicyDecision("require_approval", f"protected path: {path_text}")
             if _matches_any(path_text, self.config.sensitive_paths):
                 return PolicyDecision("warn", f"sensitive path: {path_text}")
+        command_text = str(args.get("command", ""))
+        if tool_name in {"apply_patch", "edit", "write"} and command_text:
+            protected_path = _first_embedded_match(command_text, self.config.protected_paths)
+            if protected_path:
+                return PolicyDecision("require_approval", f"protected path: {protected_path}")
+            sensitive_path = _first_embedded_match(command_text, self.config.sensitive_paths)
+            if sensitive_path:
+                return PolicyDecision("warn", f"sensitive path: {sensitive_path}")
         return PolicyDecision("allow", "no policy matched")
 
 
 def _matches_any(path: str, patterns: list[str]) -> bool:
     normalized = path[2:] if path.startswith("./") else path
     return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
+
+
+def _first_embedded_match(text: str, patterns: list[str]) -> str | None:
+    for pattern in patterns:
+        if _glob_literal_hint(pattern) and _glob_literal_hint(pattern) in text:
+            return _glob_literal_hint(pattern)
+    return None
+
+
+def _glob_literal_hint(pattern: str) -> str:
+    special = ["*", "?", "["]
+    indexes = [pattern.find(char) for char in special if pattern.find(char) >= 0]
+    end = min(indexes) if indexes else len(pattern)
+    return pattern[:end].rstrip("/")
 
 
 def _parse_minimal_yaml(text: str) -> dict[str, list[str]]:

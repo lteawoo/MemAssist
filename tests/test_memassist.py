@@ -151,8 +151,27 @@ class MemassistTest(unittest.TestCase):
             engine = PolicyEngine(load_policy(project))
             deny = engine.check_pre_tool(tool="shell", args={"command": "rm -rf dist"})
             self.assertEqual(deny.action, "deny")
+            deny_recursive = engine.check_pre_tool(tool="shell", args={"command": "rm -r dist"})
+            self.assertEqual(deny_recursive.action, "deny")
             warn = engine.check_pre_tool(tool="file_write", args={"path": ".env"})
             self.assertEqual(warn.action, "warn")
+
+    def test_policy_detects_protected_path_inside_apply_patch(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            (project / ".memassist").mkdir()
+            (project / ".memassist" / "policy.yaml").write_text(
+                default_policy_yaml()
+                + '\nprotected_paths:\n  - "src/auth/refresh-token-policy.ts"\n',
+                encoding="utf-8",
+            )
+            engine = PolicyEngine(load_policy(project))
+            decision = engine.check_pre_tool(
+                tool="apply_patch",
+                args={
+                    "command": "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n@@\n-true\n+false\n*** End Patch\n"
+                },
+            )
+            self.assertEqual(decision.action, "require_approval")
 
     def test_codex_hook_install_status_uninstall(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -181,7 +200,7 @@ class MemassistTest(unittest.TestCase):
             with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
                 code = main(["hook", "pre-tool-use"])
             self.assertEqual(code, 0)
-            self.assertIn("allow", stdout.getvalue())
+            self.assertEqual(stdout.getvalue(), "")
 
             out = StringIO()
             with patch("sys.stdout", out):
@@ -189,6 +208,81 @@ class MemassistTest(unittest.TestCase):
             events = json.loads(out.getvalue())
             self.assertEqual(events[0]["session_id"], "sess_1")
             self.assertEqual(events[0]["event_type"], "pre_tool_use")
+
+    def test_hook_pre_tool_use_denies_with_codex_schema(self) -> None:
+        with isolated_env():
+            main(["init"])
+            payload = {
+                "session_id": "sess_2",
+                "cwd": str(Path.cwd()),
+                "tool_name": "shell",
+                "tool_input": {"command": "rm -rf dist"},
+            }
+            stdin = StringIO(json.dumps(payload))
+            stdout = StringIO()
+            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+                code = main(["hook", "pre-tool-use"])
+            self.assertEqual(code, 0)
+            hook_output = json.loads(stdout.getvalue())
+            specific = hook_output["hookSpecificOutput"]
+            self.assertEqual(specific["hookEventName"], "PreToolUse")
+            self.assertEqual(specific["permissionDecision"], "deny")
+            self.assertIn("permissionDecisionReason", specific)
+
+    def test_hook_pre_tool_use_maps_require_approval_to_deny(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            main(["init"])
+            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
+                file.write('\nprotected_paths:\n  - "src/auth/refresh-token-policy.ts"\n')
+            payload = {
+                "session_id": "sess_approval",
+                "cwd": str(project),
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "command": "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n@@\n-true\n+false\n*** End Patch\n"
+                },
+            }
+            stdin = StringIO(json.dumps(payload))
+            stdout = StringIO()
+            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+                code = main(["hook", "pre-tool-use"])
+            self.assertEqual(code, 0)
+            specific = json.loads(stdout.getvalue())["hookSpecificOutput"]
+            self.assertEqual(specific["hookEventName"], "PreToolUse")
+            self.assertEqual(specific["permissionDecision"], "deny")
+            self.assertIn("explicit user approval required", specific["permissionDecisionReason"])
+
+    def test_hook_user_prompt_submit_outputs_additional_context_schema(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            store = Store()
+            try:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="lesson",
+                    content="Session timeout fixes must not change refresh token policy.",
+                    tags=["session", "timeout", "auth"],
+                    importance=0.9,
+                )
+            finally:
+                store.close()
+            payload = {
+                "session_id": "sess_3",
+                "cwd": str(Path.cwd()),
+                "prompt": "session timeout",
+            }
+            stdin = StringIO(json.dumps(payload))
+            stdout = StringIO()
+            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+                code = main(["hook", "user-prompt-submit"])
+            self.assertEqual(code, 0)
+            hook_output = json.loads(stdout.getvalue())
+            specific = hook_output["hookSpecificOutput"]
+            self.assertEqual(specific["hookEventName"], "UserPromptSubmit")
+            self.assertIn("Session timeout", specific["additionalContext"])
 
 
 if __name__ == "__main__":

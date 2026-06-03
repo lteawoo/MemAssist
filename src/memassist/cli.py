@@ -262,15 +262,25 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
     payload = _read_json_stdin()
     project = detect_project(Path(payload.get("cwd", os.getcwd())))
     session_id = str(payload.get("sessionId") or payload.get("session_id") or "unknown")
-    tool_name = str(payload.get("toolName") or payload.get("tool") or "")
+    tool_name = str(payload.get("toolName") or payload.get("tool_name") or payload.get("tool") or "")
     tool_args = _coerce_tool_args(payload)
     with _store() as store:
         store.upsert_project(project)
         if args.hook_event == "user-prompt-submit":
             query = str(payload.get("prompt") or payload.get("message") or payload.get("content") or "")
             pack = build_memory_pack(store, query=query, project_id=project.id)
-            output = {"context": render_prompt_context(pack), "pack": pack.as_dict()}
-            print(json.dumps(output))
+            context = render_prompt_context(pack)
+            if context:
+                print(
+                    json.dumps(
+                        {
+                            "hookSpecificOutput": {
+                                "hookEventName": "UserPromptSubmit",
+                                "additionalContext": context,
+                            }
+                        }
+                    )
+                )
             return 0
         if args.hook_event == "pre-tool-use":
             decision = PolicyEngine(load_policy(project.root)).check_pre_tool(
@@ -286,8 +296,10 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
                 payload=tool_args,
                 policy_decision=decision.action,
             )
-            print(json.dumps(decision.as_dict()))
-            return 1 if decision.action == "deny" else 0
+            output = _codex_pre_tool_use_output(decision.action, decision.reason)
+            if output:
+                print(json.dumps(output))
+            return 0
         record_tool_event(
             store,
             session_id=session_id,
@@ -323,7 +335,15 @@ def _read_json_stdin() -> dict[str, Any]:
 
 
 def _coerce_tool_args(payload: dict[str, Any]) -> dict[str, Any]:
-    raw_args = payload.get("toolArgs") or payload.get("args") or payload.get("arguments") or {}
+    raw_args = (
+        payload.get("toolArgs")
+        or payload.get("tool_args")
+        or payload.get("toolInput")
+        or payload.get("tool_input")
+        or payload.get("args")
+        or payload.get("arguments")
+        or {}
+    )
     if isinstance(raw_args, str):
         try:
             decoded = json.loads(raw_args)
@@ -332,6 +352,28 @@ def _coerce_tool_args(payload: dict[str, Any]) -> dict[str, Any]:
             return {"command": raw_args}
     if isinstance(raw_args, dict):
         return raw_args
+    return {}
+
+
+def _codex_pre_tool_use_output(action: str, reason: str) -> dict[str, Any]:
+    if action == "deny":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+    if action == "require_approval":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": f"{reason}; explicit user approval required before retrying.",
+            }
+        }
+    if action == "warn":
+        return {"systemMessage": f"memassist warning: {reason}"}
     return {}
 
 
