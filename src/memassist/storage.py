@@ -79,6 +79,18 @@ class Store:
               files_json TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS lifecycle_events (
+              id TEXT PRIMARY KEY,
+              session_id TEXT,
+              project_id TEXT,
+              memory_id TEXT,
+              candidate_json TEXT,
+              decision TEXT NOT NULL,
+              risk TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
             """
         )
         try:
@@ -222,7 +234,7 @@ class Store:
         project_id: str | None,
         limit: int = 10,
     ) -> list[Memory]:
-        active_statuses = ("active", "pinned")
+        active_statuses = ("active", "auto_active", "policy_active", "pinned")
         scope_clause = "(m.scope_type = 'global' OR m.project_id = ?)"
         params: list[Any] = [query, project_id, *active_statuses]
         try:
@@ -233,7 +245,7 @@ class Store:
                 JOIN memories m ON m.id = memory_fts.memory_id
                 WHERE memory_fts MATCH ?
                   AND {scope_clause}
-                  AND m.status IN (?, ?)
+                  AND m.status IN (?, ?, ?, ?)
                 ORDER BY
                   CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
                   m.importance DESC,
@@ -250,7 +262,7 @@ class Store:
                 FROM memories m
                 WHERE (m.content LIKE ? OR m.tags_json LIKE ?)
                   AND {scope_clause}
-                  AND m.status IN (?, ?)
+                  AND m.status IN (?, ?, ?, ?)
                 ORDER BY m.importance DESC, m.updated_at DESC
                 LIMIT ?
                 """,
@@ -368,6 +380,87 @@ class Store:
                 "SELECT session_id FROM trace_events ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
         return str(row["session_id"]) if row else None
+
+    def memory_exists(
+        self,
+        *,
+        project_id: str | None,
+        content: str,
+        type: str,
+        statuses: tuple[str, ...] | None = None,
+    ) -> bool:
+        clauses = ["content = ?", "type = ?"]
+        params: list[Any] = [content, type]
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        else:
+            clauses.append("project_id IS NULL")
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        row = self.conn.execute(
+            f"SELECT 1 FROM memories WHERE {' AND '.join(clauses)} LIMIT 1",
+            params,
+        ).fetchone()
+        return row is not None
+
+    def add_lifecycle_event(
+        self,
+        *,
+        session_id: str | None,
+        project_id: str | None,
+        memory_id: str | None,
+        candidate: dict[str, Any],
+        decision: str,
+        risk: str,
+        reason: str,
+    ) -> str:
+        event_id = f"life_{uuid.uuid4().hex[:12]}"
+        self.conn.execute(
+            """
+            INSERT INTO lifecycle_events (
+              id, session_id, project_id, memory_id, candidate_json,
+              decision, risk, reason, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                session_id,
+                project_id,
+                memory_id,
+                json.dumps(candidate, ensure_ascii=False),
+                decision,
+                risk,
+                reason,
+                now_iso(),
+            ),
+        )
+        self.conn.commit()
+        return event_id
+
+    def lifecycle_events(
+        self,
+        session_id: str | None = None,
+        *,
+        project_id: str | None = None,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self.conn.execute(
+            f"SELECT * FROM lifecycle_events {where} ORDER BY created_at DESC LIMIT ?",
+            [*params, limit],
+        ).fetchall()
 
     def _upsert_fts(self, memory_id: str, content: str, tags: list[str]) -> None:
         self.conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))

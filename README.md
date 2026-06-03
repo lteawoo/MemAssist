@@ -30,7 +30,7 @@ hook definitions are trusted in Codex. If hooks are new or changed, open
 automation, Codex also exposes `--dangerously-bypass-hook-trust`, but persisted
 trust is the reliable default for repeated local testing.
 
-## Trace and learning loop
+## Always-on lifecycle
 
 After a Codex run, inspect the latest traced session:
 
@@ -40,8 +40,13 @@ PYTHONPATH=src python3 -m memassist verify --session latest --json
 PYTHONPATH=src python3 -m memassist memory candidates --session latest --json
 ```
 
-`Stop` hooks store extracted memories as `draft` records. Review them before
-promoting them to active memory:
+`Stop` hooks run the memory lifecycle automatically. The lifecycle extracts
+memory candidates, classifies risk, stores low-risk workflow or preference
+memories as `auto_active`, keeps touched-file evidence as `ephemeral`, and
+leaves risky rules as `pending_confirmation`.
+
+Manual review commands remain available for debugging and development, but they
+are not the normal user path:
 
 ```bash
 PYTHONPATH=src python3 -m memassist memory list --all
@@ -52,7 +57,7 @@ PYTHONPATH=src python3 -m memassist memory cleanup
 ```
 
 Turn a traced session into a draft lesson, promote that lesson into project
-policy, and run the lightweight evaluation loop:
+policy, and run the lightweight evaluation loop during development:
 
 ```bash
 PYTHONPATH=src python3 -m memassist lesson from-session latest --feedback "What should be remembered"
@@ -77,4 +82,5 @@ PYTHONPATH=src python3 -m memassist daemon once --session latest --json
 ```
 
 This stores draft candidates from the latest trace, expires old memories, and
-runs the lightweight evaluation check.
+runs the lightweight evaluation check. In normal Codex usage the same lifecycle
+is invoked by the `Stop` hook.

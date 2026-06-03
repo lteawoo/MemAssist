@@ -15,9 +15,16 @@ MEMORY_TYPES = {
 }
 
 MEMORY_STATUSES = {
+    "observed",
+    "candidate",
     "draft",
+    "auto_active",
+    "pending_confirmation",
     "active",
+    "policy_active",
     "pinned",
+    "ephemeral",
+    "rejected",
     "stale",
     "superseded",
     "disabled",
@@ -74,4 +81,3 @@ class Memory:
             "expires_at": self.expires_at,
             "superseded_by": self.superseded_by,
         }
-

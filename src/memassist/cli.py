@@ -11,7 +11,7 @@ from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from .lesson import lesson_from_session
-from .lifecycle import cleanup_memories
+from .lifecycle import cleanup_memories, process_session_lifecycle
 from .paths import db_path, memassist_home
 from .policy import PolicyEngine, append_protected_path, default_policy_yaml, load_policy
 from .project import detect_project
@@ -516,8 +516,7 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
             payload=payload,
         )
         if args.hook_event == "stop":
-            events = store.trace_events(session_id)
-            store_candidates(events, store.add_memory, project_id=project.id)
+            process_session_lifecycle(store, session_id=session_id, project_id=project.id)
     return 0
 
 
@@ -604,18 +603,21 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
         session_id = _resolve_session_id(store, args.session, project.id)
         stored: list[str] = []
         eval_result = None
+        lifecycle_result = None
         if session_id:
             events = store.trace_events(session_id)
-            stored = store_candidates(events, store.add_memory, project_id=project.id)
+            lifecycle_result = process_session_lifecycle(store, session_id=session_id, project_id=project.id)
+            stored = lifecycle_result.stored
             eval_result = run_eval(
                 events,
                 memories=store.list_memories(project_id=project.id, include_global=True),
                 policy=load_policy(project.root),
             )
-        cleanup_result = cleanup_memories(store)
+        cleanup_result = lifecycle_result.cleanup if lifecycle_result else cleanup_memories(store)
     payload = {
         "session_id": session_id,
         "stored_candidates": stored,
+        "lifecycle": lifecycle_result.as_dict() if lifecycle_result else None,
         "cleanup": cleanup_result.as_dict(),
         "eval": eval_result.as_dict() if eval_result else None,
     }

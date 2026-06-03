@@ -363,7 +363,7 @@ class MemassistTest(unittest.TestCase):
             self.assertIn("확인 완료했습니다.", out.getvalue())
             self.assertNotIn("\\ud655", out.getvalue())
 
-    def test_stop_hook_stores_draft_memory_candidates(self) -> None:
+    def test_stop_hook_runs_lifecycle_and_auto_activates_low_risk_memory(self) -> None:
         with isolated_env():
             main(["init"])
             payload = {
@@ -381,7 +381,55 @@ class MemassistTest(unittest.TestCase):
                 code = main(["memory", "list", "--all", "--json"])
             self.assertEqual(code, 0)
             memories = json.loads(out.getvalue())
-            self.assertTrue(any(memory["status"] == "draft" for memory in memories))
+            self.assertTrue(any(memory["status"] == "auto_active" for memory in memories))
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["memory", "search", "npm", "--json"])
+            self.assertEqual(code, 0)
+            results = json.loads(out.getvalue())
+            self.assertTrue(any("npm test" in memory["content"] for memory in results))
+
+    def test_lifecycle_keeps_risky_lessons_pending_confirmation(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_trace_event(
+                    session_id="sess_risky",
+                    project_id=project.id,
+                    event_type="pre_tool_use",
+                    tool_name="apply_patch",
+                    input_json={"command": "*** Update File: src/auth/refresh-token-policy.ts"},
+                    files=["src/auth/refresh-token-policy.ts"],
+                    policy_decision="deny",
+                )
+                store.add_trace_event(
+                    session_id="sess_risky",
+                    project_id=project.id,
+                    event_type="stop",
+                    input_json={
+                        "last_assistant_message": "앞으로 refresh token 정책은 승인 없이 수정하지 않습니다."
+                    },
+                )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["daemon", "once", "--session", "sess_risky", "--json"])
+            self.assertEqual(code, 0)
+            result = json.loads(out.getvalue())
+            lifecycle = result["lifecycle"]
+            self.assertGreaterEqual(len(lifecycle["pending_confirmation"]), 1)
+            self.assertTrue(
+                any(decision["risk"] == "high" for decision in lifecycle["decisions"])
+            )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                main(["memory", "list", "--all", "--json"])
+            memories = json.loads(out.getvalue())
+            self.assertTrue(any(memory["status"] == "pending_confirmation" for memory in memories))
 
     def test_memory_review_approve_reject_and_cleanup(self) -> None:
         with isolated_env():
@@ -587,6 +635,7 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(result["session_id"], "sess_daemon")
             self.assertTrue(result["eval"]["passed"])
             self.assertGreaterEqual(len(result["stored_candidates"]), 1)
+            self.assertGreaterEqual(len(result["lifecycle"]["auto_active"]), 1)
 
             with Store() as store:
                 self.assertEqual(store.get_memory(expired_id).status, "expired")  # type: ignore[union-attr]
