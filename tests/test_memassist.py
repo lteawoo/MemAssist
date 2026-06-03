@@ -946,6 +946,90 @@ class MemassistTest(unittest.TestCase):
                 (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
             )
 
+    def test_user_prompt_direct_policy_instruction_applies_without_second_confirmation(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
+            protected.parent.mkdir(parents=True)
+            protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
+
+            payload = {
+                "session_id": "sess_direct_policy",
+                "cwd": str(project_dir),
+                "prompt": "리프레시 토큰 관련 변경은 변경전에 나의 승인부터받아야해",
+            }
+            stdin = StringIO(json.dumps(payload))
+            stdout = StringIO()
+            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+                code = main(["hook", "user-prompt-submit"])
+            self.assertEqual(code, 0)
+            output = json.loads(stdout.getvalue())
+            self.assertIn("Direct memassist instruction was applied", output["hookSpecificOutput"]["additionalContext"])
+
+            project = detect_project()
+            with Store() as store:
+                memories = store.list_memories(project_id=project.id, include_global=True)
+            direct_memories = [
+                memory
+                for memory in memories
+                if memory.source_kind == "user_prompt_directive"
+                and "리프레시 토큰" in memory.content
+            ]
+            self.assertEqual(len(direct_memories), 1)
+            self.assertEqual(direct_memories[0].status, "policy_active")
+            self.assertEqual(direct_memories[0].enforcement, "require_approval")
+            self.assertIn(
+                "src/auth/refresh-token-policy.ts",
+                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+            )
+
+            policy_out = StringIO()
+            with patch("sys.stdout", policy_out):
+                code = main(
+                    [
+                        "policy",
+                        "check",
+                        "--tool",
+                        "apply_patch",
+                        "--command",
+                        "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n*** End Patch\n",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(policy_out.getvalue())["action"], "require_approval")
+
+    def test_user_prompt_direct_policy_instruction_does_not_approve_unrelated_pending_memory(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
+            protected.parent.mkdir(parents=True)
+            protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                pending_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="preference",
+                    content="Remember temporary branch cleanup note.",
+                    tags=["explicit"],
+                    status="pending_confirmation",
+                    enforcement="none",
+                )
+
+            payload = {
+                "session_id": "sess_direct_policy_with_pending",
+                "cwd": str(project_dir),
+                "prompt": "리프레시 토큰 관련 변경은 변경전에 나의 승인부터받아야해",
+            }
+            stdin = StringIO(json.dumps(payload))
+            with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+                code = main(["hook", "user-prompt-submit"])
+            self.assertEqual(code, 0)
+            with Store() as store:
+                pending = store.get_memory(pending_id)
+            self.assertEqual(pending.status, "pending_confirmation")  # type: ignore[union-attr]
+
     def test_user_prompt_confirmation_ignores_unrelated_trace_file_when_inferring_path(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])

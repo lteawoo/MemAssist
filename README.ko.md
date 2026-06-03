@@ -176,6 +176,24 @@ memassist memory list --all
 
 ## 자연어 확인
 
+사용자가 직접 memory 또는 policy 지시를 하면 memassist는 그 지시를 이미 승인된
+의사로 처리합니다. 예를 들면:
+
+```text
+Refresh token changes must ask for my approval before editing.
+```
+
+또는:
+
+```text
+리프레시 토큰 관련 변경은 변경 전에 나의 승인부터 받아야 해.
+```
+
+`UserPromptSubmit` 시점에 memassist는 이 지시를 즉시 저장합니다. 관련 프로젝트
+파일을 추론할 수 있으면 `.memassist/policy.yaml`에 protected path를 추가하고
+메모리를 `policy_active`로 승격합니다. 경로를 추론하지 못해도 메모리는 active
+상태가 되어 이후 관련 작업 전에 검색됩니다.
+
 메모리가 `pending_confirmation` 상태이면 다음 `UserPromptSubmit` hook에서 해당
 항목을 보여 줍니다. 짧게 답하면 됩니다.
 

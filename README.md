@@ -180,6 +180,25 @@ memassist memory list --all
 
 ## Natural-Language Confirmation
 
+If the user directly gives a memory or policy instruction, memassist treats that
+instruction as already approved. For example:
+
+```text
+Refresh token changes must ask for my approval before editing.
+```
+
+or:
+
+```text
+리프레시 토큰 관련 변경은 변경 전에 나의 승인부터 받아야 해.
+```
+
+On `UserPromptSubmit`, memassist stores the instruction immediately. If it can
+infer a matching project file, it promotes the memory to `policy_active` and
+adds the protected path to `.memassist/policy.yaml`. If the path cannot be
+inferred, the memory still becomes active so it can be retrieved before related
+future work.
+
 When a memory is `pending_confirmation`, the next `UserPromptSubmit` hook shows
 the pending item. A short response is enough:
 

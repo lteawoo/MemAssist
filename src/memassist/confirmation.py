@@ -28,6 +28,26 @@ AFFIRMATIVE = {
     "승인",
 }
 
+DIRECTIVE_TERMS = {
+    "remember",
+    "always",
+    "must",
+    "require",
+    "앞으로",
+    "항상",
+    "기억",
+    "해야",
+    "받아야",
+}
+
+APPROVAL_POLICY_TERMS = {
+    "approval",
+    "approve",
+    "confirmation",
+    "승인",
+    "확인",
+}
+
 NEGATIVE = {
     "no",
     "n",
@@ -63,6 +83,8 @@ def classify_confirmation_response(prompt: str) -> str | None:
     normalized = prompt.strip().lower()
     if not normalized:
         return None
+    if _looks_like_new_user_directive(normalized):
+        return None
     if normalized in AFFIRMATIVE:
         return "approve"
     if normalized in NEGATIVE:
@@ -72,6 +94,90 @@ def classify_confirmation_response(prompt: str) -> str | None:
     if any(word in normalized for word in NEGATIVE) and len(normalized) <= 40:
         return "reject"
     return None
+
+
+def handle_direct_user_instruction(
+    store: Store,
+    *,
+    project_root: Path,
+    project_id: str,
+    session_id: str,
+    prompt: str,
+) -> ConfirmationResult:
+    content = _direct_instruction_content(prompt)
+    if not content:
+        return ConfirmationResult("none", [], [], [], None)
+
+    existing = store.find_memory(
+        project_id=project_id,
+        content=content,
+        type="preference",
+        statuses=(
+            "candidate",
+            "draft",
+            "auto_active",
+            "pending_confirmation",
+            "active",
+            "policy_active",
+            "pinned",
+            "long_term",
+        ),
+    )
+    if existing:
+        if existing.status in {"active", "policy_active", "pinned", "long_term"}:
+            return ConfirmationResult("direct_already_applied", [existing.id], [], [], None)
+        applied, simulation, decision = _apply_approved_memory(
+            store,
+            project_root=project_root,
+            project_id=project_id,
+            memory=existing,
+        )
+        simulations = [simulation.as_dict()] if simulation else []
+        _record_confirmation_lifecycle(store, project_id=project_id, memory=existing, decision=decision)
+        message = "Direct memassist instruction was applied." if applied else "Direct memassist instruction could not be applied."
+        return ConfirmationResult("direct_apply", [existing.id] if applied else [], [], simulations, message)
+
+    enforcement = "require_approval" if _is_protective_instruction(content) else "none"
+    memory_id = store.add_memory(
+        scope_type="project",
+        project_id=project_id,
+        session_id=session_id,
+        type="preference",
+        content=content,
+        reason="User directly instructed memassist to remember this rule.",
+        tags=_instruction_tags(content),
+        status="pending_confirmation" if enforcement != "none" else "active",
+        importance=0.9,
+        confidence=0.95,
+        enforcement=enforcement,
+        source_kind="user_prompt_directive",
+        source_ref=session_id,
+    )
+    memory = store.get_memory(memory_id)
+    if not memory:
+        return ConfirmationResult("none", [], [], [], None)
+    if enforcement == "none":
+        store.add_lifecycle_event(
+            session_id=session_id,
+            project_id=project_id,
+            memory_id=memory_id,
+            candidate=memory.as_dict(),
+            decision="user_prompt_active",
+            risk="low",
+            reason="User directly instructed memassist to remember this low-risk rule.",
+        )
+        return ConfirmationResult("direct_apply", [memory_id], [], [], "Direct memassist instruction was remembered.")
+
+    applied, simulation, decision = _apply_approved_memory(
+        store,
+        project_root=project_root,
+        project_id=project_id,
+        memory=memory,
+    )
+    simulations = [simulation.as_dict()] if simulation else []
+    _record_confirmation_lifecycle(store, project_id=project_id, memory=memory, decision=decision)
+    message = "Direct memassist instruction was applied." if applied else "Direct memassist instruction could not be applied."
+    return ConfirmationResult("direct_apply", [memory_id] if applied else [], [], simulations, message)
 
 
 def pending_confirmation_context(memories: list[Memory]) -> str:
@@ -114,39 +220,60 @@ def handle_pending_confirmation(
     applied: list[str] = []
     simulations: list[dict[str, object]] = []
     for memory in pending:
-        simulation: PolicySimulationResult | None = None
-        if memory.enforcement in {"require_approval", "block"}:
-            protected_path = _infer_protected_path(store, memory, project_root)
-            if protected_path:
-                append_protected_path(project_root, protected_path)
-                simulation = simulate_protected_path(project_root, protected_path)
-                simulations.append(simulation.as_dict())
-                if simulation.passed:
-                    store.update_status(memory.id, "policy_active")
-                    applied.append(memory.id)
-                    decision = "confirmation_policy_active"
-                else:
-                    store.update_status(memory.id, "pending_confirmation")
-                    decision = "confirmation_policy_failed"
-            else:
-                store.update_status(memory.id, "active")
-                applied.append(memory.id)
-                decision = "confirmation_active_no_path"
-        else:
-            store.update_status(memory.id, "active")
-            applied.append(memory.id)
-            decision = "confirmation_active"
-        store.add_lifecycle_event(
-            session_id=memory.session_id,
+        was_applied, simulation, decision = _apply_approved_memory(
+            store,
+            project_root=project_root,
             project_id=project_id,
-            memory_id=memory.id,
-            candidate=memory.as_dict(),
-            decision=decision,
-            risk="high" if memory.enforcement != "none" else "medium",
-            reason="User approved pending memory confirmation.",
+            memory=memory,
         )
+        if simulation:
+            simulations.append(simulation.as_dict())
+        if was_applied:
+            applied.append(memory.id)
+        _record_confirmation_lifecycle(store, project_id=project_id, memory=memory, decision=decision)
     message = "Pending memassist memories were applied." if applied else "No pending memories were applied."
     return ConfirmationResult("approve", applied, [], simulations, message)
+
+
+def _apply_approved_memory(
+    store: Store,
+    *,
+    project_root: Path,
+    project_id: str,
+    memory: Memory,
+) -> tuple[bool, PolicySimulationResult | None, str]:
+    if memory.enforcement in {"require_approval", "block"}:
+        protected_path = _infer_protected_path(store, memory, project_root)
+        if protected_path:
+            append_protected_path(project_root, protected_path)
+            simulation = simulate_protected_path(project_root, protected_path)
+            if simulation.passed:
+                store.update_status(memory.id, "policy_active")
+                return True, simulation, "confirmation_policy_active"
+            store.update_status(memory.id, "pending_confirmation")
+            return False, simulation, "confirmation_policy_failed"
+        store.update_status(memory.id, "active")
+        return True, None, "confirmation_active_no_path"
+    store.update_status(memory.id, "active")
+    return True, None, "confirmation_active"
+
+
+def _record_confirmation_lifecycle(
+    store: Store,
+    *,
+    project_id: str,
+    memory: Memory,
+    decision: str,
+) -> None:
+    store.add_lifecycle_event(
+        session_id=memory.session_id,
+        project_id=project_id,
+        memory_id=memory.id,
+        candidate=memory.as_dict(),
+        decision=decision,
+        risk="high" if memory.enforcement != "none" else "medium",
+        reason="User approved pending memory confirmation.",
+    )
 
 
 def _infer_protected_path(store: Store, memory: Memory, project_root: Path) -> str | None:
@@ -176,7 +303,21 @@ def _files_from_events(events: list[Row]) -> list[str]:
 
 
 def _path_terms(path: str) -> list[str]:
-    return [part for part in re.split(r"[\s/_.-]+", path) if len(part) > 2]
+    terms = [part for part in re.split(r"[\s/_.-]+", path) if len(part) > 2]
+    text = path.lower()
+    synonyms = {
+        "리프레시": "refresh",
+        "토큰": "token",
+        "정책": "policy",
+        "세션": "session",
+        "쿠키": "cookie",
+        "인증": "auth",
+        "승인": "approval",
+    }
+    for korean, english in synonyms.items():
+        if korean in text and english not in terms:
+            terms.append(english)
+    return terms
 
 
 def _project_files_from_content(project_root: Path, content: str) -> list[str]:
@@ -228,3 +369,41 @@ def _best_content_path_match(files: list[str], content: str) -> str | None:
         return None
     scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     return scored[0][1]
+
+
+def _direct_instruction_content(prompt: str) -> str:
+    content = " ".join(prompt.strip().split())
+    if not content:
+        return ""
+    if not _looks_like_new_user_directive(content.lower()):
+        return ""
+    return content[:300]
+
+
+def _looks_like_new_user_directive(text: str) -> bool:
+    has_directive = any(term in text for term in DIRECTIVE_TERMS)
+    has_approval_policy = any(term in text for term in APPROVAL_POLICY_TERMS) and any(
+        term in text for term in {"before", "change", "edit", "변경", "수정", "전에", "전"}
+    )
+    return has_directive or has_approval_policy
+
+
+def _is_protective_instruction(content: str) -> bool:
+    lowered = content.lower()
+    return any(term in lowered for term in APPROVAL_POLICY_TERMS) and any(
+        term in lowered for term in {"before", "change", "edit", "modify", "변경", "수정", "전에", "전"}
+    )
+
+
+def _instruction_tags(content: str) -> list[str]:
+    lowered = content.lower()
+    tags = ["explicit", "user_prompt"]
+    if any(term in lowered for term in {"auth", "인증", "token", "토큰", "refresh", "리프레시"}):
+        tags.append("auth")
+    if any(term in lowered for term in {"token", "토큰"}):
+        tags.append("token")
+    if any(term in lowered for term in {"refresh", "리프레시"}):
+        tags.append("refresh")
+    if any(term in lowered for term in {"policy", "정책", "approval", "승인"}):
+        tags.append("policy")
+    return list(dict.fromkeys(tags))
