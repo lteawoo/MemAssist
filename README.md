@@ -24,6 +24,12 @@ Codex hooks install to the current project's `.codex/hooks.json` by default.
 Use `--scope user` only when you intentionally want user-wide hooks in
 `~/.codex/hooks.json`.
 
+Project-local Codex hooks run only after the project `.codex` layer and exact
+hook definitions are trusted in Codex. If hooks are new or changed, open
+`/hooks` in Codex CLI and trust them before relying on trace capture. For
+automation, Codex also exposes `--dangerously-bypass-hook-trust`, but persisted
+trust is the reliable default for repeated local testing.
+
 ## Trace and learning loop
 
 After a Codex run, inspect the latest traced session:
@@ -53,3 +59,22 @@ PYTHONPATH=src python3 -m memassist lesson from-session latest --feedback "What 
 PYTHONPATH=src python3 -m memassist policy promote <memory-id> --protected-path src/auth/refresh-token-policy.ts
 PYTHONPATH=src python3 -m memassist eval run --session latest --json
 ```
+
+Project memory can be shared without exposing the local SQLite database:
+
+```bash
+PYTHONPATH=src python3 -m memassist memory export
+PYTHONPATH=src python3 -m memassist memory import .memassist/memories.json
+```
+
+Imported memories are drafts by default. Review and approve them before they
+become active context.
+
+Run one maintenance pass after a Codex session:
+
+```bash
+PYTHONPATH=src python3 -m memassist daemon once --session latest --json
+```
+
+This stores draft candidates from the latest trace, expires old memories, and
+runs the lightweight evaluation check.

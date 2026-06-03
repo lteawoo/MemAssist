@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
 from pathlib import Path
 
 from .paths import codex_home
@@ -71,7 +73,7 @@ def install_codex_hooks(*, scope: str = "project", project_root: Path | None = N
     else:
         data = {"hooks": {}}
     hooks = data.setdefault("hooks", {})
-    for event, groups in CODEX_MEMASSIST_HOOKS.items():
+    for event, groups in _codex_memassist_hooks().items():
         existing = hooks.setdefault(event, [])
         existing[:] = [group for group in existing if not _is_memassist_group(group)]
         existing.extend(groups)
@@ -114,6 +116,29 @@ def _hooks_path(*, scope: str, project_root: Path | None, home: Path | None) -> 
     if scope == "user":
         return (home or codex_home()) / "hooks.json"
     raise ValueError(f"invalid hook scope: {scope}")
+
+
+def _codex_memassist_hooks() -> dict[str, list[dict[str, object]]]:
+    hooks = json.loads(json.dumps(CODEX_MEMASSIST_HOOKS))
+    for groups in hooks.values():
+        for group in groups:
+            for hook in group.get("hooks", []):
+                hook_event = str(hook["command"]).rsplit(" ", 1)[-1]
+                hook["command"] = _python_hook_command(hook_event)
+    return hooks
+
+
+def _python_hook_command(hook_event: str) -> str:
+    env: list[str] = []
+    source_root = Path(__file__).resolve().parents[1]
+    if (source_root / "memassist").exists():
+        env.append(f"PYTHONPATH={shlex.quote(str(source_root))}:$PYTHONPATH")
+    memassist_home = os.environ.get("MEMASSIST_HOME")
+    if memassist_home:
+        env.append(f"MEMASSIST_HOME={shlex.quote(memassist_home)}")
+    prefix = " ".join(env)
+    command = f"python3 -m memassist hook {hook_event}"
+    return f"{prefix} {command}" if prefix else command
 
 
 def _is_memassist_group(group: dict[str, object]) -> bool:

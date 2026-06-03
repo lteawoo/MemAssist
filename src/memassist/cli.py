@@ -18,6 +18,7 @@ from .project import detect_project
 from .retrieval import build_memory_pack, render_prompt_context
 from .session import summarize_session
 from .storage import Store
+from .sync import export_memories, import_memories
 from .trace import record_tool_event
 from .verifier import verify_session
 
@@ -102,6 +103,18 @@ def build_parser() -> argparse.ArgumentParser:
     mem_cleanup.add_argument("--json", action="store_true")
     mem_cleanup.set_defaults(func=cmd_memory_cleanup)
 
+    mem_export = memory_sub.add_parser("export", help="export project memories")
+    mem_export.add_argument("path", nargs="?")
+    mem_export.add_argument("--all", action="store_true")
+    mem_export.add_argument("--json", action="store_true")
+    mem_export.set_defaults(func=cmd_memory_export)
+
+    mem_import = memory_sub.add_parser("import", help="import project memories as drafts")
+    mem_import.add_argument("path", nargs="?")
+    mem_import.add_argument("--activate", action="store_true")
+    mem_import.add_argument("--json", action="store_true")
+    mem_import.set_defaults(func=cmd_memory_import)
+
     policy = sub.add_parser("policy", help="policy utilities")
     policy_sub = policy.add_subparsers(required=True)
     check = policy_sub.add_parser("check", help="check a tool call")
@@ -163,6 +176,13 @@ def build_parser() -> argparse.ArgumentParser:
     eval_run.add_argument("--session", default="latest")
     eval_run.add_argument("--json", action="store_true")
     eval_run.set_defaults(func=cmd_eval_run)
+
+    daemon = sub.add_parser("daemon", help="run maintenance tasks")
+    daemon_sub = daemon.add_subparsers(required=True)
+    daemon_once = daemon_sub.add_parser("once", help="process latest session once")
+    daemon_once.add_argument("--session", default="latest")
+    daemon_once.add_argument("--json", action="store_true")
+    daemon_once.set_defaults(func=cmd_daemon_once)
 
     return parser
 
@@ -334,6 +354,35 @@ def cmd_memory_cleanup(args: argparse.Namespace) -> int:
     else:
         for memory_id in result.expired:
             print(f"expired {memory_id}")
+    return 0
+
+
+def cmd_memory_export(args: argparse.Namespace) -> int:
+    project = detect_project()
+    output_path = Path(args.path) if args.path else project.root / ".memassist" / "memories.json"
+    with _store() as store:
+        count = export_memories(store, project_id=project.id, path=output_path, include_all=args.all)
+    if args.json:
+        print(json.dumps({"path": str(output_path), "exported": count}, indent=2))
+    else:
+        print(f"exported {count} memories: {output_path}")
+    return 0
+
+
+def cmd_memory_import(args: argparse.Namespace) -> int:
+    project = detect_project()
+    input_path = Path(args.path) if args.path else project.root / ".memassist" / "memories.json"
+    if not input_path.exists():
+        print(f"Memory export not found: {input_path}")
+        return 1
+    with _store() as store:
+        result = import_memories(store, project_id=project.id, path=input_path, activate=args.activate)
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+    else:
+        print(f"imported {len(result.imported)} memories, skipped {result.skipped}")
+        for memory_id in result.imported:
+            print(memory_id)
     return 0
 
 
@@ -545,6 +594,39 @@ def cmd_eval_run(args: argparse.Namespace) -> int:
         print("PASS" if result.passed else "FAIL")
         print(f"candidate_count: {result.candidate_count}")
     return 0 if result.passed else 1
+
+
+def cmd_daemon_once(args: argparse.Namespace) -> int:
+    project = detect_project()
+    with _store() as store:
+        store.upsert_project(project)
+        session_id = _resolve_session_id(store, args.session, project.id)
+        stored: list[str] = []
+        eval_result = None
+        if session_id:
+            events = store.trace_events(session_id)
+            stored = store_candidates(events, store.add_memory, project_id=project.id)
+            eval_result = run_eval(
+                events,
+                memories=store.list_memories(project_id=project.id, include_global=True),
+                policy=load_policy(project.root),
+            )
+        cleanup_result = cleanup_memories(store)
+    payload = {
+        "session_id": session_id,
+        "stored_candidates": stored,
+        "cleanup": cleanup_result.as_dict(),
+        "eval": eval_result.as_dict() if eval_result else None,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"session: {session_id or '-'}")
+        print(f"stored_candidates: {len(stored)}")
+        print(f"expired: {len(cleanup_result.expired)}")
+        if eval_result:
+            print("eval: " + ("PASS" if eval_result.passed else "FAIL"))
+    return 0 if eval_result is None or eval_result.passed else 1
 
 
 def _read_json_stdin() -> dict[str, Any]:

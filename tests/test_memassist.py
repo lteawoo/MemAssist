@@ -183,6 +183,11 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue(status["installed"])
             self.assertEqual(status["scope"], "project")
             self.assertIn("PreToolUse", status["events"])
+            hooks = json.loads(path.read_text(encoding="utf-8"))
+            command = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            self.assertIn("PYTHONPATH=", command)
+            self.assertIn("MEMASSIST_HOME=", command)
+            self.assertIn("python3 -m memassist hook pre-tool-use", command)
             uninstall_codex_hooks(project_root=project)
             status = codex_hooks_status(project_root=project)
             self.assertFalse(status["installed"])
@@ -487,6 +492,84 @@ class MemassistTest(unittest.TestCase):
             result = json.loads(eval_out.getvalue())
             self.assertTrue(result["passed"])
             self.assertGreaterEqual(result["candidate_count"], 1)
+
+    def test_memory_export_import_project_bundle(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            with patch("sys.stdout", StringIO()):
+                main(
+                    [
+                        "memory",
+                        "add",
+                        "--type",
+                        "rule",
+                        "--content",
+                        "Do not edit billing migrations without approval.",
+                        "--tag",
+                        "billing",
+                        "--importance",
+                        "0.9",
+                        "--enforcement",
+                        "require_approval",
+                    ]
+                )
+            export_path = project_dir / ".memassist" / "memories.json"
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["memory", "export", "--json"])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out.getvalue())["exported"], 1)
+            self.assertTrue(export_path.exists())
+
+            consumer = project_dir.parent / "consumer"
+            consumer.mkdir()
+            os.chdir(consumer)
+            main(["init"])
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["memory", "import", str(export_path), "--json"])
+            self.assertEqual(code, 0)
+            self.assertEqual(len(json.loads(out.getvalue())["imported"]), 1)
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                main(["memory", "list", "--all", "--json"])
+            imported = json.loads(out.getvalue())
+            self.assertEqual(imported[0]["status"], "draft")
+            self.assertIn("billing migrations", imported[0]["content"])
+
+    def test_daemon_once_runs_maintenance_eval_and_candidate_storage(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                expired_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="fact",
+                    content="Expired fact",
+                    expires_at="2000-01-01T00:00:00+00:00",
+                )
+                store.add_trace_event(
+                    session_id="sess_daemon",
+                    project_id=project.id,
+                    event_type="pre_tool_use",
+                    tool_name="Bash",
+                    input_json={"command": "npm test"},
+                )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["daemon", "once", "--session", "sess_daemon", "--json"])
+            self.assertEqual(code, 0)
+            result = json.loads(out.getvalue())
+            self.assertEqual(result["session_id"], "sess_daemon")
+            self.assertTrue(result["eval"]["passed"])
+            self.assertGreaterEqual(len(result["stored_candidates"]), 1)
+
+            with Store() as store:
+                self.assertEqual(store.get_memory(expired_id).status, "expired")  # type: ignore[union-attr]
 
 
 if __name__ == "__main__":
