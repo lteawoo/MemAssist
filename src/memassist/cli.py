@@ -247,7 +247,7 @@ def cmd_memory_list(args: argparse.Namespace) -> int:
             status=None if args.all else "active",
         )
     if args.json:
-        print(json.dumps([memory.as_dict() for memory in memories], indent=2))
+        _print_json([memory.as_dict() for memory in memories])
     else:
         _print_memories(memories)
     return 0
@@ -258,7 +258,7 @@ def cmd_memory_search(args: argparse.Namespace) -> int:
     with _store() as store:
         memories = store.search_memories(args.query, project_id=project.id)
     if args.json:
-        print(json.dumps([memory.as_dict() for memory in memories], indent=2))
+        _print_json([memory.as_dict() for memory in memories])
     else:
         _print_memories(memories)
     return 0
@@ -269,7 +269,7 @@ def cmd_memory_pack(args: argparse.Namespace) -> int:
     with _store() as store:
         pack = build_memory_pack(store, query=args.query, project_id=project.id)
     if args.json:
-        print(json.dumps(pack.as_dict(), indent=2))
+        _print_json(pack.as_dict())
     else:
         print(render_prompt_context(pack))
     return 0
@@ -286,14 +286,14 @@ def cmd_memory_candidates(args: argparse.Namespace) -> int:
         if args.store:
             ids = store_candidates(events, store.add_memory, project_id=project.id)
             if args.json:
-                print(json.dumps({"session_id": session_id, "stored": ids}, indent=2))
+                _print_json({"session_id": session_id, "stored": ids})
             else:
                 for memory_id in ids:
                     print(memory_id)
             return 0
         candidates = extract_candidates(events)
     if args.json:
-        print(json.dumps([candidate.as_dict() for candidate in candidates], indent=2))
+        _print_json([candidate.as_dict() for candidate in candidates])
     else:
         for candidate in candidates:
             print(f"[{candidate.type}] {candidate.content}")
@@ -326,7 +326,7 @@ def cmd_memory_review(args: argparse.Namespace) -> int:
     with _store() as store:
         memories = store.list_memories(project_id=project.id, include_global=True, status="draft")
     if args.json:
-        print(json.dumps([memory.as_dict() for memory in memories], indent=2))
+        _print_json([memory.as_dict() for memory in memories])
     else:
         _print_memories(memories)
     return 0
@@ -350,7 +350,7 @@ def cmd_memory_cleanup(args: argparse.Namespace) -> int:
     with _store() as store:
         result = cleanup_memories(store)
     if args.json:
-        print(json.dumps(result.as_dict(), indent=2))
+        _print_json(result.as_dict())
     else:
         for memory_id in result.expired:
             print(f"expired {memory_id}")
@@ -363,7 +363,7 @@ def cmd_memory_export(args: argparse.Namespace) -> int:
     with _store() as store:
         count = export_memories(store, project_id=project.id, path=output_path, include_all=args.all)
     if args.json:
-        print(json.dumps({"path": str(output_path), "exported": count}, indent=2))
+        _print_json({"path": str(output_path), "exported": count})
     else:
         print(f"exported {count} memories: {output_path}")
     return 0
@@ -378,7 +378,7 @@ def cmd_memory_import(args: argparse.Namespace) -> int:
     with _store() as store:
         result = import_memories(store, project_id=project.id, path=input_path, activate=args.activate)
     if args.json:
-        print(json.dumps(result.as_dict(), indent=2))
+        _print_json(result.as_dict())
     else:
         print(f"imported {len(result.imported)} memories, skipped {result.skipped}")
         for memory_id in result.imported:
@@ -395,7 +395,7 @@ def cmd_policy_check(args: argparse.Namespace) -> int:
     if args.path:
         payload["path"] = args.path
     decision = engine.check_pre_tool(tool=args.tool, args=payload)
-    print(json.dumps(decision.as_dict(), indent=2))
+    _print_json(decision.as_dict())
     return 1 if decision.action == "deny" else 0
 
 
@@ -460,7 +460,7 @@ def cmd_hooks_uninstall(args: argparse.Namespace) -> int:
 def cmd_hooks_status(args: argparse.Namespace) -> int:
     project = detect_project()
     if args.agent == "codex":
-        print(json.dumps(codex_hooks_status(scope=args.scope, project_root=project.root), indent=2))
+        _print_json(codex_hooks_status(scope=args.scope, project_root=project.root))
     return 0
 
 
@@ -478,13 +478,14 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
             context = render_prompt_context(pack)
             if context:
                 print(
-                    json.dumps(
+                    _json_dumps(
                         {
                             "hookSpecificOutput": {
                                 "hookEventName": "UserPromptSubmit",
                                 "additionalContext": context,
                             }
-                        }
+                        },
+                        indent=None,
                     )
                 )
             return 0
@@ -504,7 +505,7 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
             )
             output = _codex_pre_tool_use_output(decision.action, decision.reason)
             if output:
-                print(json.dumps(output))
+                print(_json_dumps(output, indent=None))
             return 0
         record_tool_event(
             store,
@@ -525,7 +526,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
         events = store.trace_events(args.session)
     rows = [dict(event) for event in events]
     if args.json:
-        print(json.dumps(rows, indent=2))
+        _print_json(rows)
     else:
         for event in rows:
             print(f"{event['created_at']} {event['event_type']} {event.get('tool_name') or '-'} {event.get('policy_decision') or ''}")
@@ -541,7 +542,7 @@ def cmd_session(args: argparse.Namespace) -> int:
             return 1
         summary = summarize_session(store.trace_events(session_id))
     if args.json:
-        print(json.dumps(summary.as_dict(), indent=2))
+        _print_json(summary.as_dict())
     else:
         print(f"Session: {summary.session_id}")
         print(f"Events: {summary.event_count}")
@@ -566,7 +567,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
             policy=load_policy(project.root),
         )
     if args.json:
-        print(json.dumps(result.as_dict(), indent=2))
+        _print_json(result.as_dict())
     else:
         print("PASS" if result.passed else "FAIL")
         for issue in result.issues:
@@ -589,7 +590,7 @@ def cmd_eval_run(args: argparse.Namespace) -> int:
             policy=load_policy(project.root),
         )
     if args.json:
-        print(json.dumps(result.as_dict(), indent=2))
+        _print_json(result.as_dict())
     else:
         print("PASS" if result.passed else "FAIL")
         print(f"candidate_count: {result.candidate_count}")
@@ -619,7 +620,7 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
         "eval": eval_result.as_dict() if eval_result else None,
     }
     if args.json:
-        print(json.dumps(payload, indent=2))
+        _print_json(payload)
     else:
         print(f"session: {session_id or '-'}")
         print(f"stored_candidates: {len(stored)}")
@@ -687,6 +688,14 @@ def _codex_pre_tool_use_output(action: str, reason: str) -> dict[str, Any]:
     if action == "warn":
         return {"systemMessage": f"memassist warning: {reason}"}
     return {}
+
+
+def _print_json(value: Any) -> None:
+    print(_json_dumps(value))
+
+
+def _json_dumps(value: Any, *, indent: int | None = 2) -> str:
+    return json.dumps(value, indent=indent, ensure_ascii=False)
 
 
 def _print_memories(memories: list[Any]) -> None:

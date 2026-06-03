@@ -343,6 +343,26 @@ class MemassistTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_session_json_outputs_unicode_without_ascii_escape(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_trace_event(
+                    session_id="sess_unicode",
+                    project_id=project.id,
+                    event_type="stop",
+                    input_json={"last_assistant_message": "확인 완료했습니다."},
+                )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["session", "latest", "--json"])
+            self.assertEqual(code, 0)
+            self.assertIn("확인 완료했습니다.", out.getvalue())
+            self.assertNotIn("\\ud655", out.getvalue())
+
     def test_stop_hook_stores_draft_memory_candidates(self) -> None:
         with isolated_env():
             main(["init"])
