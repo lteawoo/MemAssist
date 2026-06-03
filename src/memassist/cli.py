@@ -7,13 +7,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .extraction import extract_candidates, store_candidates
 from .hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from .paths import db_path, memassist_home
 from .policy import PolicyEngine, default_policy_yaml, load_policy
 from .project import detect_project
 from .retrieval import build_memory_pack, render_prompt_context
+from .session import summarize_session
 from .storage import Store
 from .trace import record_tool_event
+from .verifier import verify_session
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -61,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     mem_pack.add_argument("--json", action="store_true")
     mem_pack.set_defaults(func=cmd_memory_pack)
 
+    mem_candidates = memory_sub.add_parser("candidates", help="show or store draft memory candidates")
+    mem_candidates.add_argument("--session", default="latest")
+    mem_candidates.add_argument("--store", action="store_true")
+    mem_candidates.add_argument("--json", action="store_true")
+    mem_candidates.set_defaults(func=cmd_memory_candidates)
+
     mem_disable = memory_sub.add_parser("disable", help="disable a memory")
     mem_disable.add_argument("id")
     mem_disable.set_defaults(func=cmd_memory_disable)
@@ -107,6 +116,16 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--session")
     logs.add_argument("--json", action="store_true")
     logs.set_defaults(func=cmd_logs)
+
+    session = sub.add_parser("session", help="summarize a traced session")
+    session.add_argument("id", nargs="?", default="latest")
+    session.add_argument("--json", action="store_true")
+    session.set_defaults(func=cmd_session)
+
+    verify = sub.add_parser("verify", help="verify a traced session against memory and policy")
+    verify.add_argument("--session", default="latest")
+    verify.add_argument("--json", action="store_true")
+    verify.set_defaults(func=cmd_verify)
 
     return parser
 
@@ -196,6 +215,31 @@ def cmd_memory_pack(args: argparse.Namespace) -> int:
         print(json.dumps(pack.as_dict(), indent=2))
     else:
         print(render_prompt_context(pack))
+    return 0
+
+
+def cmd_memory_candidates(args: argparse.Namespace) -> int:
+    project = detect_project()
+    with _store() as store:
+        session_id = _resolve_session_id(store, args.session, project.id)
+        if not session_id:
+            print("No traced session found.")
+            return 1
+        events = store.trace_events(session_id)
+        if args.store:
+            ids = store_candidates(events, store.add_memory, project_id=project.id)
+            if args.json:
+                print(json.dumps({"session_id": session_id, "stored": ids}, indent=2))
+            else:
+                for memory_id in ids:
+                    print(memory_id)
+            return 0
+        candidates = extract_candidates(events)
+    if args.json:
+        print(json.dumps([candidate.as_dict() for candidate in candidates], indent=2))
+    else:
+        for candidate in candidates:
+            print(f"[{candidate.type}] {candidate.content}")
     return 0
 
 
@@ -308,6 +352,9 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
             tool_name=tool_name or None,
             payload=payload,
         )
+        if args.hook_event == "stop":
+            events = store.trace_events(session_id)
+            store_candidates(events, store.add_memory, project_id=project.id)
     return 0
 
 
@@ -323,6 +370,50 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_session(args: argparse.Namespace) -> int:
+    project = detect_project()
+    with _store() as store:
+        session_id = _resolve_session_id(store, args.id, project.id)
+        if not session_id:
+            print("No traced session found.")
+            return 1
+        summary = summarize_session(store.trace_events(session_id))
+    if args.json:
+        print(json.dumps(summary.as_dict(), indent=2))
+    else:
+        print(f"Session: {summary.session_id}")
+        print(f"Events: {summary.event_count}")
+        print("Tools: " + (", ".join(summary.tools) if summary.tools else "-"))
+        print("Files: " + (", ".join(summary.files) if summary.files else "-"))
+        print("Tests: " + (", ".join(summary.test_commands) if summary.test_commands else "-"))
+        print(f"Denied events: {summary.denied_events}")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    project = detect_project()
+    with _store() as store:
+        session_id = _resolve_session_id(store, args.session, project.id)
+        if not session_id:
+            print("No traced session found.")
+            return 1
+        memories = store.list_memories(project_id=project.id, include_global=True)
+        result = verify_session(
+            store.trace_events(session_id),
+            memories=memories,
+            policy=load_policy(project.root),
+        )
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+    else:
+        print("PASS" if result.passed else "FAIL")
+        for issue in result.issues:
+            print(f"issue: {issue}")
+        for warning in result.warnings:
+            print(f"warning: {warning}")
+    return 0 if result.passed else 1
+
+
 def _read_json_stdin() -> dict[str, Any]:
     text = sys.stdin.read().strip()
     if not text:
@@ -332,6 +423,12 @@ def _read_json_stdin() -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"raw": text}
     return value if isinstance(value, dict) else {"value": value}
+
+
+def _resolve_session_id(store: Store, requested: str, project_id: str | None) -> str | None:
+    if requested == "latest":
+        return store.latest_session_id(project_id=project_id)
+    return requested
 
 
 def _coerce_tool_args(payload: dict[str, Any]) -> dict[str, Any]:

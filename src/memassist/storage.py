@@ -318,15 +318,49 @@ class Store:
         self.conn.commit()
         return event_id
 
-    def trace_events(self, session_id: str | None = None) -> list[sqlite3.Row]:
+    def trace_events(
+        self,
+        session_id: str | None = None,
+        *,
+        project_id: str | None = None,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
         if session_id:
             return self.conn.execute(
                 "SELECT * FROM trace_events WHERE session_id = ? ORDER BY created_at",
                 (session_id,),
             ).fetchall()
+        if project_id:
+            return self.conn.execute(
+                """
+                SELECT * FROM trace_events
+                WHERE project_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (project_id, limit),
+            ).fetchall()
         return self.conn.execute(
-            "SELECT * FROM trace_events ORDER BY created_at DESC LIMIT 50"
+            "SELECT * FROM trace_events ORDER BY created_at DESC LIMIT ?",
+            (limit,),
         ).fetchall()
+
+    def latest_session_id(self, project_id: str | None = None) -> str | None:
+        if project_id:
+            row = self.conn.execute(
+                """
+                SELECT session_id FROM trace_events
+                WHERE project_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT session_id FROM trace_events ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        return str(row["session_id"]) if row else None
 
     def _upsert_fts(self, memory_id: str, content: str, tags: list[str]) -> None:
         self.conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))

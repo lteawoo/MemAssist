@@ -15,6 +15,7 @@ from memassist.policy import PolicyEngine, default_policy_yaml, load_policy
 from memassist.project import detect_project
 from memassist.retrieval import build_memory_pack
 from memassist.storage import Store
+from memassist.trace import extract_files
 
 
 @contextmanager
@@ -283,6 +284,79 @@ class MemassistTest(unittest.TestCase):
             specific = hook_output["hookSpecificOutput"]
             self.assertEqual(specific["hookEventName"], "UserPromptSubmit")
             self.assertIn("Session timeout", specific["additionalContext"])
+
+    def test_trace_extracts_apply_patch_files(self) -> None:
+        files = extract_files(
+            {
+                "command": "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n@@\n-true\n+false\n*** End Patch\n"
+            }
+        )
+        self.assertEqual(files, ["src/auth/refresh-token-policy.ts"])
+
+    def test_session_summary_and_verify(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            store = Store()
+            try:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Run npm test after auth/session changes.",
+                    tags=["verification", "test"],
+                )
+                store.add_trace_event(
+                    session_id="sess_verify",
+                    project_id=project.id,
+                    event_type="pre_tool_use",
+                    tool_name="apply_patch",
+                    input_json={
+                        "command": "*** Begin Patch\n*** Update File: src/session/session-config.ts\n*** End Patch\n"
+                    },
+                    files=["src/session/session-config.ts"],
+                )
+                out = StringIO()
+                with patch("sys.stdout", out):
+                    code = main(["verify", "--session", "sess_verify"])
+                self.assertEqual(code, 1)
+                self.assertIn("no test command", out.getvalue())
+
+                store.add_trace_event(
+                    session_id="sess_verify",
+                    project_id=project.id,
+                    event_type="pre_tool_use",
+                    tool_name="Bash",
+                    input_json={"command": "npm test"},
+                )
+                out = StringIO()
+                with patch("sys.stdout", out):
+                    code = main(["verify", "--session", "sess_verify"])
+                self.assertEqual(code, 0)
+                self.assertIn("PASS", out.getvalue())
+            finally:
+                store.close()
+
+    def test_stop_hook_stores_draft_memory_candidates(self) -> None:
+        with isolated_env():
+            main(["init"])
+            payload = {
+                "session_id": "sess_stop",
+                "cwd": str(Path.cwd()),
+                "hook_event_name": "Stop",
+                "last_assistant_message": "npm test passed. 앞으로 이 프로젝트는 npm test로 검증하세요.",
+            }
+            stdin = StringIO(json.dumps(payload))
+            with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+                code = main(["hook", "stop"])
+            self.assertEqual(code, 0)
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["memory", "list", "--all", "--json"])
+            self.assertEqual(code, 0)
+            memories = json.loads(out.getvalue())
+            self.assertTrue(any(memory["status"] == "draft" for memory in memories))
 
 
 if __name__ == "__main__":

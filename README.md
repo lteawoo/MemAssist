@@ -23,3 +23,20 @@ Set `MEMASSIST_HOME` to override the default `~/.memassist` storage location.
 Codex hooks install to the current project's `.codex/hooks.json` by default.
 Use `--scope user` only when you intentionally want user-wide hooks in
 `~/.codex/hooks.json`.
+
+## Trace and learning loop
+
+After a Codex run, inspect the latest traced session:
+
+```bash
+PYTHONPATH=src python3 -m memassist session latest --json
+PYTHONPATH=src python3 -m memassist verify --session latest --json
+PYTHONPATH=src python3 -m memassist memory candidates --session latest --json
+```
+
+`Stop` hooks store extracted memories as `draft` records. Review them before
+promoting them to active memory:
+
+```bash
+PYTHONPATH=src python3 -m memassist memory list --all
+```
