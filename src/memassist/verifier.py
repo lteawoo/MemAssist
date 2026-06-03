@@ -44,7 +44,7 @@ def verify_session(
         if memory.type == "workflow" or "verification" in memory.tags or "test" in memory.tags
     ]
     requires_tests = bool(verifier_memories or policy.verification_commands)
-    if requires_tests and not summary.test_commands:
+    if requires_tests and not summary.test_commands and not summary.denied_events:
         issues.append("Verification workflow is configured but no test command was recorded.")
 
     protected_hits = [
@@ -67,4 +67,3 @@ def _matches(path: str, pattern: str) -> bool:
     if pattern.endswith("/**"):
         return path.startswith(pattern[:-3])
     return path == pattern
-

@@ -109,15 +109,30 @@ def _explicit_memory(message: str) -> MemoryCandidate | None:
     triggers = ["remember", "기억", "앞으로", "always", "항상"]
     if not any(trigger in lowered for trigger in triggers):
         return None
-    first_line = next((line.strip() for line in message.splitlines() if line.strip()), "")
-    if not first_line:
+    explicit_line = _explicit_line(message, triggers)
+    if not explicit_line:
         return None
     return MemoryCandidate(
         type="preference",
-        content=first_line[:300],
+        content=explicit_line[:300],
         tags=["explicit", "preference"],
         importance=0.8,
         confidence=0.8,
         reason="Assistant final message contained explicit memory-like wording.",
     )
 
+
+def _explicit_line(message: str, triggers: list[str]) -> str:
+    chunks: list[str] = []
+    for line in message.splitlines():
+        cleaned = line.strip().strip("-* ")
+        if not cleaned:
+            continue
+        chunks.extend(part.strip() for part in re.split(r"(?<=[.!?。])\s+", cleaned) if part.strip())
+    if not chunks:
+        return ""
+    for chunk in chunks:
+        lowered = chunk.lower()
+        if any(trigger in lowered for trigger in triggers):
+            return chunk
+    return chunks[0]

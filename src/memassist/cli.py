@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .confirmation import handle_pending_confirmation, pending_confirmation_context
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
@@ -483,8 +484,22 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
         store.upsert_project(project)
         if args.hook_event == "user-prompt-submit":
             query = str(payload.get("prompt") or payload.get("message") or payload.get("content") or "")
+            confirmation = handle_pending_confirmation(
+                store,
+                project_root=project.root,
+                project_id=project.id,
+                prompt=query,
+            )
             pack = build_memory_pack(store, query=query, project_id=project.id)
             context = render_prompt_context(pack)
+            pending = store.list_memories(
+                project_id=project.id,
+                include_global=False,
+                status="pending_confirmation",
+            )
+            pending_context = pending_confirmation_context(pending)
+            context_parts = [part for part in [confirmation.message, context, pending_context] if part]
+            context = "\n\n".join(context_parts)
             if context:
                 print(
                     _json_dumps(

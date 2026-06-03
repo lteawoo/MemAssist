@@ -41,7 +41,7 @@ def summarize_session(events: list[Row]) -> SessionSummary:
     for event in events:
         if event["tool_name"]:
             tools.add(str(event["tool_name"]))
-        if event["policy_decision"] == "deny":
+        if event["policy_decision"] in {"deny", "require_approval"}:
             denied_events += 1
         for file in json.loads(event["files_json"] or "[]"):
             files.add(str(file))
@@ -80,4 +80,3 @@ def _command(payload: dict[str, Any]) -> str:
     if isinstance(tool_input, dict) and isinstance(tool_input.get("command"), str):
         return str(tool_input["command"])
     return ""
-

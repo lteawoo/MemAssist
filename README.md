@@ -45,6 +45,13 @@ memory candidates, classifies risk, stores low-risk workflow or preference
 memories as `auto_active`, keeps touched-file evidence as `ephemeral`, and
 leaves risky rules as `pending_confirmation`.
 
+On the next user prompt, `UserPromptSubmit` checks pending confirmations before
+building the memory pack. A short natural-language response such as `yes`, `no`,
+`응`, or `아니` is enough. Approved low-risk memories become active. Approved
+protective memories attempt to infer a project path from the memory text and
+trace, update `.memassist/policy.yaml`, simulate the policy check, and become
+`policy_active` only if the protected-path policy blocks the simulated edit.
+
 Manual review commands remain available for debugging and development, but they
 are not the normal user path:
 
@@ -78,6 +85,10 @@ PYTHONPATH=src python3 -m memassist eval retrieval \
 Retrieval eval reports `recall_at_k`, `precision_at_k`, `mrr`, and
 `forbidden_recall_rate`. Use it to catch noisy or missing memory retrieval
 before retrieved memories are injected into Codex context.
+
+For end-to-end Codex CLI testing, use the interactive CLI with trusted hooks or
+`--dangerously-bypass-hook-trust`. In Codex CLI 0.136.0, `codex exec` did not
+run project lifecycle hooks in local testing, while the interactive CLI did.
 
 Project memory can be shared without exposing the local SQLite database:
 
