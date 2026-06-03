@@ -1,0 +1,23 @@
+{
+  "cases": [
+    {
+      "query": "change session timeout and verify",
+      "expect": [
+        { "term": "npm test", "section": "verifier" },
+        { "term": "session timeout", "section": "context" }
+      ],
+      "forbid": [
+        { "term": "refresh token", "section": "context" }
+      ]
+    },
+    {
+      "query": "edit refresh token policy",
+      "expect": [
+        { "term": "refresh token", "section": "policy" }
+      ],
+      "forbid": [
+        { "term": "temporary branch", "section": "*" }
+      ]
+    }
+  ]
+}

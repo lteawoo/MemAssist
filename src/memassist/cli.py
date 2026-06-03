@@ -23,6 +23,7 @@ from .memory_eval import (
 from .paths import db_path, memassist_home
 from .policy import PolicyEngine, append_protected_path, default_policy_yaml, load_policy, remove_protected_path
 from .project import detect_project
+from .rag_eval import RagCase, RagExpectation, evaluate_rag, load_rag_cases
 from .retrieval import build_memory_pack, render_prompt_context
 from .retrieval_eval import RetrievalCase, evaluate_retrieval, load_cases
 from .session import summarize_session
@@ -214,6 +215,13 @@ def build_parser() -> argparse.ArgumentParser:
     eval_memory.add_argument("--limit", type=int, default=10)
     eval_memory.add_argument("--json", action="store_true")
     eval_memory.set_defaults(func=cmd_eval_memory)
+    eval_rag = eval_sub.add_parser("rag", help="evaluate section-aware RAG memory packs")
+    eval_rag.add_argument("--case-file")
+    eval_rag.add_argument("--query")
+    eval_rag.add_argument("--expect", action="append", default=[])
+    eval_rag.add_argument("--forbid", action="append", default=[])
+    eval_rag.add_argument("--json", action="store_true")
+    eval_rag.set_defaults(func=cmd_eval_rag)
 
     daemon = sub.add_parser("daemon", help="run maintenance tasks")
     daemon_sub = daemon.add_subparsers(required=True)
@@ -574,6 +582,7 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
                 prompt=query,
             )
             pack = build_memory_pack(store, query=query, project_id=project.id)
+            _record_memory_injection(store, session_id=session_id, project_id=project.id, query=query, pack=pack)
             context = render_prompt_context(pack)
             pending = store.list_memories(
                 project_id=project.id,
@@ -765,6 +774,34 @@ def cmd_eval_memory(args: argparse.Namespace) -> int:
     return 0 if result.passed else 1
 
 
+def cmd_eval_rag(args: argparse.Namespace) -> int:
+    project = detect_project()
+    if args.case_file:
+        cases = load_rag_cases(Path(args.case_file))
+    elif args.query:
+        cases = [
+            RagCase(
+                query=args.query,
+                expect=[RagExpectation(term=term, section="*") for term in args.expect],
+                forbid=[RagExpectation(term=term, section="*") for term in args.forbid],
+            )
+        ]
+    else:
+        print("Provide --case-file or --query.")
+        return 1
+    with _store() as store:
+        result = evaluate_rag(store, project_id=project.id, cases=cases)
+    if args.json:
+        _print_json(result.as_dict())
+    else:
+        print("PASS" if result.passed else "FAIL")
+        print(f"section_accuracy: {result.section_accuracy:.3f}")
+        print(f"context_relevance: {result.context_relevance:.3f}")
+        print(f"policy_leak_rate: {result.policy_leak_rate:.3f}")
+        print(f"verifier_recall: {result.verifier_recall:.3f}")
+    return 0 if result.passed else 1
+
+
 def cmd_daemon_once(args: argparse.Namespace) -> int:
     project = detect_project()
     with _store() as store:
@@ -810,6 +847,32 @@ def _read_json_stdin() -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"raw": text}
     return value if isinstance(value, dict) else {"value": value}
+
+
+def _record_memory_injection(
+    store: Store,
+    *,
+    session_id: str,
+    project_id: str | None,
+    query: str,
+    pack: Any,
+) -> None:
+    sections = {
+        "context": [memory.id for memory in pack.context],
+        "policy": [memory.id for memory in pack.policy],
+        "verifier": [memory.id for memory in pack.verifier],
+    }
+    memory_ids = list(dict.fromkeys(memory_id for ids in sections.values() for memory_id in ids))
+    if not memory_ids:
+        return
+    store.add_trace_event(
+        session_id=session_id,
+        project_id=project_id,
+        event_type="memory_injected",
+        tool_name="memassist",
+        input_json={"query": query, "memory_ids": memory_ids, "sections": sections},
+        files=[],
+    )
 
 
 def _resolve_session_id(store: Store, requested: str, project_id: str | None) -> str | None:

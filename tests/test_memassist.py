@@ -14,7 +14,7 @@ from memassist.extraction import extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from memassist.policy import PolicyEngine, default_policy_yaml, load_policy
 from memassist.project import detect_project
-from memassist.retrieval import build_memory_pack
+from memassist.retrieval import analyze_query_intent, build_memory_pack
 from memassist.storage import Store
 from memassist.trace import extract_files
 
@@ -135,6 +135,64 @@ class MemassistTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_query_intent_analyzes_codex_task_deterministically(self) -> None:
+        intent = analyze_query_intent(
+            "Implement auth session fix in src/auth/session.py and run pytest verification"
+        )
+        self.assertEqual(intent.task_type, "feature")
+        self.assertIn("auth", intent.domains)
+        self.assertIn("tests", intent.domains)
+        self.assertIn("src/auth/session.py", intent.likely_paths)
+        self.assertEqual(intent.risk_level, "high")
+        self.assertTrue(intent.needs_policy)
+        self.assertTrue(intent.needs_verifier)
+        self.assertIn("auth", " ".join(intent.retrieval_queries))
+
+    def test_memory_pack_uses_intent_channels_for_sections(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            store = Store()
+            try:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Retrieval pack construction lives in the memassist retrieval module.",
+                    tags=["retrieval"],
+                    paths=["src/memassist/retrieval.py"],
+                    importance=0.8,
+                )
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="rule",
+                    content="Require approval before changing active retrieval policy behavior.",
+                    tags=["policy", "retrieval"],
+                    enforcement="require_approval",
+                    importance=0.9,
+                )
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Run focused memassist retrieval unit tests after retrieval changes.",
+                    tags=["verification", "retrieval"],
+                    importance=0.7,
+                )
+                pack = build_memory_pack(
+                    store,
+                    query="Implement rank fusion policy in src/memassist/retrieval.py",
+                    project_id=project.id,
+                )
+                self.assertEqual(pack.intent.task_type if pack.intent else None, "feature")
+                self.assertTrue(any("retrieval module" in memory.content for memory in pack.context))
+                self.assertTrue(any(memory.enforcement == "require_approval" for memory in pack.policy))
+                self.assertTrue(any(memory.type == "workflow" for memory in pack.verifier))
+            finally:
+                store.close()
+
     def test_retrieval_eval_measures_expected_and_forbidden_memory(self) -> None:
         with isolated_env():
             main(["init"])
@@ -227,6 +285,81 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue(result["passed"])
             self.assertEqual(result["memory_recall"], 1.0)
             self.assertEqual(result["wrong_policy_rate"], 0.0)
+
+    def test_rag_eval_measures_section_aware_memory_pack(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Use npm test after session timeout changes.",
+                    tags=["verification", "session", "timeout"],
+                    status="long_term",
+                    importance=0.8,
+                    confidence=0.9,
+                )
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="rule",
+                    content="Refresh token policy requires explicit approval before edits.",
+                    tags=["refresh", "token", "policy"],
+                    status="policy_active",
+                    enforcement="require_approval",
+                    importance=0.9,
+                    confidence=0.9,
+                )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(
+                    [
+                        "eval",
+                        "rag",
+                        "--query",
+                        "change session timeout and verify",
+                        "--expect",
+                        "npm test",
+                        "--forbid",
+                        "temporary branch",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            result = json.loads(out.getvalue())
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["section_accuracy"], 1.0)
+
+    def test_user_prompt_submit_records_injected_memory_trace(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Use npm test after session timeout changes.",
+                    tags=["verification", "session", "timeout"],
+                    status="long_term",
+                )
+            payload = {
+                "session_id": "sess_inject",
+                "cwd": str(Path.cwd()),
+                "prompt": "change session timeout and verify",
+            }
+            stdin = StringIO(json.dumps(payload))
+            with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+                code = main(["hook", "user-prompt-submit"])
+            self.assertEqual(code, 0)
+            with Store() as store:
+                events = store.trace_events("sess_inject")
+            self.assertTrue(any(event["event_type"] == "memory_injected" for event in events))
 
     def test_memory_links_related_memories_by_tags_and_content(self) -> None:
         with isolated_env():

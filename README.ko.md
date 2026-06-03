@@ -246,6 +246,31 @@ Memory pack은 다음 영역으로 나뉩니다.
 - `policy`: warning, approval, blocking enforcement가 있는 rule 또는 memory.
 - `verifier`: test command 같은 workflow memory.
 
+RAG retrieval은 intent-aware이면서 section-aware입니다.
+
+```mermaid
+flowchart LR
+    A[사용자 프롬프트] --> B[Query intent]
+    B --> C[Lexical channel]
+    B --> D[Metadata channel]
+    B --> E[Policy channel]
+    B --> F[Verifier channel]
+    B --> G[Links/path channel]
+    C --> H[RRF fusion]
+    D --> H
+    E --> H
+    F --> H
+    G --> H
+    H --> I[Context / Policy / Verifier pack]
+    I --> J[Codex additionalContext]
+    J --> K[memory_injected trace event]
+```
+
+Deterministic intent analyzer는 task type, domain, likely path, risk level,
+policy 필요 여부, verifier 필요 여부, 파생 retrieval query를 추출합니다. 이후
+lexical, metadata, policy, verifier, memory-link/path channel을 RRF 방식으로
+결합합니다. embedding 서비스나 네트워크 의존성은 필요하지 않습니다.
+
 기대해야 하는 term과 나오면 안 되는 term으로 retrieval 품질을 평가합니다.
 
 ```bash
@@ -289,7 +314,16 @@ Memory quality evaluation은 다음 지표를 보고합니다.
 ```bash
 memassist eval retrieval --case-file evals/retrieval/basic.json --json
 memassist eval memory --case-file evals/memory_quality/basic.json --json
+memassist eval rag --case-file evals/rag/basic.json --json
 ```
+
+RAG evaluation은 section-aware입니다. 기대 term이 올바른 pack section에 있는지
+확인하고 다음 지표를 보고합니다.
+
+- `section_accuracy`
+- `context_relevance`
+- `policy_leak_rate`
+- `verifier_recall`
 
 ## Verification 및 Testing
 

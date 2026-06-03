@@ -250,6 +250,32 @@ The pack separates memories into:
 - `policy`: rules or memories with warning, approval, or blocking enforcement.
 - `verifier`: workflow memories such as test commands.
 
+RAG retrieval is intent-aware and section-aware:
+
+```mermaid
+flowchart LR
+    A[User prompt] --> B[Query intent]
+    B --> C[Lexical channel]
+    B --> D[Metadata channel]
+    B --> E[Policy channel]
+    B --> F[Verifier channel]
+    B --> G[Links/path channel]
+    C --> H[RRF fusion]
+    D --> H
+    E --> H
+    F --> H
+    G --> H
+    H --> I[Context / Policy / Verifier pack]
+    I --> J[Codex additionalContext]
+    J --> K[memory_injected trace event]
+```
+
+The deterministic intent analyzer extracts task type, domains, likely paths,
+risk level, policy need, verifier need, and derived retrieval queries. Retrieval
+then combines lexical, metadata, policy, verifier, and memory-link/path channels
+with RRF-style rank fusion. No embedding service or network dependency is
+required.
+
 Evaluate retrieval quality with expected and forbidden terms:
 
 ```bash
@@ -293,7 +319,16 @@ Example fixture files live under `evals/`:
 ```bash
 memassist eval retrieval --case-file evals/retrieval/basic.json --json
 memassist eval memory --case-file evals/memory_quality/basic.json --json
+memassist eval rag --case-file evals/rag/basic.json --json
 ```
+
+RAG evaluation is section-aware. It checks whether expected terms appear in the
+right pack section and reports:
+
+- `section_accuracy`
+- `context_relevance`
+- `policy_leak_rate`
+- `verifier_recall`
 
 ## Verification And Testing
 
