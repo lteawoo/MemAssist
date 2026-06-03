@@ -1,111 +1,330 @@
 # memassist
 
-`memassist` is a local memory, trace, and policy helper for AI coding agents.
+`memassist` is a local memory assistant for Codex. It records Codex sessions
+through hooks, extracts useful memory candidates, keeps project-scoped memory,
+retrieves relevant reminders into future prompts, and can turn approved
+protective lessons into project policy.
 
-It keeps project-scoped memories, builds relevant memory packs for agent
-context, records tool activity, and evaluates simple policies before or after
-tool use.
+It is designed for ordinary Codex users who want the assistant to remember
+project conventions without pasting the same context into every session.
 
-## MVP commands
+> Current status: early local tool. The CLI and storage model are usable, but
+> you should review generated memories and policy changes before relying on
+> them in high-risk projects.
+
+## What It Does
+
+- Records Codex tool activity as local trace events.
+- Extracts memory candidates from completed sessions.
+- Automatically activates low-risk workflow or preference memories.
+- Keeps risky or protective memories pending until the next natural-language
+  confirmation.
+- Retrieves relevant memories and verification reminders into future Codex
+  prompts.
+- Blocks dangerous shell commands and asks for approval around protected paths.
+- Provides session verification and retrieval evaluation commands.
+- Exports and imports project memory without sharing the local SQLite database.
+
+## How It Works
+
+```mermaid
+flowchart LR
+    A[Codex session] --> B[Hooks record trace events]
+    B --> C[Stop hook runs lifecycle]
+    C --> D[Extract memory candidates]
+    D --> E{Risk and usefulness}
+    E -->|low-risk workflow or preference| F[auto_active memory]
+    E -->|touched-file evidence| G[ephemeral memory]
+    E -->|risky or protective| H[pending_confirmation]
+    E -->|weak signal| I[rejected]
+    H --> J[Next user prompt]
+    J -->|yes / 응| K[active or policy_active]
+    J -->|no / 아니| L[rejected]
+    K --> M[Future memory retrieval]
+    F --> M
+    M --> N[Relevant context injected into Codex prompt]
+```
+
+`memassist` stores data under `~/.memassist` by default. Project configuration
+lives in `.memassist/` inside the project directory. A git repository is not
+required.
+
+## Installation
+
+From this repository:
 
 ```bash
-PYTHONPATH=src python3 -m memassist init
+python3 -m pip install -e .
+```
+
+During local development, you can also run commands without installing by using
+`PYTHONPATH=src`:
+
+```bash
 PYTHONPATH=src python3 -m memassist status
-PYTHONPATH=src python3 -m memassist memory add --type decision --content "Use pnpm for this repo" --tag tooling
-PYTHONPATH=src python3 -m memassist memory search "pnpm"
-PYTHONPATH=src python3 -m memassist memory pack "login session bug"
-PYTHONPATH=src python3 -m memassist policy check --tool shell --command "rm -rf dist"
-PYTHONPATH=src python3 -m memassist hooks install codex
 ```
 
-Set `MEMASSIST_HOME` to override the default `~/.memassist` storage location.
-
-Codex hooks install to the current project's `.codex/hooks.json` by default.
-Use `--scope user` only when you intentionally want user-wide hooks in
-`~/.codex/hooks.json`.
-
-Project-local Codex hooks run only after the project `.codex` layer and exact
-hook definitions are trusted in Codex. If hooks are new or changed, open
-`/hooks` in Codex CLI and trust them before relying on trace capture. For
-automation, Codex also exposes `--dangerously-bypass-hook-trust`, but persisted
-trust is the reliable default for repeated local testing.
-
-## Always-on lifecycle
-
-After a Codex run, inspect the latest traced session:
+Set `MEMASSIST_HOME` if you want to keep the database somewhere other than
+`~/.memassist`:
 
 ```bash
-PYTHONPATH=src python3 -m memassist session latest --json
-PYTHONPATH=src python3 -m memassist verify --session latest --json
-PYTHONPATH=src python3 -m memassist memory candidates --session latest --json
+export MEMASSIST_HOME="$HOME/.local/share/memassist"
 ```
 
-`Stop` hooks run the memory lifecycle automatically. The lifecycle extracts
-memory candidates, classifies risk, stores low-risk workflow or preference
-memories as `auto_active`, keeps touched-file evidence as `ephemeral`, and
-leaves risky rules as `pending_confirmation`.
+## Initialize A Project
 
-On the next user prompt, `UserPromptSubmit` checks pending confirmations before
-building the memory pack. A short natural-language response such as `yes`, `no`,
-`응`, or `아니` is enough. Approved low-risk memories become active. Approved
-protective memories attempt to infer a project path from the memory text and
-trace, update `.memassist/policy.yaml`, simulate the policy check, and become
-`policy_active` only if the protected-path policy blocks the simulated edit.
-
-Manual review commands remain available for debugging and development, but they
-are not the normal user path:
+Run this from the project where Codex will work:
 
 ```bash
-PYTHONPATH=src python3 -m memassist memory list --all
-PYTHONPATH=src python3 -m memassist memory review
-PYTHONPATH=src python3 -m memassist memory approve <memory-id>
-PYTHONPATH=src python3 -m memassist memory reject <memory-id>
-PYTHONPATH=src python3 -m memassist memory cleanup
+memassist init
+memassist status
 ```
 
-Turn a traced session into a draft lesson, promote that lesson into project
-policy, and run the lightweight evaluation loop during development:
+`init` creates:
+
+- `.memassist/policy.yaml` for sensitive paths, protected paths, dangerous
+  command patterns, and verification commands.
+- `.memassist/ignore` for paths that should not be recorded.
+- A project record in the local memassist database.
+
+## Install Codex Hooks
+
+Install project-local Codex hooks:
 
 ```bash
-PYTHONPATH=src python3 -m memassist lesson from-session latest --feedback "What should be remembered"
-PYTHONPATH=src python3 -m memassist policy promote <memory-id> --protected-path src/auth/refresh-token-policy.ts
-PYTHONPATH=src python3 -m memassist eval run --session latest --json
+memassist hooks install codex
+memassist hooks status codex
 ```
 
-Evaluate retrieval quality with expected and forbidden memory terms:
+Project hooks are written to `.codex/hooks.json`. Use user-wide hooks only when
+you intentionally want memassist to run across projects:
 
 ```bash
-PYTHONPATH=src python3 -m memassist eval retrieval \
+memassist hooks install codex --scope user
+```
+
+The installed hooks use these Codex events:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as Codex
+    participant M as memassist
+
+    U->>C: Submit prompt
+    C->>M: UserPromptSubmit
+    M-->>C: Pending confirmation + relevant memory context
+    C->>M: PreToolUse
+    M-->>C: Policy decision
+    C->>M: PostToolUse
+    M-->>M: Store trace evidence
+    C->>M: Stop
+    M-->>M: Verify session and run memory lifecycle
+```
+
+Codex requires hook trust. After installing or changing project hooks, open
+`/hooks` in Codex CLI and trust the project `.codex` layer and exact hook
+definitions. For automation, Codex also has `--dangerously-bypass-hook-trust`,
+but persisted trust is the reliable default for repeated local testing.
+
+## Automatic Memory Lifecycle
+
+The normal path is automatic:
+
+1. Codex runs with hooks enabled.
+2. The `Stop` hook records the final session state and runs the lifecycle.
+3. `memassist` extracts memory candidates from trace events and the final
+   assistant message.
+4. Low-risk candidates become active immediately.
+5. Risky or protective candidates wait for the next user confirmation.
+6. Future prompts receive a small memory pack when the query is relevant.
+
+Current lifecycle statuses include:
+
+| Status | Meaning |
+| --- | --- |
+| `observed` | A behavior or event was seen in a session trace. |
+| `candidate` | The signal may be useful but is not active yet. |
+| `auto_active` | A low-risk memory was activated automatically. |
+| `pending_confirmation` | The memory needs a short user approval or rejection. |
+| `policy_active` | An approved protective memory was added to project policy and passed simulation. |
+| `ephemeral` | Useful trace evidence kept as session context, not a durable rule. |
+| `rejected` | The memory was rejected or fell below the automatic threshold. |
+
+Inspect the latest lifecycle state:
+
+```bash
+memassist session latest --json
+memassist verify --session latest --json
+memassist memory candidates --session latest --json
+memassist memory list --all
+```
+
+## Natural-Language Confirmation
+
+When a memory is `pending_confirmation`, the next `UserPromptSubmit` hook shows
+the pending item. A short response is enough:
+
+- `yes`, `y`, `ok`, `approve`, `remember`
+- `응`, `그래`, `좋아`, `기억해`, `승인`
+- `no`, `n`, `reject`, `cancel`
+- `아니`, `취소`, `거절`
+
+Approved low-risk pending memories become `active`. Approved protective memories
+try to infer a project path from memory text, trace files, or project filenames.
+If memassist can add that path to `.memassist/policy.yaml` and the simulated
+policy check blocks the edit, the memory becomes `policy_active`.
+
+## Policy Protection
+
+`memassist` ships with a small local policy engine. The default policy warns on
+sensitive paths, denies dangerous recursive commands, and lets you add protected
+paths that require explicit approval.
+
+Example `.memassist/policy.yaml`:
+
+```yaml
+sensitive_paths:
+  - ".env"
+  - ".env.*"
+  - "*.pem"
+  - "*.key"
+  - "*secret*"
+
+protected_paths:
+  - "src/auth/refresh-token-policy.ts"
+
+dangerous_commands:
+  - "\\brm\\s+-r[f]?\\b"
+  - "\\bgit\\s+reset\\s+--hard\\b"
+  - "\\bgit\\s+clean\\s+-fd\\b"
+
+verification_commands: []
+```
+
+Check policy decisions manually:
+
+```bash
+memassist policy check --tool shell --command "rm -rf dist"
+memassist policy check --tool apply_patch --command "*** Update File: src/auth/refresh-token-policy.ts"
+```
+
+Promote a reviewed memory into protected-path policy:
+
+```bash
+memassist policy promote <memory-id> --protected-path src/auth/refresh-token-policy.ts
+```
+
+In Codex hooks, `require_approval` is currently mapped to a deny response with a
+reason telling Codex that explicit user approval is required.
+
+## Retrieval And Evaluation
+
+Build a memory pack for a new prompt:
+
+```bash
+memassist memory pack "login session bug"
+```
+
+The pack separates memories into:
+
+- `context`: relevant facts, lessons, decisions, and preferences.
+- `policy`: rules or memories with warning, approval, or blocking enforcement.
+- `verifier`: workflow memories such as test commands.
+
+Evaluate retrieval quality with expected and forbidden terms:
+
+```bash
+memassist eval retrieval \
   --query "session timeout npm verification" \
   --expect "npm test" \
   --forbid "refresh token" \
   --json
 ```
 
-Retrieval eval reports `recall_at_k`, `precision_at_k`, `mrr`, and
-`forbidden_recall_rate`. Use it to catch noisy or missing memory retrieval
-before retrieved memories are injected into Codex context.
+Retrieval evaluation reports:
 
-For end-to-end Codex CLI testing, use the interactive CLI with trusted hooks or
-`--dangerously-bypass-hook-trust`. In Codex CLI 0.136.0, `codex exec` did not
-run project lifecycle hooks in local testing, while the interactive CLI did.
+- `recall_at_k`
+- `precision_at_k`
+- `mrr`
+- `forbidden_recall_rate`
 
-Project memory can be shared without exposing the local SQLite database:
+Use this before depending on automatic memory injection in a project where noisy
+or stale memories could mislead Codex.
+
+## Verification And Testing
+
+Verify a traced session:
 
 ```bash
-PYTHONPATH=src python3 -m memassist memory export
-PYTHONPATH=src python3 -m memassist memory import .memassist/memories.json
+memassist verify --session latest
+memassist eval run --session latest --json
+```
+
+Verification checks trace evidence against visible memories and project policy.
+For example, it can flag a session that touched code without an observed test
+command, while treating policy-denied protected edits as expected blocks.
+
+Run one maintenance pass manually:
+
+```bash
+memassist daemon once --session latest --json
+```
+
+This processes memory candidates, expires old memories, and runs lightweight
+evaluation checks. In normal Codex usage, the `Stop` hook invokes the same
+lifecycle automatically.
+
+Run the repository tests:
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests
+```
+
+## Manual Memory Commands
+
+Manual commands are useful for debugging, reviewing, and bootstrapping:
+
+```bash
+memassist memory add --type decision --content "Use pnpm for this repo" --tag tooling
+memassist memory search "pnpm"
+memassist memory list --all
+memassist memory review
+memassist memory approve <memory-id>
+memassist memory reject <memory-id>
+memassist memory cleanup
+```
+
+Export and import project memory:
+
+```bash
+memassist memory export
+memassist memory import .memassist/memories.json
 ```
 
 Imported memories are drafts by default. Review and approve them before they
 become active context.
 
-Run one maintenance pass after a Codex session:
+## Known Codex CLI Caveat
 
-```bash
-PYTHONPATH=src python3 -m memassist daemon once --session latest --json
-```
+End-to-end local testing confirmed that interactive Codex CLI sessions can run
+the installed lifecycle hooks when the hook definitions are trusted or hook trust
+is bypassed.
 
-This stores draft candidates from the latest trace, expires old memories, and
-runs the lightweight evaluation check. In normal Codex usage the same lifecycle
-is invoked by the `Stop` hook.
+In Codex CLI `0.136.0`, `codex exec` did not run project lifecycle hooks in
+local testing. Use the interactive CLI for hook-based E2E validation until that
+behavior is verified in your installed Codex version.
+
+## Storage And Privacy
+
+- Memory and traces are local by default.
+- The default database path is under `~/.memassist`.
+- Project policy and ignore files live under `.memassist/`.
+- Exported memories can be shared as `.memassist/memories.json`; the local
+  SQLite database does not need to be shared.
+- Add sensitive files or generated directories to `.memassist/ignore` when they
+  should not appear in trace-derived memory candidates.
+
+## Korean README
+
+A Korean version is available at [README.ko.md](README.ko.md).
