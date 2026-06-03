@@ -333,6 +333,52 @@ class MemassistTest(unittest.TestCase):
             result = json.loads(out.getvalue())
             self.assertTrue(result["passed"])
             self.assertEqual(result["section_accuracy"], 1.0)
+            self.assertIn("score", result)
+
+    def test_rag_eval_case_file_can_seed_temporary_memories(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            case_file = project_dir / "rag_seed.json"
+            case_file.write_text(
+                json.dumps(
+                    {
+                        "cases": [
+                            {
+                                "query": "change session timeout and verify",
+                                "seed": [
+                                    {
+                                        "section": "context",
+                                        "content": "Session timeout fixes should update timeout behavior only.",
+                                        "tags": ["auth", "session", "timeout"],
+                                    },
+                                    {
+                                        "section": "verifier",
+                                        "content": "Run npm test -- auth session after timeout changes.",
+                                        "tags": ["verification", "test", "auth"],
+                                    },
+                                ],
+                                "expect": [
+                                    {"term": "session timeout", "section": "context"},
+                                    {"term": "npm test", "section": "verifier"},
+                                ],
+                                "forbid": [{"term": "refresh token", "section": "*"}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["eval", "rag", "--case-file", str(case_file), "--json"])
+            self.assertEqual(code, 0)
+            result = json.loads(out.getvalue())
+            self.assertTrue(result["passed"])
+            self.assertGreaterEqual(result["score"], 4.5)
+            with Store() as store:
+                memories = store.list_memories(project_id=detect_project().id, include_global=True)
+            self.assertFalse(any(memory.source_kind == "rag_eval_seed" for memory in memories))
 
     def test_user_prompt_submit_records_injected_memory_trace(self) -> None:
         with isolated_env():

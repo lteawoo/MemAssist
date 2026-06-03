@@ -784,6 +784,7 @@ def cmd_eval_rag(args: argparse.Namespace) -> int:
                 query=args.query,
                 expect=[RagExpectation(term=term, section="*") for term in args.expect],
                 forbid=[RagExpectation(term=term, section="*") for term in args.forbid],
+                seed=[],
             )
         ]
     else:
@@ -799,6 +800,8 @@ def cmd_eval_rag(args: argparse.Namespace) -> int:
         print(f"context_relevance: {result.context_relevance:.3f}")
         print(f"policy_leak_rate: {result.policy_leak_rate:.3f}")
         print(f"verifier_recall: {result.verifier_recall:.3f}")
+        print(f"pass_rate: {result.pass_rate:.3f}")
+        print(f"score: {result.score:.3f}")
     return 0 if result.passed else 1
 
 

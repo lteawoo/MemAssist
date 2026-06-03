@@ -276,6 +276,41 @@ then combines lexical, metadata, policy, verifier, and memory-link/path channels
 with RRF-style rank fusion. No embedding service or network dependency is
 required.
 
+The current implementation is a local memory-pack RAG system, not a general
+document QA system. It is optimized for coding-agent reminders:
+
+```mermaid
+flowchart TD
+    Q[Prompt] --> I[Intent analysis]
+    I --> L[Lexical FTS/BM25]
+    I --> M[Metadata and path scoring]
+    I --> P[Policy channel]
+    I --> V[Verifier channel]
+    I --> G[Memory links and path expansion]
+    L --> F[RRF fusion]
+    M --> F
+    P --> F
+    V --> F
+    G --> F
+    F --> S[Section assignment]
+    S --> C[Context memories]
+    S --> R[Policy reminders]
+    S --> T[Verification reminders]
+    C --> A[Codex additionalContext]
+    R --> A
+    T --> A
+```
+
+The quality target for this repository is a `memassist eval rag` score of 4.5
+or higher on seeded, repeatable fixtures. The score is a 5-point weighted
+summary:
+
+- `section_accuracy`: expected memories appear in the expected pack section.
+- `context_relevance`: expected hits are dense relative to retrieved pack size.
+- `policy_leak_rate`: forbidden policy leakage remains zero.
+- `verifier_recall`: expected verification workflows are retrieved.
+- `pass_rate`: each case satisfies expected and forbidden terms.
+
 Evaluate retrieval quality with expected and forbidden terms:
 
 ```bash
@@ -329,6 +364,80 @@ right pack section and reports:
 - `context_relevance`
 - `policy_leak_rate`
 - `verifier_recall`
+- `pass_rate`
+- `score`
+
+RAG fixture cases may include a `seed` list. These memories are inserted only
+for that case and removed before the command exits, so fixture evaluation works
+even when the current project has no active memories:
+
+```json
+{
+  "query": "change session timeout and verify",
+  "seed": [
+    {
+      "section": "context",
+      "content": "Session timeout fixes should update the session timeout behavior only.",
+      "tags": ["auth", "session", "timeout"],
+      "paths": ["src/auth/session.py"]
+    },
+    {
+      "section": "verifier",
+      "content": "Run npm test -- auth session after session timeout changes.",
+      "tags": ["verification", "test", "auth", "session"]
+    }
+  ],
+  "expect": [
+    { "term": "session timeout", "section": "context" },
+    { "term": "npm test", "section": "verifier" }
+  ],
+  "forbid": [
+    { "term": "refresh token", "section": "context" }
+  ]
+}
+```
+
+The repository fixture currently passes the target:
+
+```bash
+PYTHONPATH=src python3 -m memassist eval rag --case-file evals/rag/basic.json --json
+```
+
+Expected headline result:
+
+```json
+{
+  "passed": true,
+  "score": 4.833
+}
+```
+
+## RAG Improvement Roadmap
+
+The next quality steps are intentionally staged so each can be verified with
+fixture evals before it changes prompt injection behavior:
+
+```mermaid
+flowchart LR
+    A[Seeded eval fixtures] --> B[Score and failure diagnostics]
+    B --> C[Contextual memory index text]
+    C --> D[Optional dense retrieval channel]
+    D --> E[Cross-encoder reranking]
+    E --> F[Corrective confidence gate]
+    F --> G[Trace-derived production eval set]
+```
+
+The planned 4.5+ architecture keeps the current local-first behavior, then adds
+optional layers:
+
+- Contextual memory text: index memory content together with section, path,
+  project, and risk context so short memories do not lose meaning.
+- Hybrid retrieval: combine sparse BM25 with optional dense embeddings through
+  rank fusion.
+- Reranking: re-score top retrieval candidates before section assignment.
+- Corrective gate: suppress or shrink memory packs when retrieval confidence is
+  low or memories conflict.
+- Production eval slices: promote real trace failures into repeatable cases.
 
 ## Verification And Testing
 
@@ -415,3 +524,26 @@ behavior is verified in your installed Codex version.
 ## Korean README
 
 A Korean version is available at [README.ko.md](README.ko.md).
+
+## References
+
+- RAGAS: Automated Evaluation of Retrieval Augmented Generation:
+  https://arxiv.org/abs/2309.15217
+- RAGAS metrics documentation:
+  https://docs.ragas.io/en/v0.3.1/concepts/metrics/available_metrics/
+- TruLens RAG Triad:
+  https://www.trulens.org/getting_started/core_concepts/rag_triad/
+- Anthropic Contextual Retrieval:
+  https://www.anthropic.com/engineering/contextual-retrieval
+- Corrective Retrieval Augmented Generation:
+  https://arxiv.org/abs/2401.15884
+- Self-RAG:
+  https://arxiv.org/abs/2310.11511
+- BGE reranker documentation:
+  https://bge-model.com/Introduction/reranker.html
+- ColBERTv2:
+  https://arxiv.org/abs/2112.01488
+- RAPTOR:
+  https://arxiv.org/abs/2401.18059
+- Microsoft GraphRAG:
+  https://microsoft.github.io/graphrag//index/overview/

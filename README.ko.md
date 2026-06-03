@@ -271,6 +271,40 @@ policy 필요 여부, verifier 필요 여부, 파생 retrieval query를 추출�
 lexical, metadata, policy, verifier, memory-link/path channel을 RRF 방식으로
 결합합니다. embedding 서비스나 네트워크 의존성은 필요하지 않습니다.
 
+현재 구현은 범용 문서 QA RAG가 아니라 coding-agent reminder를 위한 local
+memory-pack RAG입니다.
+
+```mermaid
+flowchart TD
+    Q[Prompt] --> I[Intent analysis]
+    I --> L[Lexical FTS/BM25]
+    I --> M[Metadata/path scoring]
+    I --> P[Policy channel]
+    I --> V[Verifier channel]
+    I --> G[Memory links/path expansion]
+    L --> F[RRF fusion]
+    M --> F
+    P --> F
+    V --> F
+    G --> F
+    F --> S[Section assignment]
+    S --> C[Context memories]
+    S --> R[Policy reminders]
+    S --> T[Verification reminders]
+    C --> A[Codex additionalContext]
+    R --> A
+    T --> A
+```
+
+이 저장소의 RAG 품질 목표는 seeded fixture에서 `memassist eval rag` 점수 4.5
+이상을 유지하는 것입니다. 점수는 5점 만점 가중 요약입니다.
+
+- `section_accuracy`: 기대 memory가 기대한 pack section에 들어갔는지.
+- `context_relevance`: 검색된 pack 크기 대비 기대 hit가 충분히 조밀한지.
+- `policy_leak_rate`: 금지된 policy/context 누수가 없는지.
+- `verifier_recall`: 필요한 검증 workflow가 검색되는지.
+- `pass_rate`: 각 case가 기대/금지 조건을 만족하는지.
+
 기대해야 하는 term과 나오면 안 되는 term으로 retrieval 품질을 평가합니다.
 
 ```bash
@@ -324,6 +358,75 @@ RAG evaluation은 section-aware입니다. 기대 term이 올바른 pack section�
 - `context_relevance`
 - `policy_leak_rate`
 - `verifier_recall`
+- `pass_rate`
+- `score`
+
+RAG fixture case에는 `seed` 목록을 넣을 수 있습니다. 이 memory들은 해당 case
+평가 중에만 삽입되고 명령 종료 전에 삭제되므로, 현재 프로젝트에 active memory가
+없어도 반복 가능한 평가가 가능합니다.
+
+```json
+{
+  "query": "change session timeout and verify",
+  "seed": [
+    {
+      "section": "context",
+      "content": "Session timeout fixes should update the session timeout behavior only.",
+      "tags": ["auth", "session", "timeout"],
+      "paths": ["src/auth/session.py"]
+    },
+    {
+      "section": "verifier",
+      "content": "Run npm test -- auth session after session timeout changes.",
+      "tags": ["verification", "test", "auth", "session"]
+    }
+  ],
+  "expect": [
+    { "term": "session timeout", "section": "context" },
+    { "term": "npm test", "section": "verifier" }
+  ],
+  "forbid": [
+    { "term": "refresh token", "section": "context" }
+  ]
+}
+```
+
+현재 저장소 fixture는 목표 점수를 통과합니다.
+
+```bash
+PYTHONPATH=src python3 -m memassist eval rag --case-file evals/rag/basic.json --json
+```
+
+대표 결과:
+
+```json
+{
+  "passed": true,
+  "score": 4.833
+}
+```
+
+## RAG 개선 로드맵
+
+다음 단계는 fixture eval로 검증한 뒤 prompt injection 동작에 반영합니다.
+
+```mermaid
+flowchart LR
+    A[Seeded eval fixtures] --> B[Score/failure diagnostics]
+    B --> C[Contextual memory index text]
+    C --> D[Optional dense retrieval channel]
+    D --> E[Cross-encoder reranking]
+    E --> F[Corrective confidence gate]
+    F --> G[Trace-derived production eval set]
+```
+
+- Contextual memory text: section, path, project, risk context를 memory content와
+  함께 색인합니다.
+- Hybrid retrieval: BM25와 optional dense embedding을 rank fusion으로 결합합니다.
+- Reranking: section assignment 전에 top 후보를 재점수화합니다.
+- Corrective gate: confidence가 낮거나 memory가 충돌하면 pack을 줄이거나 주입을
+  막습니다.
+- Production eval slices: 실제 trace 실패를 반복 가능한 fixture로 승격합니다.
 
 ## Verification 및 Testing
 
@@ -410,3 +513,26 @@ hook 기반 E2E 검증에 interactive CLI를 사용하세요.
 ## English README
 
 English version: [README.md](README.md).
+
+## References
+
+- RAGAS: Automated Evaluation of Retrieval Augmented Generation:
+  https://arxiv.org/abs/2309.15217
+- RAGAS metrics documentation:
+  https://docs.ragas.io/en/v0.3.1/concepts/metrics/available_metrics/
+- TruLens RAG Triad:
+  https://www.trulens.org/getting_started/core_concepts/rag_triad/
+- Anthropic Contextual Retrieval:
+  https://www.anthropic.com/engineering/contextual-retrieval
+- Corrective Retrieval Augmented Generation:
+  https://arxiv.org/abs/2401.15884
+- Self-RAG:
+  https://arxiv.org/abs/2310.11511
+- BGE reranker documentation:
+  https://bge-model.com/Introduction/reranker.html
+- ColBERTv2:
+  https://arxiv.org/abs/2112.01488
+- RAPTOR:
+  https://arxiv.org/abs/2401.18059
+- Microsoft GraphRAG:
+  https://microsoft.github.io/graphrag//index/overview/

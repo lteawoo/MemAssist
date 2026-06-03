@@ -2,6 +2,21 @@
   "cases": [
     {
       "query": "change session timeout and verify",
+      "seed": [
+        {
+          "section": "context",
+          "type": "lesson",
+          "content": "Session timeout fixes should update the session timeout behavior only.",
+          "tags": ["auth", "session", "timeout"],
+          "paths": ["src/auth/session.py"]
+        },
+        {
+          "section": "verifier",
+          "type": "workflow",
+          "content": "Run npm test -- auth session after session timeout changes.",
+          "tags": ["verification", "test", "auth", "session"]
+        }
+      ],
       "expect": [
         { "term": "npm test", "section": "verifier" },
         { "term": "session timeout", "section": "context" }
@@ -12,6 +27,16 @@
     },
     {
       "query": "edit refresh token policy",
+      "seed": [
+        {
+          "section": "policy",
+          "type": "rule",
+          "content": "Refresh token policy requires explicit approval before edits.",
+          "tags": ["auth", "security", "refresh", "token", "policy"],
+          "paths": ["src/auth/refresh-token-policy.ts"],
+          "enforcement": "require_approval"
+        }
+      ],
       "expect": [
         { "term": "refresh token", "section": "policy" }
       ],
