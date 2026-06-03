@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .hooks import codex_hooks_status
+from .integrations import status_tools
 from .paths import db_path, memassist_home
 from .project import Project
 
@@ -67,15 +67,16 @@ def run_doctor(project: Project) -> DoctorReport:
         )
     )
 
-    hooks = codex_hooks_status(scope="project", project_root=root)
+    statuses = status_tools(project, tools=[], scope="project")
+    installed_tools = [status.tool for status in statuses if status.installed]
     checks.append(
         DoctorCheck(
-            name="codex_project_hooks",
-            status="pass" if hooks["installed"] else "warn",
+            name="tool_integrations",
+            status="pass" if installed_tools else "warn",
             detail=(
-                f"installed events: {', '.join(hooks['events'])}"
-                if hooks["installed"]
-                else "Project hooks are not installed; run `memassist hooks install codex`."
+                f"installed tools: {', '.join(installed_tools)}"
+                if installed_tools
+                else "No tool integrations are installed; run `memassist init --tools codex` or `memassist init --tools all`."
             ),
         )
     )
@@ -90,7 +91,7 @@ def run_doctor(project: Project) -> DoctorReport:
         DoctorCheck(
             name="hook_trust",
             status="warn",
-            detail="Codex project hooks must be trusted with `/hooks`; interactive CLI is the validated E2E path.",
+            detail="Tool integrations may require each agent CLI to trust project config before trace capture runs.",
         )
     )
     return DoctorReport(

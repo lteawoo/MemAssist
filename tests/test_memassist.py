@@ -54,9 +54,9 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue((project / ".memassist" / "policy.yaml").exists())
             self.assertTrue((project / ".memassist" / "ignore").exists())
 
-    def test_init_can_install_hooks_and_doctor_reports_setup(self) -> None:
+    def test_init_can_install_codex_tool_and_doctor_reports_setup(self) -> None:
         with isolated_env() as (_root, project, _home):
-            code = main(["init", "--hooks"])
+            code = main(["init", "--tools", "codex"])
             self.assertEqual(code, 0)
             self.assertTrue((project / ".codex" / "hooks.json").exists())
 
@@ -68,7 +68,38 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue(report["passed"])
             checks = {check["name"]: check for check in report["checks"]}
             self.assertEqual(checks["project_config"]["status"], "pass")
-            self.assertEqual(checks["codex_project_hooks"]["status"], "pass")
+            self.assertEqual(checks["tool_integrations"]["status"], "pass")
+
+    def test_init_tools_all_installs_supported_project_integrations(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            code = main(["init", "--tools", "all"])
+            self.assertEqual(code, 0)
+            self.assertTrue((project / ".codex" / "hooks.json").exists())
+            self.assertTrue((project / ".claude" / "settings.json").exists())
+            self.assertTrue((project / ".opencode" / "plugins" / "memassist.js").exists())
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["tools", "status", "--json"])
+            self.assertEqual(code, 0)
+            statuses = {item["tool"]: item for item in json.loads(out.getvalue())}
+            self.assertEqual(set(statuses), {"codex", "claude", "opencode"})
+            self.assertTrue(all(item["installed"] for item in statuses.values()))
+
+    def test_tools_uninstall_removes_selected_integration(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            self.assertEqual(main(["init", "--tools", "codex,claude"]), 0)
+            self.assertTrue((project / ".codex" / "hooks.json").exists())
+            self.assertTrue((project / ".claude" / "settings.json").exists())
+
+            self.assertEqual(main(["tools", "uninstall", "claude"]), 0)
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["tools", "status", "codex,claude", "--json"])
+            self.assertEqual(code, 0)
+            statuses = {item["tool"]: item for item in json.loads(out.getvalue())}
+            self.assertTrue(statuses["codex"]["installed"])
+            self.assertFalse(statuses["claude"]["installed"])
 
     def test_memory_search_is_project_scoped(self) -> None:
         with isolated_env() as (_root, project_dir, _home):

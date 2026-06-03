@@ -7,6 +7,13 @@ from pathlib import Path
 
 from .paths import codex_home
 
+CODEX_MODE_EVENTS = {
+    "full": ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"),
+    "context": ("UserPromptSubmit",),
+    "trace": ("PostToolUse", "Stop"),
+    "guard": ("PreToolUse",),
+}
+
 
 CODEX_MEMASSIST_HOOKS = {
     "PreToolUse": [
@@ -62,7 +69,13 @@ CODEX_MEMASSIST_HOOKS = {
 }
 
 
-def install_codex_hooks(*, scope: str = "project", project_root: Path | None = None, home: Path | None = None) -> Path:
+def install_codex_hooks(
+    *,
+    scope: str = "project",
+    project_root: Path | None = None,
+    home: Path | None = None,
+    mode: str = "full",
+) -> Path:
     path = _hooks_path(scope=scope, project_root=project_root, home=home)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -73,7 +86,7 @@ def install_codex_hooks(*, scope: str = "project", project_root: Path | None = N
     else:
         data = {"hooks": {}}
     hooks = data.setdefault("hooks", {})
-    for event, groups in _codex_memassist_hooks().items():
+    for event, groups in _codex_memassist_hooks(mode=mode).items():
         existing = hooks.setdefault(event, [])
         existing[:] = [group for group in existing if not _is_memassist_group(group)]
         existing.extend(groups)
@@ -118,8 +131,11 @@ def _hooks_path(*, scope: str, project_root: Path | None, home: Path | None) -> 
     raise ValueError(f"invalid hook scope: {scope}")
 
 
-def _codex_memassist_hooks() -> dict[str, list[dict[str, object]]]:
+def _codex_memassist_hooks(*, mode: str = "full") -> dict[str, list[dict[str, object]]]:
+    if mode not in CODEX_MODE_EVENTS:
+        raise ValueError(f"invalid hook mode: {mode}")
     hooks = json.loads(json.dumps(CODEX_MEMASSIST_HOOKS))
+    hooks = {event: hooks[event] for event in CODEX_MODE_EVENTS[mode]}
     for groups in hooks.values():
         for group in groups:
             for hook in group.get("hooks", []):

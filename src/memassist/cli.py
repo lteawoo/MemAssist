@@ -11,7 +11,7 @@ from .confirmation import handle_direct_user_instruction
 from .doctor import run_doctor
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
-from .hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
+from .integrations import install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
 from .lesson import lesson_from_session
 from .lifecycle import cleanup_memories, process_session_lifecycle
 from .memory_eval import (
@@ -44,13 +44,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(required=True)
 
     init = sub.add_parser("init", help="initialize .memassist in this project")
-    init.add_argument("--hooks", action="store_true", help="also install project-local Codex hooks")
+    init.add_argument("--tools", help="also install tool integrations: codex, claude, opencode, or all")
+    init.add_argument("--mode", choices=["full", "context", "trace", "guard"], default="full")
     init.set_defaults(func=cmd_init)
 
     status = sub.add_parser("status", help="show project and storage status")
     status.set_defaults(func=cmd_status)
 
-    doctor = sub.add_parser("doctor", help="check memassist project setup and Codex hook readiness")
+    doctor = sub.add_parser("doctor", help="check memassist project setup and tool integration readiness")
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
 
@@ -157,20 +158,30 @@ def build_parser() -> argparse.ArgumentParser:
     lesson_from.add_argument("--feedback")
     lesson_from.set_defaults(func=cmd_lesson_from_session)
 
-    hooks = sub.add_parser("hooks", help="manage agent hooks")
-    hooks_sub = hooks.add_subparsers(required=True)
-    hook_install = hooks_sub.add_parser("install", help="install hooks")
-    hook_install.add_argument("agent", choices=["codex"])
-    hook_install.add_argument("--scope", choices=["project", "user"], default="project")
-    hook_install.set_defaults(func=cmd_hooks_install)
-    hook_uninstall = hooks_sub.add_parser("uninstall", help="uninstall hooks")
-    hook_uninstall.add_argument("agent", choices=["codex"])
-    hook_uninstall.add_argument("--scope", choices=["project", "user"], default="project")
-    hook_uninstall.set_defaults(func=cmd_hooks_uninstall)
-    hook_status = hooks_sub.add_parser("status", help="show hook status")
-    hook_status.add_argument("agent", choices=["codex"])
-    hook_status.add_argument("--scope", choices=["project", "user"], default="project")
-    hook_status.set_defaults(func=cmd_hooks_status)
+    tools = sub.add_parser("tools", help="manage agent tool integrations")
+    tools_sub = tools.add_subparsers(required=True)
+    tools_install = tools_sub.add_parser("install", help="install tool integrations")
+    tools_install.add_argument("tools", help="comma-separated tools: codex, claude, opencode, or all")
+    tools_install.add_argument("--mode", choices=["full", "context", "trace", "guard"], default="full")
+    tools_install.add_argument("--scope", choices=["project", "user"], default="project")
+    tools_install.add_argument("--json", action="store_true")
+    tools_install.set_defaults(func=cmd_tools_install)
+    tools_uninstall = tools_sub.add_parser("uninstall", help="uninstall tool integrations")
+    tools_uninstall.add_argument("tools", help="comma-separated tools: codex, claude, opencode, or all")
+    tools_uninstall.add_argument("--scope", choices=["project", "user"], default="project")
+    tools_uninstall.add_argument("--json", action="store_true")
+    tools_uninstall.set_defaults(func=cmd_tools_uninstall)
+    tools_repair = tools_sub.add_parser("repair", help="reinstall tool integrations")
+    tools_repair.add_argument("tools", help="comma-separated tools: codex, claude, opencode, or all")
+    tools_repair.add_argument("--mode", choices=["full", "context", "trace", "guard"], default="full")
+    tools_repair.add_argument("--scope", choices=["project", "user"], default="project")
+    tools_repair.add_argument("--json", action="store_true")
+    tools_repair.set_defaults(func=cmd_tools_repair)
+    tools_status = tools_sub.add_parser("status", help="show tool integration status")
+    tools_status.add_argument("tools", nargs="?", help="comma-separated tools; defaults to all")
+    tools_status.add_argument("--scope", choices=["project", "user"], default="project")
+    tools_status.add_argument("--json", action="store_true")
+    tools_status.set_defaults(func=cmd_tools_status)
 
     hook = sub.add_parser("hook", help=argparse.SUPPRESS)
     hook_sub = hook.add_subparsers(required=True)
@@ -247,10 +258,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         store.upsert_project(project)
     print(f"Initialized memassist for {project.id}")
     print(f"Project config: {policy_path}")
-    if args.hooks:
-        path = install_codex_hooks(scope="project", project_root=project.root)
-        print(f"Installed codex hooks: {path}")
-        print("Trust the project hooks in Codex CLI with `/hooks` before relying on trace capture.")
+    tools = _tools_or_error(args.tools)
+    if tools is None:
+        return 2
+    if tools:
+        results = install_tools(project, tools=tools, mode=args.mode, scope="project")
+        _print_tool_results(results)
+        print("Review each tool's trust or permission prompt before relying on trace capture.")
     return 0
 
 
@@ -540,28 +554,49 @@ def cmd_lesson_from_session(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_hooks_install(args: argparse.Namespace) -> int:
+def cmd_tools_install(args: argparse.Namespace) -> int:
     project = detect_project()
-    if args.agent == "codex":
-        path = install_codex_hooks(scope=args.scope, project_root=project.root)
-        print(f"installed codex hooks ({args.scope}): {path}")
-        if args.scope == "project":
-            print("Note: Codex loads project hooks only for trusted project .codex layers.")
+    tools = _tools_or_error(args.tools)
+    if tools is None:
+        return 2
+    results = install_tools(project, tools=tools, mode=args.mode, scope=args.scope)
+    _print_tool_results(results, as_json=args.json)
     return 0
 
 
-def cmd_hooks_uninstall(args: argparse.Namespace) -> int:
+def cmd_tools_uninstall(args: argparse.Namespace) -> int:
     project = detect_project()
-    if args.agent == "codex":
-        path = uninstall_codex_hooks(scope=args.scope, project_root=project.root)
-        print(f"uninstalled codex hooks ({args.scope}): {path}")
+    tools = _tools_or_error(args.tools)
+    if tools is None:
+        return 2
+    results = uninstall_tools(project, tools=tools, scope=args.scope)
+    _print_tool_results(results, as_json=args.json)
     return 0
 
 
-def cmd_hooks_status(args: argparse.Namespace) -> int:
+def cmd_tools_repair(args: argparse.Namespace) -> int:
     project = detect_project()
-    if args.agent == "codex":
-        _print_json(codex_hooks_status(scope=args.scope, project_root=project.root))
+    tools = _tools_or_error(args.tools)
+    if tools is None:
+        return 2
+    results = repair_tools(project, tools=tools, mode=args.mode, scope=args.scope)
+    _print_tool_results(results, as_json=args.json)
+    return 0
+
+
+def cmd_tools_status(args: argparse.Namespace) -> int:
+    project = detect_project()
+    tools = _tools_or_error(args.tools)
+    if tools is None:
+        return 2
+    statuses = status_tools(project, tools=tools, scope=args.scope)
+    if args.json:
+        _print_json([status.as_dict() for status in statuses])
+    else:
+        for status in statuses:
+            events = ",".join(status.events) if status.events else "-"
+            state = "installed" if status.installed else "missing"
+            print(f"{status.tool}: {state} {status.path} events={events}")
     return 0
 
 
@@ -938,6 +973,23 @@ def _print_memories(memories: list[Any]) -> None:
     for memory in memories:
         tags = ",".join(memory.tags)
         print(f"{memory.id} [{memory.scope_type}/{memory.type}/{memory.status}] {memory.content} ({tags})")
+
+
+def _tools_or_error(raw: str | list[str] | tuple[str, ...] | None) -> list[str] | None:
+    try:
+        return normalize_tools(raw)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None
+
+
+def _print_tool_results(results: list[Any], *, as_json: bool = False) -> None:
+    if as_json:
+        _print_json([result.as_dict() for result in results])
+        return
+    for result in results:
+        state = "installed" if result.installed else "removed"
+        print(f"{result.tool}: {state} {result.path}")
 
 
 class _store:
