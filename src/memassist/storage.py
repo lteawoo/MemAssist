@@ -208,6 +208,13 @@ class Store:
         ).fetchall()
         return [self._row_to_memory(row) for row in rows]
 
+    def get_memory(self, memory_id: str) -> Memory | None:
+        row = self.conn.execute(
+            "SELECT * FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        return self._row_to_memory(row) if row else None
+
     def search_memories(
         self,
         query: str,

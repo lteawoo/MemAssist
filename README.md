@@ -39,4 +39,17 @@ promoting them to active memory:
 
 ```bash
 PYTHONPATH=src python3 -m memassist memory list --all
+PYTHONPATH=src python3 -m memassist memory review
+PYTHONPATH=src python3 -m memassist memory approve <memory-id>
+PYTHONPATH=src python3 -m memassist memory reject <memory-id>
+PYTHONPATH=src python3 -m memassist memory cleanup
+```
+
+Turn a traced session into a draft lesson, promote that lesson into project
+policy, and run the lightweight evaluation loop:
+
+```bash
+PYTHONPATH=src python3 -m memassist lesson from-session latest --feedback "What should be remembered"
+PYTHONPATH=src python3 -m memassist policy promote <memory-id> --protected-path src/auth/refresh-token-policy.ts
+PYTHONPATH=src python3 -m memassist eval run --session latest --json
 ```

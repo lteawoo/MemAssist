@@ -7,10 +7,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
+from .lesson import lesson_from_session
+from .lifecycle import cleanup_memories
 from .paths import db_path, memassist_home
-from .policy import PolicyEngine, default_policy_yaml, load_policy
+from .policy import PolicyEngine, append_protected_path, default_policy_yaml, load_policy
 from .project import detect_project
 from .retrieval import build_memory_pack, render_prompt_context
 from .session import summarize_session
@@ -83,6 +86,22 @@ def build_parser() -> argparse.ArgumentParser:
     mem_supersede.add_argument("new_id")
     mem_supersede.set_defaults(func=cmd_memory_supersede)
 
+    mem_review = memory_sub.add_parser("review", help="list draft memories")
+    mem_review.add_argument("--json", action="store_true")
+    mem_review.set_defaults(func=cmd_memory_review)
+
+    mem_approve = memory_sub.add_parser("approve", help="activate a draft memory")
+    mem_approve.add_argument("id")
+    mem_approve.set_defaults(func=cmd_memory_approve)
+
+    mem_reject = memory_sub.add_parser("reject", help="disable a draft memory")
+    mem_reject.add_argument("id")
+    mem_reject.set_defaults(func=cmd_memory_reject)
+
+    mem_cleanup = memory_sub.add_parser("cleanup", help="expire stale memories")
+    mem_cleanup.add_argument("--json", action="store_true")
+    mem_cleanup.set_defaults(func=cmd_memory_cleanup)
+
     policy = sub.add_parser("policy", help="policy utilities")
     policy_sub = policy.add_subparsers(required=True)
     check = policy_sub.add_parser("check", help="check a tool call")
@@ -90,6 +109,17 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--command")
     check.add_argument("--path")
     check.set_defaults(func=cmd_policy_check)
+    promote = policy_sub.add_parser("promote", help="promote a memory into project policy")
+    promote.add_argument("memory_id")
+    promote.add_argument("--protected-path", required=True)
+    promote.set_defaults(func=cmd_policy_promote)
+
+    lesson = sub.add_parser("lesson", help="create lessons from traced sessions")
+    lesson_sub = lesson.add_subparsers(required=True)
+    lesson_from = lesson_sub.add_parser("from-session", help="create a draft lesson from a session")
+    lesson_from.add_argument("session", nargs="?", default="latest")
+    lesson_from.add_argument("--feedback")
+    lesson_from.set_defaults(func=cmd_lesson_from_session)
 
     hooks = sub.add_parser("hooks", help="manage agent hooks")
     hooks_sub = hooks.add_subparsers(required=True)
@@ -126,6 +156,13 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--session", default="latest")
     verify.add_argument("--json", action="store_true")
     verify.set_defaults(func=cmd_verify)
+
+    eval_parser = sub.add_parser("eval", help="run memassist session evaluation")
+    eval_sub = eval_parser.add_subparsers(required=True)
+    eval_run = eval_sub.add_parser("run", help="run verification and extraction checks")
+    eval_run.add_argument("--session", default="latest")
+    eval_run.add_argument("--json", action="store_true")
+    eval_run.set_defaults(func=cmd_eval_run)
 
     return parser
 
@@ -264,6 +301,42 @@ def cmd_memory_supersede(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_memory_review(args: argparse.Namespace) -> int:
+    project = detect_project()
+    with _store() as store:
+        memories = store.list_memories(project_id=project.id, include_global=True, status="draft")
+    if args.json:
+        print(json.dumps([memory.as_dict() for memory in memories], indent=2))
+    else:
+        _print_memories(memories)
+    return 0
+
+
+def cmd_memory_approve(args: argparse.Namespace) -> int:
+    with _store() as store:
+        store.update_status(args.id, "active")
+    print(f"approved {args.id}")
+    return 0
+
+
+def cmd_memory_reject(args: argparse.Namespace) -> int:
+    with _store() as store:
+        store.update_status(args.id, "disabled")
+    print(f"rejected {args.id}")
+    return 0
+
+
+def cmd_memory_cleanup(args: argparse.Namespace) -> int:
+    with _store() as store:
+        result = cleanup_memories(store)
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+    else:
+        for memory_id in result.expired:
+            print(f"expired {memory_id}")
+    return 0
+
+
 def cmd_policy_check(args: argparse.Namespace) -> int:
     project = detect_project()
     engine = PolicyEngine(load_policy(project.root))
@@ -275,6 +348,46 @@ def cmd_policy_check(args: argparse.Namespace) -> int:
     decision = engine.check_pre_tool(tool=args.tool, args=payload)
     print(json.dumps(decision.as_dict(), indent=2))
     return 1 if decision.action == "deny" else 0
+
+
+def cmd_policy_promote(args: argparse.Namespace) -> int:
+    project = detect_project()
+    with _store() as store:
+        memory = store.get_memory(args.memory_id)
+        if not memory:
+            print(f"Memory not found: {args.memory_id}")
+            return 1
+        changed = append_protected_path(project.root, args.protected_path)
+        store.update_status(args.memory_id, "active")
+    print(("added" if changed else "already present") + f" protected path: {args.protected_path}")
+    return 0
+
+
+def cmd_lesson_from_session(args: argparse.Namespace) -> int:
+    project = detect_project()
+    with _store() as store:
+        session_id = _resolve_session_id(store, args.session, project.id)
+        if not session_id:
+            print("No traced session found.")
+            return 1
+        events = store.trace_events(session_id)
+        content = lesson_from_session(events, args.feedback)
+        memory_id = store.add_memory(
+            scope_type="project",
+            project_id=project.id,
+            session_id=session_id,
+            type="lesson",
+            content=content,
+            reason="Created from traced session feedback.",
+            tags=["lesson", "session"],
+            status="draft",
+            importance=0.8,
+            confidence=0.6,
+            source_kind="lesson_from_session",
+            source_ref=session_id,
+        )
+    print(memory_id)
+    return 0
 
 
 def cmd_hooks_install(args: argparse.Namespace) -> int:
@@ -411,6 +524,26 @@ def cmd_verify(args: argparse.Namespace) -> int:
             print(f"issue: {issue}")
         for warning in result.warnings:
             print(f"warning: {warning}")
+    return 0 if result.passed else 1
+
+
+def cmd_eval_run(args: argparse.Namespace) -> int:
+    project = detect_project()
+    with _store() as store:
+        session_id = _resolve_session_id(store, args.session, project.id)
+        if not session_id:
+            print("No traced session found.")
+            return 1
+        result = run_eval(
+            store.trace_events(session_id),
+            memories=store.list_memories(project_id=project.id, include_global=True),
+            policy=load_policy(project.root),
+        )
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+    else:
+        print("PASS" if result.passed else "FAIL")
+        print(f"candidate_count: {result.candidate_count}")
     return 0 if result.passed else 1
 
 

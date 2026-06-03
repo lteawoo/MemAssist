@@ -84,6 +84,33 @@ def load_policy(project_root: Path) -> PolicyConfig:
     )
 
 
+def append_protected_path(project_root: Path, path: str) -> bool:
+    policy_path = project_root / ".memassist" / "policy.yaml"
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    if not policy_path.exists():
+        policy_path.write_text(default_policy_yaml(), encoding="utf-8")
+    text = policy_path.read_text(encoding="utf-8")
+    config = load_policy(project_root)
+    if path in config.protected_paths:
+        return False
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == "protected_paths: []":
+            lines[index] = "protected_paths:"
+            lines.insert(index + 1, f'  - "{path}"')
+            policy_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+            return True
+        if line.strip() == "protected_paths:":
+            insert_at = index + 1
+            while insert_at < len(lines) and lines[insert_at].startswith("  - "):
+                insert_at += 1
+            lines.insert(insert_at, f'  - "{path}"')
+            policy_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+            return True
+    policy_path.write_text(text.rstrip() + f'\n\nprotected_paths:\n  - "{path}"\n', encoding="utf-8")
+    return True
+
+
 class PolicyEngine:
     def __init__(self, config: PolicyConfig) -> None:
         self.config = config

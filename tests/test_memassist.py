@@ -358,6 +358,136 @@ class MemassistTest(unittest.TestCase):
             memories = json.loads(out.getvalue())
             self.assertTrue(any(memory["status"] == "draft" for memory in memories))
 
+    def test_memory_review_approve_reject_and_cleanup(self) -> None:
+        with isolated_env():
+            main(["init"])
+            first = StringIO()
+            with patch("sys.stdout", first):
+                main(
+                    [
+                        "memory",
+                        "add",
+                        "--type",
+                        "fact",
+                        "--content",
+                        "Draft fact",
+                        "--scope",
+                        "project",
+                    ]
+                )
+            draft_id = first.getvalue().strip()
+            with Store() as store:
+                store.update_status(draft_id, "draft")
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["memory", "review"])
+            self.assertEqual(code, 0)
+            self.assertIn("Draft fact", out.getvalue())
+
+            with patch("sys.stdout", StringIO()):
+                main(["memory", "approve", draft_id])
+            with Store() as store:
+                self.assertEqual(store.get_memory(draft_id).status, "active")  # type: ignore[union-attr]
+
+            with patch("sys.stdout", StringIO()):
+                main(["memory", "reject", draft_id])
+            with Store() as store:
+                self.assertEqual(store.get_memory(draft_id).status, "disabled")  # type: ignore[union-attr]
+
+            with Store() as store:
+                expired_id = store.add_memory(
+                    scope_type="project",
+                    project_id=detect_project().id,
+                    type="fact",
+                    content="Temporary fact",
+                    expires_at="2000-01-01T00:00:00+00:00",
+                )
+            with patch("sys.stdout", StringIO()):
+                main(["memory", "cleanup"])
+            with Store() as store:
+                self.assertEqual(store.get_memory(expired_id).status, "expired")  # type: ignore[union-attr]
+
+    def test_lesson_from_session_policy_promote_and_eval(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Run npm test.",
+                    tags=["verification", "test"],
+                )
+                store.add_trace_event(
+                    session_id="sess_eval",
+                    project_id=project.id,
+                    event_type="pre_tool_use",
+                    tool_name="Bash",
+                    input_json={"command": "npm test"},
+                )
+                store.add_trace_event(
+                    session_id="sess_eval",
+                    project_id=project.id,
+                    event_type="pre_tool_use",
+                    tool_name="apply_patch",
+                    input_json={"command": "*** Update File: src/auth/refresh-token-policy.ts"},
+                    files=["src/auth/refresh-token-policy.ts"],
+                    policy_decision="deny",
+                )
+
+            lesson_out = StringIO()
+            with patch("sys.stdout", lesson_out):
+                code = main(
+                    [
+                        "lesson",
+                        "from-session",
+                        "sess_eval",
+                        "--feedback",
+                        "Do not touch refresh token policy without approval.",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            lesson_id = lesson_out.getvalue().strip()
+            self.assertTrue(lesson_id.startswith("mem_"))
+
+            with patch("sys.stdout", StringIO()):
+                code = main(
+                    [
+                        "policy",
+                        "promote",
+                        lesson_id,
+                        "--protected-path",
+                        "src/auth/refresh-token-policy.ts",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "policy.yaml").read_text())
+            policy_out = StringIO()
+            with patch("sys.stdout", policy_out):
+                code = main(
+                    [
+                        "policy",
+                        "check",
+                        "--tool",
+                        "apply_patch",
+                        "--command",
+                        "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n*** End Patch\n",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(policy_out.getvalue())["action"], "require_approval")
+
+            eval_out = StringIO()
+            with patch("sys.stdout", eval_out):
+                code = main(["eval", "run", "--session", "sess_eval", "--json"])
+            self.assertEqual(code, 0)
+            result = json.loads(eval_out.getvalue())
+            self.assertTrue(result["passed"])
+            self.assertGreaterEqual(result["candidate_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
