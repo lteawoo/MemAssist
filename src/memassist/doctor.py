@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .integrations import status_tools
+from .interpreter import interpreter_diagnostics
 from .paths import db_path, memassist_home
 from .project import Project
 
@@ -77,6 +78,17 @@ def run_doctor(project: Project) -> DoctorReport:
                 f"installed tools: {', '.join(installed_tools)}"
                 if installed_tools
                 else "No tool integrations are installed; run `memassist init --tools codex` or `memassist init --tools all`."
+            ),
+        )
+    )
+    interpreter = interpreter_diagnostics(project)
+    checks.append(
+        DoctorCheck(
+            name="directive_interpreter",
+            status="pass" if interpreter["llm_available"] else "warn",
+            detail=(
+                f"adapter={interpreter['adapter']}; initialized_tools={', '.join(interpreter['initialized_tools']) or '-'}; "
+                f"{interpreter['detail']}"
             ),
         )
     )

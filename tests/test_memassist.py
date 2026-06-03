@@ -12,6 +12,7 @@ from unittest.mock import patch
 from memassist.cli import main
 from memassist.extraction import extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
+from memassist.interpreter import INTERPRETER_ACTIVE_ENV, interpret_directive
 from memassist.policy import PolicyEngine, append_sensitive_path, default_policy_yaml, load_policy
 from memassist.project import detect_project
 from memassist.retrieval import analyze_query_intent, build_memory_pack
@@ -51,7 +52,13 @@ class MemassistTest(unittest.TestCase):
         with isolated_env() as (_root, project, _home):
             code = main(["init"])
             self.assertEqual(code, 0)
-            self.assertTrue((project / ".memassist" / "policy.yaml").exists())
+            policy_path = project / ".memassist" / "policy.yaml"
+            self.assertTrue(policy_path.exists())
+            policy_text = policy_path.read_text(encoding="utf-8")
+            self.assertIn("sensitive_paths: []", policy_text)
+            self.assertIn("dangerous_commands: []", policy_text)
+            self.assertNotIn(".env", policy_text)
+            self.assertNotIn("rm -rf", policy_text)
             self.assertTrue((project / ".memassist" / "ignore").exists())
 
     def test_init_ignores_global_memassist_home_as_project_marker(self) -> None:
@@ -104,6 +111,18 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(checks["project_config"]["status"], "pass")
             self.assertEqual(checks["tool_integrations"]["status"], "pass")
 
+    def test_doctor_warns_when_codex_interpreter_executable_is_missing(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init", "--tools", "codex"]), 0)
+            out = StringIO()
+            with patch("memassist.interpreter.shutil.which", return_value=None), patch("sys.stdout", out):
+                code = main(["doctor", "--json"])
+            self.assertEqual(code, 0)
+            report = json.loads(out.getvalue())
+            checks = {check["name"]: check for check in report["checks"]}
+            self.assertEqual(checks["directive_interpreter"]["status"], "warn")
+            self.assertIn("codex executable not found", checks["directive_interpreter"]["detail"])
+
     def test_init_tools_all_installs_supported_project_integrations(self) -> None:
         with isolated_env() as (_root, project, _home):
             code = main(["init", "--tools", "all"])
@@ -119,6 +138,9 @@ class MemassistTest(unittest.TestCase):
             statuses = {item["tool"]: item for item in json.loads(out.getvalue())}
             self.assertEqual(set(statuses), {"codex", "claude", "opencode"})
             self.assertTrue(all(item["installed"] for item in statuses.values()))
+            self.assertTrue(statuses["codex"]["capabilities"]["prompt_memory_injection"])
+            self.assertTrue(statuses["codex"]["capabilities"]["llm_directive_interpretation"])
+            self.assertFalse(statuses["claude"]["capabilities"]["llm_directive_interpretation"])
 
     def test_tools_uninstall_removes_selected_integration(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -576,17 +598,44 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("Use pnpm", out.getvalue())
 
-    def test_policy_blocks_dangerous_command_and_warns_sensitive_path(self) -> None:
+    def test_policy_allows_sensitive_path_and_dangerous_command_without_project_policy(self) -> None:
         with isolated_env() as (_root, project, _home):
             (project / ".memassist").mkdir()
             (project / ".memassist" / "policy.yaml").write_text(default_policy_yaml(), encoding="utf-8")
             engine = PolicyEngine(load_policy(project))
+            delete = engine.check_pre_tool(tool="shell", args={"command": "rm -rf dist"})
+            self.assertEqual(delete.action, "allow")
+            recursive_delete = engine.check_pre_tool(tool="shell", args={"command": "rm -r dist"})
+            self.assertEqual(recursive_delete.action, "allow")
+            env_write = engine.check_pre_tool(tool="file_write", args={"path": ".env"})
+            self.assertEqual(env_write.action, "allow")
+
+    def test_policy_enforces_explicit_sensitive_path_and_dangerous_command(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            (project / ".memassist").mkdir()
+            (project / ".memassist" / "policy.yaml").write_text(
+                default_policy_yaml()
+                + '\nsensitive_paths:\n  - ".env"\n'
+                + "\ndangerous_commands:\n"
+                + r'  - "\brm\s+-r[f]?\b"'
+                + "\n",
+                encoding="utf-8",
+            )
+            engine = PolicyEngine(load_policy(project))
             deny = engine.check_pre_tool(tool="shell", args={"command": "rm -rf dist"})
             self.assertEqual(deny.action, "block")
-            deny_recursive = engine.check_pre_tool(tool="shell", args={"command": "rm -r dist"})
-            self.assertEqual(deny_recursive.action, "block")
             warn = engine.check_pre_tool(tool="file_write", args={"path": ".env"})
             self.assertEqual(warn.action, "warn")
+
+    def test_policy_partial_file_does_not_restore_removed_defaults(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            (project / ".memassist").mkdir()
+            (project / ".memassist" / "policy.yaml").write_text("protected_paths: []\n", encoding="utf-8")
+            engine = PolicyEngine(load_policy(project))
+            delete = engine.check_pre_tool(tool="shell", args={"command": "rm -rf dist"})
+            self.assertEqual(delete.action, "allow")
+            env_write = engine.check_pre_tool(tool="file_write", args={"path": ".env"})
+            self.assertEqual(env_write.action, "allow")
 
     def test_policy_detects_protected_path_inside_apply_patch(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -646,7 +695,7 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(events[0]["session_id"], "sess_1")
             self.assertEqual(events[0]["event_type"], "pre_tool_use")
 
-    def test_hook_pre_tool_use_denies_with_codex_schema(self) -> None:
+    def test_hook_pre_tool_use_allows_without_project_policy(self) -> None:
         with isolated_env():
             main(["init"])
             payload = {
@@ -660,11 +709,7 @@ class MemassistTest(unittest.TestCase):
             with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
                 code = main(["hook", "pre-tool-use"])
             self.assertEqual(code, 0)
-            hook_output = json.loads(stdout.getvalue())
-            specific = hook_output["hookSpecificOutput"]
-            self.assertEqual(specific["hookEventName"], "PreToolUse")
-            self.assertEqual(specific["permissionDecision"], "deny")
-            self.assertIn("permissionDecisionReason", specific)
+            self.assertEqual(stdout.getvalue(), "")
 
     def test_hook_pre_tool_use_maps_block_to_deny(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -688,6 +733,135 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(specific["hookEventName"], "PreToolUse")
             self.assertEqual(specific["permissionDecision"], "deny")
             self.assertIn("blocked by autonomous memory policy", specific["permissionDecisionReason"])
+
+    def test_hook_user_approval_allows_next_protected_path_edit(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            main(["init"])
+            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
+                file.write('\nprotected_paths:\n  - "src/auth/refresh-token-policy.ts"\n')
+            approval_payload = {
+                "session_id": "sess_approved",
+                "cwd": str(project),
+                "prompt": "승인",
+            }
+            with patch("sys.stdin", StringIO(json.dumps(approval_payload))), patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+
+            tool_payload = {
+                "session_id": "sess_approved",
+                "cwd": str(project),
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "command": "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n@@\n-30\n+15\n*** End Patch\n"
+                },
+            }
+            stdout = StringIO()
+            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", stdout):
+                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+            store = Store()
+            try:
+                events = [dict(event) for event in store.trace_events("sess_approved")]
+            finally:
+                store.close()
+            event_types = [event["event_type"] for event in events]
+            self.assertIn("approval_granted", event_types)
+            self.assertIn("approval_consumed", event_types)
+            self.assertNotIn("directive_interpreted", event_types)
+            self.assertNotIn("memory_intent_observed", event_types)
+            self.assertNotIn("memory_judged", event_types)
+            pre_tool_events = [event for event in events if event["event_type"] == "pre_tool_use"]
+            self.assertEqual(pre_tool_events[-1]["policy_decision"], "allow")
+
+    def test_hook_user_approval_is_single_use(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            main(["init"])
+            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
+                file.write('\nprotected_paths:\n  - "src/auth/refresh-token-policy.ts"\n')
+            approval_payload = {
+                "session_id": "sess_one_use",
+                "cwd": str(project),
+                "prompt": "approve",
+            }
+            with patch("sys.stdin", StringIO(json.dumps(approval_payload))), patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            tool_payload = {
+                "session_id": "sess_one_use",
+                "cwd": str(project),
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "command": "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n@@\n-30\n+15\n*** End Patch\n"
+                },
+            }
+            first_stdout = StringIO()
+            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", first_stdout):
+                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
+            self.assertEqual(first_stdout.getvalue(), "")
+
+            second_stdout = StringIO()
+            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", second_stdout):
+                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
+            specific = json.loads(second_stdout.getvalue())["hookSpecificOutput"]
+            self.assertEqual(specific["permissionDecision"], "deny")
+            self.assertIn("blocked by autonomous memory policy", specific["permissionDecisionReason"])
+
+    def test_hook_user_approval_matches_glob_protected_path_patch_target(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            main(["init"])
+            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
+                file.write('\nprotected_paths:\n  - "src/auth/*.py"\n')
+            approval_payload = {
+                "session_id": "sess_glob_approval",
+                "cwd": str(project),
+                "prompt": "승인",
+            }
+            with patch("sys.stdin", StringIO(json.dumps(approval_payload))), patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            tool_payload = {
+                "session_id": "sess_glob_approval",
+                "cwd": str(project),
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "command": "*** Begin Patch\n*** Update File: src/auth/session.py\n@@\n-True\n+False\n*** End Patch\n"
+                },
+            }
+            stdout = StringIO()
+            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", stdout):
+                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+            store = Store()
+            try:
+                events = [dict(event) for event in store.trace_events("sess_glob_approval")]
+            finally:
+                store.close()
+            self.assertIn("approval_consumed", [event["event_type"] for event in events])
+            pre_tool_events = [event for event in events if event["event_type"] == "pre_tool_use"]
+            self.assertEqual(pre_tool_events[-1]["policy_decision"], "allow")
+
+    def test_hook_user_approval_does_not_cross_sessions(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            main(["init"])
+            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
+                file.write('\nsensitive_paths:\n  - ".env"\n')
+            approval_payload = {
+                "session_id": "sess_a",
+                "cwd": str(project),
+                "prompt": "proceed",
+            }
+            with patch("sys.stdin", StringIO(json.dumps(approval_payload))), patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            tool_payload = {
+                "session_id": "sess_b",
+                "cwd": str(project),
+                "tool_name": "write",
+                "tool_input": {"path": ".env"},
+            }
+            stdout = StringIO()
+            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", stdout):
+                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
+            self.assertEqual(json.loads(stdout.getvalue())["systemMessage"], "memassist warning: sensitive path: .env")
 
     def test_hook_user_prompt_submit_outputs_additional_context_schema(self) -> None:
         with isolated_env():
@@ -834,7 +1008,7 @@ class MemassistTest(unittest.TestCase):
             self.assertIn("확인 완료했습니다.", out.getvalue())
             self.assertNotIn("\\ud655", out.getvalue())
 
-    def test_stop_hook_runs_lifecycle_and_auto_activates_low_risk_memory(self) -> None:
+    def test_stop_hook_does_not_auto_activate_assistant_echo_memory(self) -> None:
         with isolated_env():
             main(["init"])
             payload = {
@@ -852,14 +1026,7 @@ class MemassistTest(unittest.TestCase):
                 code = main(["memory", "list", "--all", "--json"])
             self.assertEqual(code, 0)
             memories = json.loads(out.getvalue())
-            self.assertTrue(any(memory["status"] == "auto_active" for memory in memories))
-
-            out = StringIO()
-            with patch("sys.stdout", out):
-                code = main(["memory", "search", "npm", "--json"])
-            self.assertEqual(code, 0)
-            results = json.loads(out.getvalue())
-            self.assertTrue(any("npm test" in memory["content"] for memory in results))
+            self.assertFalse(any("앞으로 이 프로젝트는 npm test로 검증하세요." in memory["content"] for memory in memories))
 
     def test_lifecycle_keeps_risky_lessons_as_inactive_candidates(self) -> None:
         with isolated_env():
@@ -892,9 +1059,7 @@ class MemassistTest(unittest.TestCase):
             result = json.loads(out.getvalue())
             lifecycle = result["lifecycle"]
             self.assertGreaterEqual(len(lifecycle["candidates"]), 1)
-            self.assertTrue(
-                any(decision["risk"] == "high" for decision in lifecycle["decisions"])
-            )
+            self.assertTrue(any(decision["risk"] in {"medium", "high"} for decision in lifecycle["decisions"]))
 
             out = StringIO()
             with patch("sys.stdout", out):
@@ -902,7 +1067,7 @@ class MemassistTest(unittest.TestCase):
             memories = json.loads(out.getvalue())
             self.assertTrue(any(memory["status"] == "candidate" for memory in memories))
 
-    def test_extract_explicit_memory_uses_trigger_line(self) -> None:
+    def test_extract_candidates_ignores_assistant_echo_memory_wording(self) -> None:
         with isolated_env():
             main(["init"])
             project = detect_project()
@@ -919,7 +1084,7 @@ class MemassistTest(unittest.TestCase):
                 candidates = extract_candidates(store.trace_events("sess_explicit_line"))
 
             contents = [candidate.content for candidate in candidates]
-            self.assertIn("앞으로 refresh token 정책은 묻지 않고 수정하지 않습니다.", contents)
+            self.assertNotIn("앞으로 refresh token 정책은 묻지 않고 수정하지 않습니다.", contents)
 
     def test_user_prompt_short_reply_does_not_activate_candidate_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -959,7 +1124,142 @@ class MemassistTest(unittest.TestCase):
                 (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
             )
 
-    def test_direct_policy_instruction_upgrades_existing_candidate_memory_to_warn_policy(self) -> None:
+    def test_user_prompt_submit_records_source_event_without_direct_memory_when_judge_unavailable(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            target = project_dir / "src" / "auth" / "refresh-token-policy.ts"
+            target.parent.mkdir(parents=True)
+            target.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
+            payload = {
+                "session_id": "sess_source_only",
+                "cwd": str(project_dir),
+                "prompt": "앞으로 refresh token 쪽은 고치기 전에 나한테 먼저 물어봐",
+            }
+            with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+
+            project = detect_project()
+            with Store() as store:
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                events = [dict(event) for event in store.trace_events("sess_source_only")]
+            event_types = [event["event_type"] for event in events]
+            self.assertIn("memory_intent_observed", event_types)
+            self.assertIn("memory_judged", event_types)
+            self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
+            self.assertNotIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "policy.yaml").read_text())
+
+    def test_isolated_judge_payload_excludes_assistant_and_injected_context(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="directive",
+                    content="Injected memory must not be sent as judge source.",
+                    tags=["refresh", "token"],
+                    status="active",
+                )
+                store.add_trace_event(
+                    session_id="sess_payload_isolation",
+                    project_id=project.id,
+                    event_type="stop",
+                    input_json={"last_assistant_message": "앞으로 페이지 리프레시는 승인 요청하겠습니다."},
+                )
+            fixture = json.dumps(
+                {
+                    "should_store": True,
+                    "memory_content": "refresh token 관련 변경 전 사용자에게 먼저 확인한다.",
+                    "source_quote": "앞으로 refresh token 쪽은 고치기 전에 나한테 먼저 물어봐",
+                    "memory_type": "directive",
+                    "enforcement": "warn",
+                    "activation": "candidate",
+                    "candidate_paths": [],
+                    "policy_compile": False,
+                    "meaning_preserved": True,
+                    "contamination_risk": "low",
+                    "reason": "Payload isolation test.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                payload = {
+                    "session_id": "sess_payload_isolation",
+                    "cwd": str(project_dir),
+                    "prompt": "앞으로 refresh token 쪽은 고치기 전에 나한테 먼저 물어봐",
+                }
+                with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+                    self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+            with Store() as store:
+                judged = [
+                    dict(event)
+                    for event in store.trace_events("sess_payload_isolation")
+                    if event["event_type"] == "memory_judged"
+                ]
+            self.assertEqual(len(judged), 1)
+            payload_json = json.loads(judged[0]["input_json"])["payload"]
+            serialized = json.dumps(payload_json, ensure_ascii=False)
+            self.assertIn("앞으로 refresh token 쪽은 고치기 전에 나한테 먼저 물어봐", serialized)
+            self.assertNotIn("Injected memory must not be sent as judge source.", serialized)
+            self.assertNotIn("앞으로 페이지 리프레시는 승인 요청하겠습니다.", serialized)
+            self.assertIn("assistant_responses", serialized)
+
+    def test_low_risk_judge_preference_auto_activates(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            fixture = json.dumps(
+                {
+                    "should_store": True,
+                    "memory_content": "사용자는 한국어로 간결한 답변을 선호한다.",
+                    "source_quote": "앞으로 답변은 한국어로 짧게 해줘",
+                    "memory_type": "preference",
+                    "enforcement": "none",
+                    "activation": "active",
+                    "candidate_paths": [],
+                    "policy_compile": False,
+                    "meaning_preserved": True,
+                    "contamination_risk": "low",
+                    "reason": "Low-risk user preference.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                payload = {
+                    "session_id": "sess_low_risk_active",
+                    "cwd": str(project_dir),
+                    "prompt": "앞으로 답변은 한국어로 짧게 해줘",
+                }
+                with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+                    self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+            project = detect_project()
+            with Store() as store:
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+            self.assertTrue(
+                any(
+                    memory.source_kind == "isolated_memory_judge"
+                    and memory.status == "active"
+                    and memory.enforcement == "none"
+                    for memory in memories
+                )
+            )
+
+    def test_direct_policy_instruction_does_not_upgrade_existing_candidate_in_user_prompt_submit(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
@@ -991,45 +1291,79 @@ class MemassistTest(unittest.TestCase):
 
             with Store() as store:
                 memory = store.get_memory(memory_id)
-                self.assertEqual(memory.status, "warn_policy")  # type: ignore[union-attr]
-                self.assertEqual(memory.enforcement, "warn")  # type: ignore[union-attr]
-            self.assertIn(
+                traces = store.trace_events("sess_direct_policy_upgrade_candidate")
+                self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
+                self.assertEqual(memory.enforcement, "none")  # type: ignore[union-attr]
+            self.assertTrue(any(event["event_type"] == "memory_intent_observed" for event in traces))
+            self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
                 (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
             )
 
-    def test_user_prompt_direct_policy_instruction_applies_as_block_policy(self) -> None:
+    def test_user_prompt_direct_policy_instruction_is_judged_as_candidate_until_activation(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
             protected.parent.mkdir(parents=True)
             protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
+            fixture = json.dumps(
+                {
+                    "should_store": True,
+                    "memory_content": "리프레시 토큰 관련 변경은 사용자 확인 전 수정하지 않는다.",
+                    "source_quote": "리프레시 토큰 관련 변경은 절대 묻지 않고 수정하지마",
+                    "memory_type": "directive",
+                    "enforcement": "block",
+                    "activation": "active",
+                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
+                    "policy_compile": True,
+                    "meaning_preserved": True,
+                    "contamination_risk": "low",
+                    "reason": "User explicitly set a future edit gate for refresh token changes.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
 
-            payload = {
-                "session_id": "sess_direct_policy",
-                "cwd": str(project_dir),
-                "prompt": "리프레시 토큰 관련 변경은 절대 묻지 않고 수정하지마",
-            }
-            stdin = StringIO(json.dumps(payload))
-            stdout = StringIO()
-            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
-                code = main(["hook", "user-prompt-submit"])
-            self.assertEqual(code, 0)
-            output = json.loads(stdout.getvalue())
-            self.assertIn("Direct memassist directive was recorded", output["hookSpecificOutput"]["additionalContext"])
+            try:
+                payload = {
+                    "session_id": "sess_direct_policy",
+                    "cwd": str(project_dir),
+                    "prompt": "리프레시 토큰 관련 변경은 절대 묻지 않고 수정하지마",
+                }
+                stdin = StringIO(json.dumps(payload))
+                stdout = StringIO()
+                with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+                    code = main(["hook", "user-prompt-submit"])
+                self.assertEqual(code, 0)
+                self.assertEqual(stdout.getvalue(), "")
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
 
             project = detect_project()
             with Store() as store:
                 memories = store.list_memories(project_id=project.id, include_global=True)
+                traces = store.trace_events("sess_direct_policy")
             direct_memories = [
                 memory
                 for memory in memories
-                if memory.source_kind == "user_prompt_directive"
+                if memory.source_kind == "isolated_memory_judge"
                 and "리프레시 토큰" in memory.content
             ]
             self.assertEqual(len(direct_memories), 1)
-            self.assertEqual(direct_memories[0].status, "block_policy")
+            self.assertEqual(direct_memories[0].status, "candidate")
             self.assertEqual(direct_memories[0].enforcement, "block")
+            self.assertTrue(any(event["event_type"] == "memory_intent_observed" for event in traces))
+            self.assertTrue(any(event["event_type"] == "memory_judged" for event in traces))
+            self.assertNotIn(
+                "src/auth/refresh-token-policy.ts",
+                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+            )
+
+            with patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["memory", "activate", direct_memories[0].id]), 0)
             self.assertIn(
                 "src/auth/refresh-token-policy.ts",
                 (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
@@ -1081,6 +1415,309 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 candidate = store.get_memory(candidate_id)
             self.assertEqual(candidate.status, "candidate")  # type: ignore[union-attr]
+
+    def test_fallback_interpreter_recognizes_multilingual_typo_directive(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
+            protected.parent.mkdir(parents=True)
+            protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
+            project = detect_project()
+
+            result = interpret_directive(
+                "리프레쉬 토큰 쪽은 담부터 고치기 전에 꼭 나한테 먼저 말해줘",
+                project=project,
+            )
+
+            self.assertTrue(result.candidate.is_directive)
+            self.assertEqual(result.candidate.enforcement, "warn")
+            self.assertGreaterEqual(result.candidate.confidence, 0.85)
+            self.assertIn("refresh", result.candidate.scope_terms)
+            self.assertIn("token", result.candidate.scope_terms)
+
+    def test_typo_directive_is_judged_to_candidate_without_policy_compile(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
+            protected.parent.mkdir(parents=True)
+            protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
+            fixture = json.dumps(
+                {
+                    "should_store": True,
+                    "memory_content": "리프레시 토큰 관련 변경 전 사용자에게 먼저 확인한다.",
+                    "source_quote": "리프레쉬 토큰 쪽은 담부터 고치기 전에 꼭 나한테 먼저 말해줘",
+                    "memory_type": "directive",
+                    "enforcement": "warn",
+                    "activation": "active",
+                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
+                    "policy_compile": False,
+                    "meaning_preserved": True,
+                    "contamination_risk": "low",
+                    "reason": "User asked for confirmation before refresh token changes.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+
+            try:
+                payload = {
+                    "session_id": "sess_typo_warn_policy",
+                    "cwd": str(project_dir),
+                    "prompt": "리프레쉬 토큰 쪽은 담부터 고치기 전에 꼭 나한테 먼저 말해줘",
+                }
+                stdin = StringIO(json.dumps(payload))
+                stdout = StringIO()
+                with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+                    code = main(["hook", "user-prompt-submit"])
+                self.assertEqual(code, 0)
+                self.assertEqual(stdout.getvalue(), "")
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+            project = detect_project()
+            with Store() as store:
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                traces = store.trace_events("sess_typo_warn_policy")
+            policy_text = (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8")
+            self.assertNotIn("src/auth/refresh-token-policy.ts", policy_text)
+            self.assertTrue(any(memory.status == "candidate" and memory.enforcement == "warn" for memory in memories))
+            self.assertTrue(any(event["event_type"] == "memory_judged" for event in traces))
+
+    def test_initialized_codex_fixture_judge_stages_policy_memory(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
+            protected.parent.mkdir(parents=True)
+            protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
+            fixture = json.dumps(
+                {
+                    "should_store": True,
+                    "memory_content": "Do not change refresh token policy without asking first.",
+                    "source_quote": "refresh token policy 변경은 묻지 않고 하지마",
+                    "memory_type": "directive",
+                    "enforcement": "block",
+                    "activation": "active",
+                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
+                    "policy_compile": True,
+                    "meaning_preserved": True,
+                    "contamination_risk": "low",
+                    "reason": "Explicit future change gate.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                payload = {
+                    "session_id": "sess_codex_fixture",
+                    "cwd": str(project_dir),
+                    "prompt": "refresh token policy 변경은 묻지 않고 하지마",
+                }
+                stdin = StringIO(json.dumps(payload))
+                with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+                    code = main(["hook", "user-prompt-submit"])
+                self.assertEqual(code, 0)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+            project = detect_project()
+            with Store() as store:
+                traces = store.trace_events("sess_codex_fixture")
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+            self.assertTrue(any(memory.status == "candidate" and memory.enforcement == "block" for memory in memories))
+            judged = [event for event in traces if event["event_type"] == "memory_judged"]
+            self.assertEqual(len(judged), 1)
+            self.assertIn('"adapter_name": "fixture"', judged[0]["input_json"])
+
+    def test_medium_risk_judge_candidate_does_not_mutate_policy(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            fixture = json.dumps(
+                {
+                    "should_store": True,
+                    "memory_content": "Maybe mention refresh token changes later.",
+                    "source_quote": "앞으로 refresh token changes tell me later",
+                    "memory_type": "directive",
+                    "enforcement": "warn",
+                    "activation": "candidate",
+                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
+                    "policy_compile": False,
+                    "meaning_preserved": True,
+                    "contamination_risk": "medium",
+                    "reason": "Ambiguous but potentially useful.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                payload = {"session_id": "sess_low_conf", "cwd": str(project_dir), "prompt": "앞으로 refresh token changes tell me later"}
+                stdin = StringIO(json.dumps(payload))
+                with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+                    code = main(["hook", "user-prompt-submit"])
+                self.assertEqual(code, 0)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+            project = detect_project()
+            with Store() as store:
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+            self.assertTrue(any(memory.status == "candidate" for memory in memories))
+            self.assertNotIn(
+                "src/auth/refresh-token-policy.ts",
+                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+            )
+
+    def test_external_judge_candidate_paths_do_not_compile_policy(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            fixture = json.dumps(
+                {
+                    "should_store": True,
+                    "memory_content": "Do not change external path.",
+                    "source_quote": "외부 경로 건드리지마",
+                    "memory_type": "directive",
+                    "enforcement": "block",
+                    "activation": "active",
+                    "candidate_paths": ["../outside.txt", "/etc/passwd"],
+                    "policy_compile": True,
+                    "meaning_preserved": True,
+                    "contamination_risk": "low",
+                    "reason": "External paths must not be normalized into project policy.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                payload = {"session_id": "sess_external_path", "cwd": str(project_dir), "prompt": "외부 경로 건드리지마"}
+                stdin = StringIO(json.dumps(payload))
+                with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+                    code = main(["hook", "user-prompt-submit"])
+                self.assertEqual(code, 0)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+            project = detect_project()
+            with Store() as store:
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+            self.assertTrue(any(memory.status == "candidate" and not memory.paths for memory in memories))
+            self.assertNotIn("outside.txt", (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"))
+            self.assertNotIn("/etc/passwd", (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"))
+
+    def test_weak_single_term_path_match_does_not_compile_policy(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            target = project_dir / "src" / "auth" / "session.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("SESSION = True\n", encoding="utf-8")
+            fixture = json.dumps(
+                {
+                    "should_store": True,
+                    "memory_content": "Tell me before auth changes.",
+                    "source_quote": "auth 변경 전에 알려줘",
+                    "memory_type": "directive",
+                    "enforcement": "warn",
+                    "activation": "candidate",
+                    "candidate_paths": [],
+                    "policy_compile": False,
+                    "meaning_preserved": True,
+                    "contamination_risk": "medium",
+                    "reason": "No reliable path was provided.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                payload = {"session_id": "sess_weak_path", "cwd": str(project_dir), "prompt": "auth 변경 전에 알려줘"}
+                stdin = StringIO(json.dumps(payload))
+                with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+                    code = main(["hook", "user-prompt-submit"])
+                self.assertEqual(code, 0)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+            self.assertNotIn(
+                "src/auth/session.py",
+                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+            )
+
+    def test_invalid_judge_output_does_not_mutate_policy(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            fixture = json.dumps(
+                {
+                    "is_directive": "false",
+                    "intent": "none",
+                    "subject": "refresh token policy",
+                    "enforcement": "block",
+                    "scope_terms": ["refresh", "token"],
+                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
+                    "confidence": 0.99,
+                    "rationale": "malformed boolean should be rejected",
+                    "normalized_prompt": "앞으로 refresh token policy 관련 내용은 기억해줘",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                payload = {
+                    "session_id": "sess_invalid_interpreter",
+                    "cwd": str(project_dir),
+                    "prompt": "앞으로 refresh token policy 관련 내용은 기억해줘",
+                }
+                stdin = StringIO(json.dumps(payload))
+                with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+                    code = main(["hook", "user-prompt-submit"])
+                self.assertEqual(code, 0)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+            project = detect_project()
+            with Store() as store:
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                traces = store.trace_events("sess_invalid_interpreter")
+            self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
+            self.assertNotIn(
+                "src/auth/refresh-token-policy.ts",
+                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+            )
+            judged = [event for event in traces if event["event_type"] == "memory_judged"]
+            self.assertEqual(len(judged), 1)
+            self.assertIn("invalid judge output", judged[0]["input_json"])
+
+    def test_interpreter_recursion_guard_noops_hook(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            old_active = os.environ.get(INTERPRETER_ACTIVE_ENV)
+            os.environ[INTERPRETER_ACTIVE_ENV] = "1"
+            try:
+                payload = {"session_id": "sess_guard", "cwd": str(project_dir), "prompt": "remember this"}
+                stdin = StringIO(json.dumps(payload))
+                stdout = StringIO()
+                with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+                    code = main(["hook", "user-prompt-submit"])
+            finally:
+                if old_active is None:
+                    os.environ.pop(INTERPRETER_ACTIVE_ENV, None)
+                else:
+                    os.environ[INTERPRETER_ACTIVE_ENV] = old_active
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
 
     def test_memory_drafts_activate_deactivate_and_cleanup(self) -> None:
         with isolated_env():
@@ -1401,7 +2038,8 @@ class MemassistTest(unittest.TestCase):
                 code = main(["daemon", "once", "--session", "sess_paraphrase", "--json"])
             self.assertEqual(code, 0)
             result = json.loads(out.getvalue())
-            self.assertEqual(result["lifecycle"]["duplicates"], 1)
+            self.assertEqual(result["lifecycle"]["duplicates"], 0)
+            self.assertEqual(result["lifecycle"]["stored"], [])
             with Store() as store:
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
                 self.assertEqual([memory.id for memory in memories if memory.status == "candidate"], [])

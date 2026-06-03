@@ -6,7 +6,7 @@ from pathlib import Path
 from memassist.hooks import _is_memassist_group, _python_hook_command
 from memassist.project import Project
 
-from .base import MODE_EVENTS, InstallResult, IntegrationStatus, ToolMode
+from .base import MODE_EVENTS, InstallResult, IntegrationStatus, ToolMode, lifecycle_capabilities
 
 CLAUDE_EVENT_TO_HOOK = {
     "UserPromptSubmit": "user-prompt-submit",
@@ -71,6 +71,7 @@ class ClaudeIntegration:
             path,
             events,
             "installed" if events else "not installed",
+            lifecycle_capabilities(events, llm_directive_interpretation=False),
         )
 
 

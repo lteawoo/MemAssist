@@ -17,40 +17,11 @@ class PolicyDecision:
         return {"action": self.action, "reason": self.reason}
 
 
-DEFAULT_DANGEROUS_COMMANDS = [
-    r"\brm\s+-r[f]?\b",
-    r"\bgit\s+reset\s+--hard\b",
-    r"\bgit\s+clean\s+-fd\b",
-    r"\bchmod\s+-R\s+777\b",
-]
-
-DEFAULT_SENSITIVE_PATHS = [
-    ".env",
-    ".env.*",
-    "*.pem",
-    "*.key",
-    "*secret*",
-    ".ssh/**",
-    ".aws/**",
-]
-
-
 def default_policy_yaml() -> str:
     return """# memassist project policy
-sensitive_paths:
-  - ".env"
-  - ".env.*"
-  - "*.pem"
-  - "*.key"
-  - "*secret*"
-
+sensitive_paths: []
 protected_paths: []
-
-dangerous_commands:
-  - "\\brm\\s+-r[f]?\\b"
-  - "\\bgit\\s+reset\\s+--hard\\b"
-  - "\\bgit\\s+clean\\s+-fd\\b"
-
+dangerous_commands: []
 verification_commands: []
 """
 
@@ -64,10 +35,10 @@ class PolicyConfig:
         dangerous_commands: list[str] | None = None,
         verification_commands: list[str] | None = None,
     ) -> None:
-        self.sensitive_paths = sensitive_paths or DEFAULT_SENSITIVE_PATHS
-        self.protected_paths = protected_paths or []
-        self.dangerous_commands = dangerous_commands or DEFAULT_DANGEROUS_COMMANDS
-        self.verification_commands = verification_commands or []
+        self.sensitive_paths = list(sensitive_paths or [])
+        self.protected_paths = list(protected_paths or [])
+        self.dangerous_commands = list(dangerous_commands or [])
+        self.verification_commands = list(verification_commands or [])
 
 
 def load_policy(project_root: Path) -> PolicyConfig:
@@ -77,9 +48,9 @@ def load_policy(project_root: Path) -> PolicyConfig:
     text = path.read_text(encoding="utf-8")
     data = _parse_minimal_yaml(text)
     return PolicyConfig(
-        sensitive_paths=data.get("sensitive_paths") or DEFAULT_SENSITIVE_PATHS,
+        sensitive_paths=data.get("sensitive_paths") or [],
         protected_paths=data.get("protected_paths") or [],
-        dangerous_commands=data.get("dangerous_commands") or DEFAULT_DANGEROUS_COMMANDS,
+        dangerous_commands=data.get("dangerous_commands") or [],
         verification_commands=data.get("verification_commands") or [],
     )
 

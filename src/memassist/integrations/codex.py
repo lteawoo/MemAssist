@@ -5,7 +5,7 @@ from pathlib import Path
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from memassist.project import Project
 
-from .base import InstallResult, IntegrationStatus, ToolMode
+from .base import InstallResult, IntegrationStatus, ToolMode, lifecycle_capabilities
 
 
 class CodexIntegration:
@@ -40,4 +40,5 @@ class CodexIntegration:
             path=Path(str(raw["path"])),
             events=events,
             detail="installed" if raw["installed"] else "not installed",
+            capabilities=lifecycle_capabilities(events, llm_directive_interpretation=bool(raw["installed"])),
         )

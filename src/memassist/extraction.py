@@ -66,10 +66,6 @@ def extract_candidates(events: list[Row]) -> list[MemoryCandidate]:
                 reason="Policy denial was recorded in the session trace.",
             )
         )
-    if summary.last_message:
-        explicit = _explicit_memory(summary.last_message)
-        if explicit:
-            candidates.append(explicit)
     return candidates
 
 

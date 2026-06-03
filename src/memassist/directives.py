@@ -7,8 +7,10 @@ from pathlib import Path
 from sqlite3 import Row
 from typing import Any
 
+from .interpreter import DEFAULT_CONFIDENCE_THRESHOLD, DRAFT_CONFIDENCE_THRESHOLD, DirectiveCandidate, interpret_directive
 from .models import Memory
 from .policy import append_protected_path, append_sensitive_path
+from .project import Project
 from .storage import Store
 
 
@@ -61,15 +63,27 @@ class DirectiveResult:
 def handle_direct_user_instruction(
     store: Store,
     *,
-    project_root: Path,
-    project_id: str,
+    project: Project,
     session_id: str,
     prompt: str,
 ) -> DirectiveResult:
-    content = _direct_instruction_content(prompt)
-    if not content:
+    project_id = project.id
+    result = interpret_directive(prompt, project=project)
+    candidate = result.candidate
+    _record_interpreter_trace(store, session_id=session_id, project_id=project_id, result=result.as_dict())
+    if not candidate.is_directive or candidate.confidence < DRAFT_CONFIDENCE_THRESHOLD:
+        store.add_lifecycle_event(
+            session_id=session_id,
+            project_id=project_id,
+            memory_id=None,
+            candidate=result.as_dict(),
+            decision="directive_interpreter_ignored",
+            risk="low",
+            reason="Interpreter did not find a confident direct memory directive.",
+        )
         return DirectiveResult("none", [], [], [], None)
-    enforcement = _directive_enforcement(content)
+    content = candidate.original_prompt.strip() or candidate.normalized_prompt.strip()
+    enforcement = candidate.memory_enforcement
 
     existing = store.find_memory(
         project_id=project_id,
@@ -99,13 +113,43 @@ def handle_direct_user_instruction(
                 existing = refreshed
         applied, policy_events, decision = _apply_directive_memory(
             store,
-            project_root=project_root,
+            project_root=project.root,
             project_id=project_id,
             memory=existing,
+            candidate=candidate,
         )
         _record_directive_lifecycle(store, project_id=project_id, memory=existing, decision=decision)
         message = "Direct memassist directive was recorded." if applied else "Direct memassist directive was recorded without a policy path."
         return DirectiveResult("directive_recorded", [existing.id], [], policy_events, message)
+
+    if candidate.confidence < DEFAULT_CONFIDENCE_THRESHOLD or enforcement == "none":
+        memory_id = store.add_memory(
+            scope_type="project",
+            project_id=project_id,
+            session_id=session_id,
+            type="directive",
+            content=content,
+            reason="Interpreter found an ambiguous or low-confidence direct memory directive.",
+            tags=_instruction_tags(content, candidate=candidate),
+            paths=_normalize_project_files(candidate.candidate_paths, project.root),
+            status="candidate",
+            importance=0.65,
+            confidence=candidate.confidence,
+            enforcement=enforcement,
+            source_kind="user_prompt_directive",
+            source_ref=session_id,
+        )
+        memory = store.get_memory(memory_id)
+        store.add_lifecycle_event(
+            session_id=session_id,
+            project_id=project_id,
+            memory_id=memory_id,
+            candidate=memory.as_dict() if memory else candidate.as_dict(),
+            decision="directive_candidate",
+            risk="medium",
+            reason="Directive interpretation did not meet immediate policy compilation threshold.",
+        )
+        return DirectiveResult("directive_recorded", [memory_id], [], [], "Direct memassist directive was remembered as a candidate.")
 
     memory_id = store.add_memory(
         scope_type="project",
@@ -114,10 +158,11 @@ def handle_direct_user_instruction(
         type="directive",
         content=content,
         reason="User directly instructed memassist to remember this directive.",
-        tags=_instruction_tags(content),
+        tags=_instruction_tags(content, candidate=candidate),
+        paths=_normalize_project_files(candidate.candidate_paths, project.root),
         status="active",
         importance=0.9,
-        confidence=0.95,
+        confidence=candidate.confidence,
         enforcement=enforcement,
         source_kind="user_prompt_directive",
         source_ref=session_id,
@@ -139,9 +184,10 @@ def handle_direct_user_instruction(
 
     applied, policy_events, decision = _apply_directive_memory(
         store,
-        project_root=project_root,
+        project_root=project.root,
         project_id=project_id,
         memory=memory,
+        candidate=candidate,
     )
     _record_directive_lifecycle(store, project_id=project_id, memory=memory, decision=decision)
     message = "Direct memassist directive was recorded." if applied else "Direct memassist directive was recorded without a policy path."
@@ -154,9 +200,10 @@ def _apply_directive_memory(
     project_root: Path,
     project_id: str,
     memory: Memory,
+    candidate: DirectiveCandidate | None = None,
 ) -> tuple[bool, list[dict[str, object]], str]:
     if memory.enforcement in {"warn", "block"}:
-        protected_path = _infer_protected_path(store, memory, project_root)
+        protected_path = _infer_protected_path(store, memory, project_root, candidate=candidate)
         if protected_path:
             changed = (
                 append_protected_path(project_root, protected_path)
@@ -191,6 +238,23 @@ def _record_directive_lifecycle(
     )
 
 
+def _record_interpreter_trace(
+    store: Store,
+    *,
+    session_id: str,
+    project_id: str,
+    result: dict[str, object],
+) -> None:
+    store.add_trace_event(
+        session_id=session_id,
+        project_id=project_id,
+        event_type="directive_interpreted",
+        tool_name="memassist",
+        input_json=result,
+        files=[],
+    )
+
+
 def _policy_event(enforcement: str, path: str, changed: bool) -> dict[str, object]:
     return {
         "path": path,
@@ -200,16 +264,37 @@ def _policy_event(enforcement: str, path: str, changed: bool) -> dict[str, objec
     }
 
 
-def _infer_protected_path(store: Store, memory: Memory, project_root: Path) -> str | None:
+def _infer_protected_path(
+    store: Store,
+    memory: Memory,
+    project_root: Path,
+    *,
+    candidate: DirectiveCandidate | None = None,
+) -> str | None:
+    semantic_content = " ".join(
+        [
+            memory.content,
+            candidate.subject if candidate else "",
+            " ".join(candidate.scope_terms) if candidate else "",
+            candidate.normalized_prompt if candidate else "",
+        ]
+    )
     if memory.paths:
-        return memory.paths[0]
+        normalized_paths = _normalize_project_files(memory.paths, project_root)
+        for path in normalized_paths:
+            if candidate is None or _path_match_score(path, semantic_content) >= 2:
+                return path
+    if candidate:
+        for path in _normalize_project_files(candidate.candidate_paths, project_root):
+            if path and _path_match_score(path, semantic_content) >= 2:
+                return path
     events = store.trace_events(memory.session_id) if memory.session_id else []
     files = _normalize_project_files(_files_from_events(events), project_root)
-    content = memory.content.lower()
+    content = semantic_content.lower()
     matched = _best_content_path_match(files, content)
     if matched:
         return matched
-    project_matches = _project_files_from_content(project_root, memory.content)
+    project_matches = _project_files_from_content(project_root, semantic_content)
     return project_matches[0] if project_matches else None
 
 
@@ -258,7 +343,7 @@ def _project_files_from_content(project_root: Path, content: str) -> list[str]:
         relative = path.relative_to(project_root).as_posix()
         path_terms = set(_path_terms(relative.lower()))
         score = len(content_terms & path_terms)
-        if score:
+        if score >= 2:
             scored.append((score, relative))
     scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     return [relative for _score, relative in scored[:5]]
@@ -269,11 +354,13 @@ def _normalize_project_files(files: list[str], project_root: Path) -> list[str]:
     resolved_root = project_root.resolve()
     for file in files:
         path = Path(file)
-        if path.is_absolute():
-            try:
-                file = path.resolve().relative_to(resolved_root).as_posix()
-            except ValueError:
-                file = path.as_posix()
+        candidate = path if path.is_absolute() else project_root / path
+        try:
+            file = candidate.resolve().relative_to(resolved_root).as_posix()
+        except ValueError:
+            continue
+        if file == ".." or file.startswith("../"):
+            continue
         if file not in normalized:
             normalized.append(file)
     return normalized
@@ -286,12 +373,16 @@ def _best_content_path_match(files: list[str], content: str) -> str | None:
     scored: list[tuple[int, str]] = []
     for file in files:
         score = len(content_terms & set(_path_terms(file.lower())))
-        if score:
+        if score >= 2:
             scored.append((score, file))
     if not scored:
         return None
     scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     return scored[0][1]
+
+
+def _path_match_score(path: str, content: str) -> int:
+    return len(set(_path_terms(content.lower())) & set(_path_terms(path.lower())))
 
 
 def _direct_instruction_content(prompt: str) -> str:
@@ -339,12 +430,16 @@ def _directive_enforcement(content: str) -> str:
     return "none"
 
 
-def _instruction_tags(content: str) -> list[str]:
+def _instruction_tags(content: str, *, candidate: DirectiveCandidate | None = None) -> list[str]:
     lowered = content.lower()
     tags = ["directive", "explicit", "user_prompt"]
-    enforcement = _directive_enforcement(content)
+    enforcement = candidate.memory_enforcement if candidate else _directive_enforcement(content)
     if enforcement != "none":
         tags.append(enforcement)
+    if candidate:
+        tags.extend(candidate.scope_terms)
+        if candidate.subject:
+            tags.extend(_path_terms(candidate.subject.lower()))
     if any(term in lowered for term in {"auth", "인증", "token", "토큰", "refresh", "리프레시"}):
         tags.append("auth")
     if any(term in lowered for term in {"token", "토큰"}):

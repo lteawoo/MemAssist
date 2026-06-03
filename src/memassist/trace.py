@@ -89,6 +89,6 @@ def _files_from_shell_command(command: str) -> list[str]:
     files: list[str] = []
     if not command.strip().startswith(("sed ", "cat ", "rg ", "python", "npm", "git ")):
         return files
-    for token in re.findall(r"(?<![-\\w./])(?:[\\w.-]+/)+[\\w.-]+", command):
+    for token in re.findall(r"(?<![-\w./])(?:[\w.-]+/)+[\w.-]+", command):
         files.append(token.strip("'\""))
     return files

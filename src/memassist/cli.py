@@ -7,13 +7,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .directives import handle_direct_user_instruction
+from .approvals import apply_session_approval, grant_approval_from_prompt
 from .doctor import run_doctor
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .integrations import install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
+from .interpreter import INTERPRETER_ACTIVE_ENV
 from .lesson import lesson_from_session
 from .lifecycle import cleanup_memories, process_session_lifecycle
+from .memory_judge import (
+    likely_distorted_or_echo_memory,
+    observe_memory_intent,
+    process_memory_intent_event,
+    process_pending_memory_intents,
+)
 from .memory_eval import (
     ACTIVE_STATUSES as MEMORY_EVAL_ACTIVE_STATUSES,
     MemoryQualityCase,
@@ -24,6 +31,7 @@ from .paths import db_path, memassist_home
 from .policy import (
     PolicyEngine,
     append_protected_path,
+    append_sensitive_path,
     default_policy_yaml,
     load_policy,
     remove_protected_path,
@@ -468,8 +476,24 @@ def cmd_memory_drafts(args: argparse.Namespace) -> int:
 
 
 def cmd_memory_activate(args: argparse.Namespace) -> int:
+    project = detect_project()
     with _store() as store:
+        memory = store.get_memory(args.id)
+        if not memory:
+            print(f"Memory not found: {args.id}")
+            return 1
         store.update_status(args.id, "active")
+        if memory.enforcement in {"warn", "block"} and memory.paths:
+            path = memory.paths[0]
+            changed = (
+                append_protected_path(project.root, path)
+                if memory.enforcement == "block"
+                else append_sensitive_path(project.root, path)
+            )
+            store.update_status(args.id, "block_policy" if memory.enforcement == "block" else "warn_policy")
+            print(f"activated {args.id}")
+            print(("added" if changed else "already present") + f" policy path: {path}")
+            return 0
     print(f"activated {args.id}")
     return 0
 
@@ -482,13 +506,23 @@ def cmd_memory_deactivate(args: argparse.Namespace) -> int:
 
 
 def cmd_memory_cleanup(args: argparse.Namespace) -> int:
+    project = detect_project()
     with _store() as store:
         result = cleanup_memories(store)
+        suspect = [
+            memory
+            for memory in store.list_memories(project_id=project.id, include_global=True, status=None)
+            if likely_distorted_or_echo_memory(memory.content)
+        ]
     if args.json:
-        _print_json(result.as_dict())
+        payload = result.as_dict()
+        payload["suspect_echo_or_drift"] = [memory.as_dict() for memory in suspect]
+        _print_json(payload)
     else:
         for memory_id in result.expired:
             print(f"expired {memory_id}")
+        for memory in suspect:
+            print(f"suspect echo/drift memory: {memory.id} {memory.content}")
     return 0
 
 
@@ -624,6 +658,8 @@ def cmd_tools_status(args: argparse.Namespace) -> int:
 
 
 def cmd_hook_event(args: argparse.Namespace) -> int:
+    if os.environ.get(INTERPRETER_ACTIVE_ENV) == "1":
+        return 0
     payload = _read_json_stdin()
     project = detect_project(Path(payload.get("cwd", os.getcwd())))
     session_id = str(payload.get("sessionId") or payload.get("session_id") or "unknown")
@@ -633,19 +669,34 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
         store.upsert_project(project)
         if args.hook_event == "user-prompt-submit":
             query = str(payload.get("prompt") or payload.get("message") or payload.get("content") or "")
-            direct_instruction = handle_direct_user_instruction(
+            approval_grant = grant_approval_from_prompt(
                 store,
-                project_root=project.root,
-                project_id=project.id,
                 session_id=session_id,
+                project_id=project.id,
                 prompt=query,
+                policy=load_policy(project.root),
             )
+            source_event = None
+            if approval_grant is None:
+                source_event = observe_memory_intent(
+                    store,
+                    session_id=session_id,
+                    project_id=project.id,
+                    prompt=query,
+                )
+                if source_event and source_event.immediate:
+                    process_memory_intent_event(
+                        store,
+                        project=project,
+                        session_id=session_id,
+                        source_event_id=source_event.event_id,
+                    )
             pack = build_memory_pack(store, query=query, project_id=project.id)
             _record_memory_injection(store, session_id=session_id, project_id=project.id, query=query, pack=pack)
             context = render_prompt_context(pack)
             context_parts = [
                 part
-                for part in [direct_instruction.message, context]
+                for part in [context]
                 if part
             ]
             context = "\n\n".join(context_parts)
@@ -663,9 +714,19 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
                 )
             return 0
         if args.hook_event == "pre-tool-use":
-            decision = PolicyEngine(load_policy(project.root)).check_pre_tool(
+            policy = load_policy(project.root)
+            decision = PolicyEngine(policy).check_pre_tool(
                 tool=tool_name,
                 args=tool_args,
+            )
+            decision = apply_session_approval(
+                store,
+                session_id=session_id,
+                project_id=project.id,
+                policy=policy,
+                tool=tool_name,
+                args=tool_args,
+                decision=decision,
             )
             record_tool_event(
                 store,
@@ -689,6 +750,7 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
             payload=payload,
         )
         if args.hook_event == "stop":
+            process_pending_memory_intents(store, project=project, session_id=session_id)
             process_session_lifecycle(store, session_id=session_id, project_id=project.id)
     return 0
 

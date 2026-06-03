@@ -1,0 +1,8 @@
+schema: spec-driven
+
+context: |
+  ai-codeassist is a memory assistant. Its enforcement behavior must follow
+  explicit project/user memory, not universal safety defaults. The product
+  should preserve project autonomy and avoid blocking or warning on actions
+  unless the project has remembered that policy.
+
