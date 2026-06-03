@@ -226,6 +226,68 @@ class GuiReadOnlyApiTest(unittest.TestCase):
             finally:
                 client.close()
 
+    def test_memory_api_exposes_read_only_priority_and_relevance_metrics(self) -> None:
+        with isolated_env():
+            self._seed_project()
+            client = GuiApiClient(self.gui)
+            try:
+                status, _headers, payload = client.get_json("/api/memories")
+                self.assertEqual(status, 200)
+                self.assertEqual(payload.get("metric"), "priority")
+                memories = payload.get("memories") or []
+                self.assertGreaterEqual(len(memories), 2)
+                for memory in memories:
+                    metrics = memory.get("metrics") or {}
+                    evidence = metrics.get("evidence") or {}
+                    self.assertIsInstance(metrics.get("priority"), int)
+                    self.assertGreaterEqual(metrics["priority"], 0)
+                    self.assertLessEqual(metrics["priority"], 100)
+                    self.assertIsNone(metrics.get("relevance"))
+                    for key in ("confidence", "strength", "utility", "uses", "recurrence"):
+                        self.assertIn(key, evidence)
+
+                status, _headers, searched = client.get_json("/api/memories?q=locked")
+                self.assertEqual(status, 200)
+                self.assertEqual(searched.get("metric"), "relevance")
+                searched_memories = searched.get("memories") or []
+                self.assertTrue(searched_memories)
+                relevance_scores = [memory["metrics"]["relevance"] for memory in searched_memories]
+                self.assertEqual(relevance_scores, sorted(relevance_scores, reverse=True))
+                self.assertTrue(all(isinstance(score, int) for score in relevance_scores))
+            finally:
+                client.close()
+
+    def test_dashboard_html_exposes_localized_metric_help_without_score_label(self) -> None:
+        html = self.gui._dashboard_html()
+        self.assertIn('id="locale"', html)
+        self.assertIn("localStorage", html)
+        self.assertIn("document.documentElement.lang", html)
+        self.assertIn("Priority", html)
+        self.assertIn("우선순위", html)
+        self.assertIn("Relevance", html)
+        self.assertIn("관련도", html)
+        self.assertIn("priorityTooltip", html)
+        self.assertIn("relevanceTooltip", html)
+        self.assertNotIn('["Type", "Content", "Paths", "Score", "Updated"]', html)
+
+    def test_localization_dictionary_covers_english_and_korean_metric_terms(self) -> None:
+        i18n = getattr(self.gui, "GUI_I18N")
+        required = {
+            "priority",
+            "relevance",
+            "confidence",
+            "strength",
+            "utility",
+            "uses",
+            "recurrence",
+            "priorityTooltip",
+            "relevanceTooltip",
+        }
+        for locale in ("en", "ko"):
+            self.assertIn(locale, i18n)
+            missing = [key for key in required if not i18n[locale].get(key)]
+            self.assertEqual(missing, [], locale)
+
     def _seed_project(self) -> Any:
         self.assertEqual(main(["init", "--tools", "codex"]), 0)
         policy_path = Path.cwd() / ".memassist" / "policy.yaml"
