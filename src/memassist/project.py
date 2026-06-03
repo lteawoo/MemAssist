@@ -5,6 +5,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .paths import memassist_home
+
 
 @dataclass(frozen=True)
 class Project:
@@ -27,8 +29,12 @@ def detect_project(start: Path | None = None) -> Project:
 
 def _walk_for_root(start: Path) -> Path:
     current = start
+    global_memassist_home = memassist_home().resolve()
     while True:
-        if (current / ".git").exists() or (current / ".memassist").exists():
+        project_memassist = current / ".memassist"
+        if (current / ".git").exists() or (
+            project_memassist.exists() and project_memassist.resolve() != global_memassist_home
+        ):
             return current
         if current.parent == current:
             return start
@@ -60,4 +66,3 @@ def _normalize_remote(remote: str) -> str:
     if cleaned.startswith("http://"):
         cleaned = cleaned.removeprefix("http://")
     return cleaned.removesuffix(".git")
-

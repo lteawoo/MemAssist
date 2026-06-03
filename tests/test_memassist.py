@@ -54,6 +54,40 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue((project / ".memassist" / "policy.yaml").exists())
             self.assertTrue((project / ".memassist" / "ignore").exists())
 
+    def test_init_ignores_global_memassist_home_as_project_marker(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            fake_home = root / "home"
+            project = fake_home / "projects" / "plain-project"
+            project.mkdir(parents=True)
+            global_memassist = fake_home / ".memassist"
+            global_memassist.mkdir()
+            old_cwd = Path.cwd()
+            old_home = os.environ.get("MEMASSIST_HOME")
+            old_codex = os.environ.get("CODEX_HOME")
+            os.environ["MEMASSIST_HOME"] = str(global_memassist)
+            os.environ["CODEX_HOME"] = str(fake_home / ".codex")
+            os.chdir(project)
+            try:
+                detected = detect_project()
+                self.assertEqual(detected.root, project.resolve())
+                code = main(["init", "--tools", "codex"])
+                self.assertEqual(code, 0)
+                self.assertTrue((project / ".memassist" / "policy.yaml").exists())
+                self.assertTrue((project / ".codex" / "hooks.json").exists())
+                self.assertFalse((fake_home / ".memassist" / "policy.yaml").exists())
+                self.assertFalse((fake_home / ".codex" / "hooks.json").exists())
+            finally:
+                os.chdir(old_cwd)
+                if old_home is None:
+                    os.environ.pop("MEMASSIST_HOME", None)
+                else:
+                    os.environ["MEMASSIST_HOME"] = old_home
+                if old_codex is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = old_codex
+
     def test_init_can_install_codex_tool_and_doctor_reports_setup(self) -> None:
         with isolated_env() as (_root, project, _home):
             code = main(["init", "--tools", "codex"])
