@@ -202,7 +202,16 @@ class Store:
                 expires_at,
             ),
         )
-        self._upsert_fts(memory_id, content, tags)
+        self._upsert_fts(
+            memory_id,
+            content,
+            tags,
+            type=type,
+            reason=reason,
+            paths=paths,
+            status=status,
+            enforcement=enforcement,
+        )
         self.conn.commit()
         return memory_id
 
@@ -355,6 +364,7 @@ class Store:
             "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
             (status, now_iso(), memory_id),
         )
+        self._refresh_fts(memory_id)
         self.conn.commit()
 
     def update_paths(self, memory_id: str, paths: list[str]) -> None:
@@ -362,6 +372,7 @@ class Store:
             "UPDATE memories SET paths_json = ?, updated_at = ? WHERE id = ?",
             (json.dumps(paths), now_iso(), memory_id),
         )
+        self._refresh_fts(memory_id)
         self.conn.commit()
 
     def supersede(self, old_id: str, new_id: str) -> None:
@@ -595,11 +606,47 @@ class Store:
             [*params, limit],
         ).fetchall()
 
-    def _upsert_fts(self, memory_id: str, content: str, tags: list[str]) -> None:
+    def _upsert_fts(
+        self,
+        memory_id: str,
+        content: str,
+        tags: list[str],
+        *,
+        type: str,
+        reason: str | None,
+        paths: list[str],
+        status: str,
+        enforcement: str,
+    ) -> None:
+        index_text = _memory_index_text(
+            content=content,
+            type=type,
+            reason=reason,
+            tags=tags,
+            paths=paths,
+            status=status,
+            enforcement=enforcement,
+        )
+        tag_text = " ".join([*tags, *paths, type, status, enforcement])
         self.conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))
         self.conn.execute(
             "INSERT INTO memory_fts (memory_id, content, tags) VALUES (?, ?, ?)",
-            (memory_id, content, " ".join(tags)),
+            (memory_id, index_text, tag_text),
+        )
+
+    def _refresh_fts(self, memory_id: str) -> None:
+        row = self.conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        if not row:
+            return
+        self._upsert_fts(
+            memory_id,
+            str(row["content"]),
+            json.loads(row["tags_json"] or "[]"),
+            type=str(row["type"]),
+            reason=row["reason"],
+            paths=json.loads(row["paths_json"] or "[]"),
+            status=str(row["status"]),
+            enforcement=str(row["enforcement"]),
         )
 
     def _row_to_memory(self, row: sqlite3.Row) -> Memory:
@@ -633,3 +680,34 @@ def _fts_query(query: str) -> str:
         return query
     deduped = list(dict.fromkeys(tokens))
     return " OR ".join(f'"{token}"' for token in deduped[:8])
+
+
+def _memory_index_text(
+    *,
+    content: str,
+    type: str,
+    reason: str | None,
+    tags: list[str],
+    paths: list[str],
+    status: str,
+    enforcement: str,
+) -> str:
+    section = "context"
+    if type == "rule" or enforcement in {"warn", "require_approval", "block"}:
+        section = "policy"
+    elif type == "workflow" or set(tags) & {"test", "tests", "verification", "verify", "ci"}:
+        section = "verifier"
+    return " ".join(
+        part
+        for part in [
+            content,
+            f"type {type}",
+            f"section {section}",
+            f"status {status}",
+            f"enforcement {enforcement}",
+            "tags " + " ".join(tags) if tags else "",
+            "paths " + " ".join(paths) if paths else "",
+            "reason " + reason if reason else "",
+        ]
+        if part
+    )

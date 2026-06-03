@@ -420,7 +420,7 @@ fixture evals before it changes prompt injection behavior:
 ```mermaid
 flowchart LR
     A[Seeded eval fixtures] --> B[Score and failure diagnostics]
-    B --> C[Contextual memory index text]
+    B --> C[Contextual memory index text baseline]
     C --> D[Optional dense retrieval channel]
     D --> E[Cross-encoder reranking]
     E --> F[Corrective confidence gate]
@@ -431,7 +431,8 @@ The planned 4.5+ architecture keeps the current local-first behavior, then adds
 optional layers:
 
 - Contextual memory text: index memory content together with section, path,
-  project, and risk context so short memories do not lose meaning.
+  status, enforcement, tags, and reason so short memories do not lose meaning.
+  A SQLite FTS baseline is implemented.
 - Hybrid retrieval: combine sparse BM25 with optional dense embeddings through
   rank fusion.
 - Reranking: re-score top retrieval candidates before section assignment.

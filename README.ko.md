@@ -413,15 +413,15 @@ PYTHONPATH=src python3 -m memassist eval rag --case-file evals/rag/basic.json --
 ```mermaid
 flowchart LR
     A[Seeded eval fixtures] --> B[Score/failure diagnostics]
-    B --> C[Contextual memory index text]
+    B --> C[Contextual memory index text baseline]
     C --> D[Optional dense retrieval channel]
     D --> E[Cross-encoder reranking]
     E --> F[Corrective confidence gate]
     F --> G[Trace-derived production eval set]
 ```
 
-- Contextual memory text: section, path, project, risk context를 memory content와
-  함께 색인합니다.
+- Contextual memory text: section, path, status, enforcement, tags, reason을
+  memory content와 함께 색인합니다. SQLite FTS baseline은 구현되어 있습니다.
 - Hybrid retrieval: BM25와 optional dense embedding을 rank fusion으로 결합합니다.
 - Reranking: section assignment 전에 top 후보를 재점수화합니다.
 - Corrective gate: confidence가 낮거나 memory가 충돌하면 pack을 줄이거나 주입을

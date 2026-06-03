@@ -102,6 +102,26 @@ class MemassistTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_memory_search_uses_contextual_path_index(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                first_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Use the focused regression command.",
+                    tags=[],
+                    paths=[],
+                )
+                self.assertFalse(store.search_memories("auth session", project_id=project.id))
+
+                store.update_paths(first_id, ["src/auth/session.py"])
+                results = store.search_memories("auth session", project_id=project.id)
+                self.assertTrue(any(memory.id == first_id for memory in results))
+
     def test_store_search_and_pack(self) -> None:
         with isolated_env():
             main(["init"])
