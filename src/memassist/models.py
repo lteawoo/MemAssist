@@ -19,6 +19,7 @@ MEMORY_STATUSES = {
     "candidate",
     "draft",
     "auto_active",
+    "long_term",
     "pending_confirmation",
     "active",
     "policy_active",

@@ -111,6 +111,29 @@ def append_protected_path(project_root: Path, path: str) -> bool:
     return True
 
 
+def remove_protected_path(project_root: Path, path: str) -> bool:
+    policy_path = project_root / ".memassist" / "policy.yaml"
+    if not policy_path.exists():
+        return False
+    config = load_policy(project_root)
+    if path not in config.protected_paths:
+        return False
+    lines = policy_path.read_text(encoding="utf-8").splitlines()
+    changed = False
+    next_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("-"):
+            value = stripped[1:].strip().strip('"').strip("'")
+            if value == path:
+                changed = True
+                continue
+        next_lines.append(line)
+    if changed:
+        policy_path.write_text("\n".join(next_lines).rstrip() + "\n", encoding="utf-8")
+    return changed
+
+
 class PolicyEngine:
     def __init__(self, config: PolicyConfig) -> None:
         self.config = config

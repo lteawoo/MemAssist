@@ -87,6 +87,23 @@ memassist status
 - `.memassist/ignore` for paths that should not be recorded.
 - A project record in the local memassist database.
 
+If you want project hooks installed in the same step, opt in explicitly:
+
+```bash
+memassist init --hooks
+```
+
+Check setup health at any time:
+
+```bash
+memassist doctor
+memassist doctor --json
+```
+
+`doctor` checks project config, local storage, Codex hook installation, Codex CLI
+availability, and reminds you that project hooks must still be trusted in Codex
+with `/hooks`.
+
 ## Install Codex Hooks
 
 Install project-local Codex hooks:
@@ -146,6 +163,7 @@ Current lifecycle statuses include:
 | `observed` | A behavior or event was seen in a session trace. |
 | `candidate` | The signal may be useful but is not active yet. |
 | `auto_active` | A low-risk memory was activated automatically. |
+| `long_term` | A repeated high-quality memory was promoted for durable retrieval. |
 | `pending_confirmation` | The memory needs a short user approval or rejection. |
 | `policy_active` | An approved protective memory was added to project policy and passed simulation. |
 | `ephemeral` | Useful trace evidence kept as session context, not a durable rule. |
@@ -252,6 +270,31 @@ Retrieval evaluation reports:
 Use this before depending on automatic memory injection in a project where noisy
 or stale memories could mislead Codex.
 
+Evaluate broader memory quality:
+
+```bash
+memassist eval memory \
+  --query "session timeout npm verification" \
+  --expect "npm test" \
+  --forbid "refresh token" \
+  --json
+```
+
+Memory quality evaluation reports:
+
+- `memory_recall`
+- `memory_precision`
+- `wrong_promotion_rate`
+- `wrong_policy_rate`
+- `stale_memory_rate`
+
+Example fixture files live under `evals/`:
+
+```bash
+memassist eval retrieval --case-file evals/retrieval/basic.json --json
+memassist eval memory --case-file evals/memory_quality/basic.json --json
+```
+
 ## Verification And Testing
 
 Verify a traced session:
@@ -292,8 +335,17 @@ memassist memory list --all
 memassist memory review
 memassist memory approve <memory-id>
 memassist memory reject <memory-id>
+memassist memory rollback <memory-id>
+memassist memory links <memory-id>
 memassist memory cleanup
 ```
+
+`rollback` rejects a memory and removes its protected path when the memory or
+command supplies one. Use it to undo an incorrect `policy_active` promotion.
+`links` shows related memories created from shared tags, paths, and content
+terms. This is the first lightweight memory-evolution layer; future scoring can
+use these links to explain why a memory was retrieved or why an older memory was
+superseded.
 
 Export and import project memory:
 

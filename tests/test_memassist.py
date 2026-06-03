@@ -54,6 +54,22 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue((project / ".memassist" / "policy.yaml").exists())
             self.assertTrue((project / ".memassist" / "ignore").exists())
 
+    def test_init_can_install_hooks_and_doctor_reports_setup(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            code = main(["init", "--hooks"])
+            self.assertEqual(code, 0)
+            self.assertTrue((project / ".codex" / "hooks.json").exists())
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["doctor", "--json"])
+            self.assertEqual(code, 0)
+            report = json.loads(out.getvalue())
+            self.assertTrue(report["passed"])
+            checks = {check["name"]: check for check in report["checks"]}
+            self.assertEqual(checks["project_config"]["status"], "pass")
+            self.assertEqual(checks["codex_project_hooks"]["status"], "pass")
+
     def test_memory_search_is_project_scoped(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
@@ -164,6 +180,96 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue(result["passed"])
             self.assertEqual(result["recall_at_k"], 1.0)
             self.assertEqual(result["forbidden_recall_rate"], 0.0)
+
+    def test_memory_quality_eval_measures_wrong_policy_and_stale_rates(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Use npm test after session timeout changes.",
+                    tags=["verification", "session", "timeout"],
+                    status="long_term",
+                    importance=0.8,
+                    confidence=0.9,
+                )
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="preference",
+                    content="Do not touch refresh token policy without confirmation.",
+                    tags=["auth", "token"],
+                    status="pending_confirmation",
+                    importance=0.9,
+                )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(
+                    [
+                        "eval",
+                        "memory",
+                        "--query",
+                        "session-timeout npm verification",
+                        "--expect",
+                        "npm test",
+                        "--forbid",
+                        "refresh token",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            result = json.loads(out.getvalue())
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["memory_recall"], 1.0)
+            self.assertEqual(result["wrong_policy_rate"], 0.0)
+
+    def test_memory_links_related_memories_by_tags_and_content(self) -> None:
+        with isolated_env():
+            main(["init"])
+            first = StringIO()
+            with patch("sys.stdout", first):
+                main(
+                    [
+                        "memory",
+                        "add",
+                        "--type",
+                        "workflow",
+                        "--content",
+                        "Run npm test after auth changes.",
+                        "--tag",
+                        "auth",
+                        "--tag",
+                        "verification",
+                    ]
+                )
+            first_id = first.getvalue().strip()
+            second = StringIO()
+            with patch("sys.stdout", second):
+                main(
+                    [
+                        "memory",
+                        "add",
+                        "--type",
+                        "lesson",
+                        "--content",
+                        "Auth changes require npm test verification.",
+                        "--tag",
+                        "auth",
+                    ]
+                )
+            second_id = second.getvalue().strip()
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["memory", "links", second_id, "--json"])
+            self.assertEqual(code, 0)
+            links = json.loads(out.getvalue())
+            self.assertTrue(any(link["target_id"] == first_id for link in links))
 
     def test_cli_memory_add_and_search(self) -> None:
         with isolated_env():
@@ -826,6 +932,10 @@ class MemassistTest(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             self.assertIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "policy.yaml").read_text())
+            with Store() as store:
+                memory = store.get_memory(lesson_id)
+                self.assertEqual(memory.status, "policy_active")  # type: ignore[union-attr]
+                self.assertIn("src/auth/refresh-token-policy.ts", memory.paths)  # type: ignore[union-attr]
             policy_out = StringIO()
             with patch("sys.stdout", policy_out):
                 code = main(
@@ -848,6 +958,17 @@ class MemassistTest(unittest.TestCase):
             result = json.loads(eval_out.getvalue())
             self.assertTrue(result["passed"])
             self.assertGreaterEqual(result["candidate_count"], 1)
+
+            with patch("sys.stdout", StringIO()):
+                code = main(["memory", "rollback", lesson_id])
+            self.assertEqual(code, 0)
+            with Store() as store:
+                memory = store.get_memory(lesson_id)
+                self.assertEqual(memory.status, "rejected")  # type: ignore[union-attr]
+            self.assertNotIn(
+                "src/auth/refresh-token-policy.ts",
+                (project_dir / ".memassist" / "policy.yaml").read_text(),
+            )
 
     def test_memory_export_import_project_bundle(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -927,6 +1048,40 @@ class MemassistTest(unittest.TestCase):
 
             with Store() as store:
                 self.assertEqual(store.get_memory(expired_id).status, "expired")  # type: ignore[union-attr]
+
+    def test_lifecycle_reinforces_duplicate_memory_to_long_term(self) -> None:
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Use these verification command(s) when relevant: npm test",
+                    tags=["verification", "test"],
+                    status="auto_active",
+                    importance=0.75,
+                    confidence=0.84,
+                )
+                store.add_trace_event(
+                    session_id="sess_repeat",
+                    project_id=project.id,
+                    event_type="pre_tool_use",
+                    tool_name="Bash",
+                    input_json={"command": "npm test"},
+                )
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = main(["daemon", "once", "--session", "sess_repeat", "--json"])
+            self.assertEqual(code, 0)
+            result = json.loads(out.getvalue())
+            self.assertEqual(result["lifecycle"]["duplicates"], 1)
+            with Store() as store:
+                memory = store.get_memory(memory_id)
+                self.assertEqual(memory.status, "long_term")  # type: ignore[union-attr]
 
 
 if __name__ == "__main__":

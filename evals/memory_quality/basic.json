@@ -1,0 +1,19 @@
+{
+  "cases": [
+    {
+      "name": "verification workflow is remembered without policy noise",
+      "query": "session timeout npm verification",
+      "expect": ["npm test"],
+      "forbid": ["refresh token"],
+      "limit": 5
+    },
+    {
+      "name": "policy memory is retrieved only when relevant",
+      "query": "refresh token protected path",
+      "expect": ["refresh token"],
+      "forbid": ["temporary branch"],
+      "expect_statuses": ["policy_active", "long_term", "active", "auto_active", "pinned"],
+      "limit": 5
+    }
+  ]
+}

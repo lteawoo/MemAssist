@@ -92,6 +92,18 @@ class Store:
               reason TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS memory_links (
+              id TEXT PRIMARY KEY,
+              project_id TEXT,
+              source_id TEXT NOT NULL,
+              target_id TEXT NOT NULL,
+              relation TEXT NOT NULL,
+              strength REAL NOT NULL,
+              reason TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(source_id, target_id, relation)
+            );
             """
         )
         try:
@@ -194,6 +206,59 @@ class Store:
         self.conn.commit()
         return memory_id
 
+    def link_related_memories(self, memory_id: str, *, project_id: str | None, limit: int = 5) -> list[str]:
+        memory = self.get_memory(memory_id)
+        if not memory:
+            return []
+        candidates = [
+            candidate
+            for candidate in self.list_memories(project_id=project_id, include_global=True)
+            if candidate.id != memory_id
+            and candidate.status not in {"rejected", "expired", "disabled", "deleted", "superseded"}
+        ]
+        scored: list[tuple[float, Memory, str]] = []
+        memory_tags = set(memory.tags)
+        memory_paths = set(memory.paths)
+        memory_tokens = set(re.findall(r"[A-Za-z0-9_가-힣]+", memory.content.lower()))
+        for candidate in candidates:
+            tag_overlap = len(memory_tags & set(candidate.tags))
+            path_overlap = len(memory_paths & set(candidate.paths))
+            candidate_tokens = set(re.findall(r"[A-Za-z0-9_가-힣]+", candidate.content.lower()))
+            token_overlap = len(memory_tokens & candidate_tokens) / max(len(memory_tokens), 1)
+            strength = min(1.0, tag_overlap * 0.25 + path_overlap * 0.35 + token_overlap * 0.40)
+            if strength >= 0.25:
+                reason = "Related by shared tags, paths, or content terms."
+                scored.append((strength, candidate, reason))
+        linked: list[str] = []
+        for strength, target, reason in sorted(scored, key=lambda item: item[0], reverse=True)[:limit]:
+            link_id = f"link_{uuid.uuid4().hex[:12]}"
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO memory_links (
+                  id, project_id, source_id, target_id, relation, strength, reason, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (link_id, project_id, memory_id, target.id, "related", strength, reason, now_iso()),
+            )
+            if cursor.rowcount:
+                linked.append(target.id)
+        self.conn.commit()
+        return linked
+
+    def memory_links(self, memory_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT l.*, m.content AS target_content, m.type AS target_type, m.status AS target_status
+            FROM memory_links l
+            JOIN memories m ON m.id = l.target_id
+            WHERE l.source_id = ?
+            ORDER BY l.strength DESC, l.created_at DESC
+            """,
+            (memory_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_memories(
         self,
         *,
@@ -235,7 +300,7 @@ class Store:
         project_id: str | None,
         limit: int = 10,
     ) -> list[Memory]:
-        active_statuses = ("active", "auto_active", "policy_active", "pinned")
+        active_statuses = ("active", "auto_active", "long_term", "policy_active", "pinned")
         scope_clause = "(m.scope_type = 'global' OR m.project_id = ?)"
         params: list[Any] = [_fts_query(query), project_id, *active_statuses]
         try:
@@ -246,10 +311,13 @@ class Store:
                 JOIN memories m ON m.id = memory_fts.memory_id
                 WHERE memory_fts MATCH ?
                   AND {scope_clause}
-                  AND m.status IN (?, ?, ?, ?)
+                  AND m.status IN (?, ?, ?, ?, ?)
                 ORDER BY
                   CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'policy_active' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'long_term' THEN 1 ELSE 0 END DESC,
                   text_score ASC,
+                  m.confidence DESC,
                   m.importance DESC
                 LIMIT ?
                 """,
@@ -263,8 +331,14 @@ class Store:
                 FROM memories m
                 WHERE (m.content LIKE ? OR m.tags_json LIKE ?)
                   AND {scope_clause}
-                  AND m.status IN (?, ?, ?, ?)
-                ORDER BY m.importance DESC, m.updated_at DESC
+                  AND m.status IN (?, ?, ?, ?, ?)
+                ORDER BY
+                  CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'policy_active' THEN 1 ELSE 0 END DESC,
+                  CASE m.status WHEN 'long_term' THEN 1 ELSE 0 END DESC,
+                  m.confidence DESC,
+                  m.importance DESC,
+                  m.updated_at DESC
                 LIMIT ?
                 """,
                 [like, like, project_id, *active_statuses, limit],
@@ -280,6 +354,13 @@ class Store:
         self.conn.execute(
             "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
             (status, now_iso(), memory_id),
+        )
+        self.conn.commit()
+
+    def update_paths(self, memory_id: str, paths: list[str]) -> None:
+        self.conn.execute(
+            "UPDATE memories SET paths_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(paths), now_iso(), memory_id),
         )
         self.conn.commit()
 
@@ -406,6 +487,57 @@ class Store:
             params,
         ).fetchone()
         return row is not None
+
+    def find_memory(
+        self,
+        *,
+        project_id: str | None,
+        content: str,
+        type: str,
+        statuses: tuple[str, ...] | None = None,
+    ) -> Memory | None:
+        clauses = ["content = ?", "type = ?"]
+        params: list[Any] = [content, type]
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        else:
+            clauses.append("project_id IS NULL")
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        row = self.conn.execute(
+            f"SELECT * FROM memories WHERE {' AND '.join(clauses)} ORDER BY updated_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+        return self._row_to_memory(row) if row else None
+
+    def reinforce_memory(
+        self,
+        memory_id: str,
+        *,
+        confidence_delta: float = 0.05,
+        importance_delta: float = 0.03,
+    ) -> Memory | None:
+        memory = self.get_memory(memory_id)
+        if not memory:
+            return None
+        confidence = min(1.0, memory.confidence + confidence_delta)
+        importance = min(1.0, memory.importance + importance_delta)
+        status = memory.status
+        if status in {"auto_active", "active"} and confidence >= 0.85 and importance >= 0.75:
+            status = "long_term"
+        self.conn.execute(
+            """
+            UPDATE memories
+            SET confidence = ?, importance = ?, status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (confidence, importance, status, now_iso(), memory_id),
+        )
+        self.conn.commit()
+        return self.get_memory(memory_id)
 
     def add_lifecycle_event(
         self,

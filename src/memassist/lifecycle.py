@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .classifier import CandidateDecision, classify_candidate
+from .classifier import CandidateDecision
+from .evaluator import evaluate_candidate
 from .extraction import extract_candidates
 from .storage import Store
 
@@ -12,9 +13,11 @@ from .storage import Store
 @dataclass(frozen=True)
 class CleanupResult:
     expired: list[str]
+    stale: list[str]
+    superseded: list[str]
 
     def as_dict(self) -> dict[str, Any]:
-        return {"expired": self.expired}
+        return {"expired": self.expired, "stale": self.stale, "superseded": self.superseded}
 
 
 @dataclass(frozen=True)
@@ -59,8 +62,9 @@ def process_session_lifecycle(
     duplicates = 0
 
     for candidate in extract_candidates(events):
-        decision = classify_candidate(candidate)
-        if store.memory_exists(
+        existing = store.list_memories(project_id=project_id, include_global=True)
+        decision = evaluate_candidate(candidate, existing_memories=existing)
+        duplicate = store.find_memory(
             project_id=project_id,
             content=candidate.content,
             type=candidate.type,
@@ -73,21 +77,29 @@ def process_session_lifecycle(
                 "policy_active",
                 "pinned",
                 "ephemeral",
+                "long_term",
             ),
-        ):
+        )
+        if duplicate:
             duplicates += 1
+            reinforced = store.reinforce_memory(duplicate.id)
             store.add_lifecycle_event(
                 session_id=session_id,
                 project_id=project_id,
-                memory_id=None,
+                memory_id=duplicate.id,
                 candidate=candidate.as_dict(),
-                decision="duplicate",
+                decision="reinforce_duplicate",
                 risk=decision.risk,
-                reason="Equivalent memory already exists for this project.",
+                reason=(
+                    "Equivalent memory already exists for this project; confidence and importance were reinforced."
+                    if reinforced
+                    else "Equivalent memory already exists for this project."
+                ),
             )
             continue
 
         memory_id = _store_decision(store, decision, session_id=session_id, project_id=project_id)
+        store.link_related_memories(memory_id, project_id=project_id)
         stored.append(memory_id)
         if decision.status == "auto_active":
             auto_active.append(memory_id)
@@ -136,7 +148,39 @@ def cleanup_memories(store: Store) -> CleanupResult:
     expired = [str(row["id"]) for row in rows]
     for memory_id in expired:
         store.update_status(memory_id, "expired")
-    return CleanupResult(expired=expired)
+    stale_rows = store.conn.execute(
+        """
+        SELECT id FROM memories
+        WHERE status = 'candidate'
+          AND updated_at <= datetime('now', '-14 days')
+        """
+    ).fetchall()
+    stale = [str(row["id"]) for row in stale_rows]
+    for memory_id in stale:
+        store.update_status(memory_id, "stale")
+
+    duplicate_rows = store.conn.execute(
+        """
+        SELECT old.id AS old_id, new.id AS new_id
+        FROM memories old
+        JOIN memories new
+          ON old.project_id IS new.project_id
+         AND old.type = new.type
+         AND lower(old.content) = lower(new.content)
+         AND old.id != new.id
+        WHERE old.status IN ('active', 'auto_active', 'long_term')
+          AND new.status IN ('active', 'auto_active', 'long_term')
+          AND old.updated_at < new.updated_at
+        """
+    ).fetchall()
+    superseded: list[str] = []
+    for row in duplicate_rows:
+        memory_id = str(row["old_id"])
+        if memory_id in superseded:
+            continue
+        store.supersede(memory_id, str(row["new_id"]))
+        superseded.append(memory_id)
+    return CleanupResult(expired=expired, stale=stale, superseded=superseded)
 
 
 def _store_decision(

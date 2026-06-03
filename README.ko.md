@@ -84,6 +84,23 @@ memassist status
 - `.memassist/ignore`: 기록하지 않을 경로 목록.
 - 로컬 memassist 데이터베이스의 프로젝트 레코드.
 
+같은 단계에서 프로젝트 hooks까지 설치하려면 명시적으로 선택합니다.
+
+```bash
+memassist init --hooks
+```
+
+설정 상태는 언제든지 점검할 수 있습니다.
+
+```bash
+memassist doctor
+memassist doctor --json
+```
+
+`doctor`는 프로젝트 설정, 로컬 저장소, Codex hook 설치 여부, Codex CLI 존재
+여부를 확인하고, 프로젝트 hooks는 Codex에서 `/hooks`로 신뢰해야 한다는 점을
+알려 줍니다.
+
 ## Codex Hooks 설치
 
 프로젝트 로컬 Codex hooks를 설치합니다.
@@ -142,6 +159,7 @@ Codex CLI에서 `/hooks`를 열고 프로젝트 `.codex` layer와 정확한 hook
 | `observed` | 세션 trace에서 동작이나 이벤트가 관찰되었습니다. |
 | `candidate` | 유용할 수 있지만 아직 활성화되지 않은 신호입니다. |
 | `auto_active` | 위험도가 낮아 자동 활성화된 메모리입니다. |
+| `long_term` | 반복 관찰된 고품질 메모리가 장기 retrieval 대상으로 승격되었습니다. |
 | `pending_confirmation` | 짧은 사용자 승인 또는 거절이 필요한 메모리입니다. |
 | `policy_active` | 승인된 보호 메모리가 프로젝트 정책에 추가되고 simulation을 통과했습니다. |
 | `ephemeral` | 영구 규칙이 아니라 세션 증거로 보관되는 정보입니다. |
@@ -248,6 +266,31 @@ Retrieval evaluation은 다음 지표를 보고합니다.
 노이즈가 많거나 오래된 메모리가 Codex를 잘못 이끌 수 있는 프로젝트라면 자동
 memory injection에 의존하기 전에 이 평가를 사용하세요.
 
+더 넓은 memory quality도 평가할 수 있습니다.
+
+```bash
+memassist eval memory \
+  --query "session timeout npm verification" \
+  --expect "npm test" \
+  --forbid "refresh token" \
+  --json
+```
+
+Memory quality evaluation은 다음 지표를 보고합니다.
+
+- `memory_recall`
+- `memory_precision`
+- `wrong_promotion_rate`
+- `wrong_policy_rate`
+- `stale_memory_rate`
+
+예시 fixture 파일은 `evals/` 아래에 있습니다.
+
+```bash
+memassist eval retrieval --case-file evals/retrieval/basic.json --json
+memassist eval memory --case-file evals/memory_quality/basic.json --json
+```
+
 ## Verification 및 Testing
 
 기록된 세션을 검증합니다.
@@ -288,8 +331,18 @@ memassist memory list --all
 memassist memory review
 memassist memory approve <memory-id>
 memassist memory reject <memory-id>
+memassist memory rollback <memory-id>
+memassist memory links <memory-id>
 memassist memory cleanup
 ```
+
+`rollback`은 메모리를 reject 상태로 바꾸고, 메모리나 명령에 보호 경로가 있으면
+해당 protected path도 제거합니다. 잘못된 `policy_active` 승격을 되돌릴 때
+사용합니다.
+`links`는 tag, path, content term이 겹쳐 자동 연결된 관련 메모리를 보여 줍니다.
+이것은 첫 번째 lightweight memory evolution 계층이며, 이후에는 어떤 이유로
+메모리가 검색되었는지 또는 오래된 메모리가 supersede되었는지 설명하는 근거로
+사용할 수 있습니다.
 
 프로젝트 메모리를 export/import합니다.
 

@@ -8,13 +8,20 @@ from pathlib import Path
 from typing import Any
 
 from .confirmation import handle_pending_confirmation, pending_confirmation_context
+from .doctor import run_doctor
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from .lesson import lesson_from_session
 from .lifecycle import cleanup_memories, process_session_lifecycle
+from .memory_eval import (
+    ACTIVE_STATUSES as MEMORY_EVAL_ACTIVE_STATUSES,
+    MemoryQualityCase,
+    evaluate_memory_quality,
+    load_memory_quality_cases,
+)
 from .paths import db_path, memassist_home
-from .policy import PolicyEngine, append_protected_path, default_policy_yaml, load_policy
+from .policy import PolicyEngine, append_protected_path, default_policy_yaml, load_policy, remove_protected_path
 from .project import detect_project
 from .retrieval import build_memory_pack, render_prompt_context
 from .retrieval_eval import RetrievalCase, evaluate_retrieval, load_cases
@@ -36,10 +43,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(required=True)
 
     init = sub.add_parser("init", help="initialize .memassist in this project")
+    init.add_argument("--hooks", action="store_true", help="also install project-local Codex hooks")
     init.set_defaults(func=cmd_init)
 
     status = sub.add_parser("status", help="show project and storage status")
     status.set_defaults(func=cmd_status)
+
+    doctor = sub.add_parser("doctor", help="check memassist project setup and Codex hook readiness")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=cmd_doctor)
 
     memory = sub.add_parser("memory", help="manage memories")
     memory_sub = memory.add_subparsers(required=True)
@@ -88,6 +100,14 @@ def build_parser() -> argparse.ArgumentParser:
     mem_supersede.add_argument("old_id")
     mem_supersede.add_argument("new_id")
     mem_supersede.set_defaults(func=cmd_memory_supersede)
+    mem_rollback = memory_sub.add_parser("rollback", help="reject a memory and remove its protected path if present")
+    mem_rollback.add_argument("id")
+    mem_rollback.add_argument("--protected-path")
+    mem_rollback.set_defaults(func=cmd_memory_rollback)
+    mem_links = memory_sub.add_parser("links", help="show related memories")
+    mem_links.add_argument("id")
+    mem_links.add_argument("--json", action="store_true")
+    mem_links.set_defaults(func=cmd_memory_links)
 
     mem_review = memory_sub.add_parser("review", help="list draft memories")
     mem_review.add_argument("--json", action="store_true")
@@ -186,6 +206,14 @@ def build_parser() -> argparse.ArgumentParser:
     eval_retrieval.add_argument("--limit", type=int, default=5)
     eval_retrieval.add_argument("--json", action="store_true")
     eval_retrieval.set_defaults(func=cmd_eval_retrieval)
+    eval_memory = eval_sub.add_parser("memory", help="evaluate memory quality cases")
+    eval_memory.add_argument("--case-file")
+    eval_memory.add_argument("--query")
+    eval_memory.add_argument("--expect", action="append", default=[])
+    eval_memory.add_argument("--forbid", action="append", default=[])
+    eval_memory.add_argument("--limit", type=int, default=10)
+    eval_memory.add_argument("--json", action="store_true")
+    eval_memory.set_defaults(func=cmd_eval_memory)
 
     daemon = sub.add_parser("daemon", help="run maintenance tasks")
     daemon_sub = daemon.add_subparsers(required=True)
@@ -197,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def cmd_init(_args: argparse.Namespace) -> int:
+def cmd_init(args: argparse.Namespace) -> int:
     project = detect_project()
     mem_dir = project.root / ".memassist"
     mem_dir.mkdir(exist_ok=True)
@@ -211,6 +239,10 @@ def cmd_init(_args: argparse.Namespace) -> int:
         store.upsert_project(project)
     print(f"Initialized memassist for {project.id}")
     print(f"Project config: {policy_path}")
+    if args.hooks:
+        path = install_codex_hooks(scope="project", project_root=project.root)
+        print(f"Installed codex hooks: {path}")
+        print("Trust the project hooks in Codex CLI with `/hooks` before relying on trace capture.")
     return 0
 
 
@@ -225,6 +257,22 @@ def cmd_status(_args: argparse.Namespace) -> int:
     print(f"Database: {db_path()}")
     print(f"Memories visible here: {len(memories)}")
     return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    project = detect_project()
+    report = run_doctor(project)
+    if args.json:
+        _print_json(report.as_dict())
+    else:
+        print("PASS" if report.passed else "FAIL")
+        print(f"Project: {report.project_id}")
+        print(f"Root: {report.project_root}")
+        print(f"Home: {report.memassist_home}")
+        print(f"Database: {report.database}")
+        for check in report.checks:
+            print(f"{check.status.upper()} {check.name}: {check.detail}")
+    return 0 if report.passed else 1
 
 
 def cmd_memory_add(args: argparse.Namespace) -> int:
@@ -244,6 +292,7 @@ def cmd_memory_add(args: argparse.Namespace) -> int:
             confidence=args.confidence,
             enforcement=args.enforcement,
         )
+        store.link_related_memories(memory_id, project_id=project_id)
     print(memory_id)
     return 0
 
@@ -328,6 +377,38 @@ def cmd_memory_supersede(args: argparse.Namespace) -> int:
     with _store() as store:
         store.supersede(args.old_id, args.new_id)
     print(f"superseded {args.old_id} by {args.new_id}")
+    return 0
+
+
+def cmd_memory_rollback(args: argparse.Namespace) -> int:
+    project = detect_project()
+    removed = False
+    with _store() as store:
+        memory = store.get_memory(args.id)
+        if not memory:
+            print(f"Memory not found: {args.id}")
+            return 1
+        path = args.protected_path or (memory.paths[0] if memory.paths else None)
+        if path:
+            removed = remove_protected_path(project.root, path)
+        store.update_status(args.id, "rejected")
+    print(f"rolled back {args.id}")
+    if args.protected_path or removed:
+        print(("removed" if removed else "not present") + f" protected path: {args.protected_path or path}")
+    return 0
+
+
+def cmd_memory_links(args: argparse.Namespace) -> int:
+    with _store() as store:
+        links = store.memory_links(args.id)
+    if args.json:
+        _print_json(links)
+    else:
+        for link in links:
+            print(
+                f"{link['relation']} {link['target_id']} "
+                f"strength={link['strength']:.2f}: {link['target_content']}"
+            )
     return 0
 
 
@@ -417,7 +498,9 @@ def cmd_policy_promote(args: argparse.Namespace) -> int:
             print(f"Memory not found: {args.memory_id}")
             return 1
         changed = append_protected_path(project.root, args.protected_path)
-        store.update_status(args.memory_id, "active")
+        paths = list(dict.fromkeys([*memory.paths, args.protected_path]))
+        store.update_paths(args.memory_id, paths)
+        store.update_status(args.memory_id, "policy_active")
     print(("added" if changed else "already present") + f" protected path: {args.protected_path}")
     return 0
 
@@ -646,6 +729,39 @@ def cmd_eval_retrieval(args: argparse.Namespace) -> int:
         print(f"precision_at_k: {result.precision_at_k:.3f}")
         print(f"mrr: {result.mrr:.3f}")
         print(f"forbidden_recall_rate: {result.forbidden_recall_rate:.3f}")
+    return 0 if result.passed else 1
+
+
+def cmd_eval_memory(args: argparse.Namespace) -> int:
+    project = detect_project()
+    if args.case_file:
+        cases = load_memory_quality_cases(Path(args.case_file))
+    elif args.query:
+        cases = [
+            MemoryQualityCase(
+                name=args.query,
+                query=args.query,
+                expect=args.expect,
+                forbid=args.forbid,
+                expect_statuses=sorted(MEMORY_EVAL_ACTIVE_STATUSES),
+                forbid_statuses=sorted(MEMORY_EVAL_ACTIVE_STATUSES),
+                limit=args.limit,
+            )
+        ]
+    else:
+        print("Provide --case-file or --query.")
+        return 1
+    with _store() as store:
+        result = evaluate_memory_quality(store, project_id=project.id, cases=cases)
+    if args.json:
+        _print_json(result.as_dict())
+    else:
+        print("PASS" if result.passed else "FAIL")
+        print(f"memory_recall: {result.memory_recall:.3f}")
+        print(f"memory_precision: {result.memory_precision:.3f}")
+        print(f"wrong_promotion_rate: {result.wrong_promotion_rate:.3f}")
+        print(f"wrong_policy_rate: {result.wrong_policy_rate:.3f}")
+        print(f"stale_memory_rate: {result.stale_memory_rate:.3f}")
     return 0 if result.passed else 1
 
 

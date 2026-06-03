@@ -1,0 +1,10 @@
+{
+  "cases": [
+    {
+      "query": "session timeout npm verification",
+      "expect": ["npm test"],
+      "forbid": ["refresh token"],
+      "limit": 5
+    }
+  ]
+}

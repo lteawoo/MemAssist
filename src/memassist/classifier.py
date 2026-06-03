@@ -16,6 +16,8 @@ class CandidateDecision:
     memory_kind: str
     enforcement: str
     reason: str
+    scores: dict[str, float] | None = None
+    total_score: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -26,6 +28,8 @@ class CandidateDecision:
             "memory_kind": self.memory_kind,
             "enforcement": self.enforcement,
             "reason": self.reason,
+            "scores": self.scores or {},
+            "total_score": self.total_score,
         }
 
 
