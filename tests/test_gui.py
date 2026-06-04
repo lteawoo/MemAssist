@@ -257,6 +257,47 @@ class GuiReadOnlyApiTest(unittest.TestCase):
             finally:
                 client.close()
 
+    def test_memory_api_uses_markdown_artifacts_not_sqlite_only_rows(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init", "--tools", "codex"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                markdown_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="fact",
+                    content="GUI should display this Markdown-backed memory.",
+                    tags=["gui", "markdown"],
+                    status="active",
+                )
+                stale_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="fact",
+                    content="GUI must hide this SQLite-only stale row.",
+                    tags=["gui", "stale"],
+                    status="active",
+                )
+                (store.path.parent / "memories" / "active" / f"{stale_id}.md").unlink()
+                store.conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (markdown_id,))
+                store.conn.execute("DELETE FROM memories WHERE id = ?", (markdown_id,))
+                store.conn.commit()
+
+            client = GuiApiClient(self.gui)
+            try:
+                status, _headers, payload = client.get_json("/api/memories")
+                self.assertEqual(status, 200)
+                memories = payload.get("memories") or []
+                memory_ids = {memory.get("id") for memory in memories}
+                contents = [str(memory.get("content") or "") for memory in memories]
+                self.assertIn(markdown_id, memory_ids)
+                self.assertNotIn(stale_id, memory_ids)
+                self.assertTrue(any("Markdown-backed memory" in content for content in contents))
+                self.assertFalse(any("SQLite-only stale row" in content for content in contents))
+            finally:
+                client.close()
+
     def test_api_survives_lone_surrogate_in_stored_trace_input(self) -> None:
         # Tool input stored as JSON text with a \uXXXX lone-surrogate escape binds fine,
         # but json.loads restores a real lone surrogate on read. The API must still respond.

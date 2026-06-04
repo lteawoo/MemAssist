@@ -73,13 +73,13 @@ memassist SHALL NOT warn, block, or otherwise gate tool execution at the `PreToo
 - **AND** memassist SHALL record the tool event as trace data only
 
 ### Requirement: memassist SHALL keep UserPromptSubmit retrieval-only for memory content
-During `UserPromptSubmit`, memassist SHALL retrieve eligible existing memories, update read-side retrieval telemetry for memories that are returned, and inject relevant context. It SHALL NOT create source events, candidate memories, persistent memories, or lifecycle decisions during `UserPromptSubmit`.
+During `UserPromptSubmit`, memassist SHALL retrieve eligible existing memories from derived search/index state, update read-side retrieval telemetry for memories that are returned, and inject relevant context. It SHALL NOT create source events, candidate memories, persistent memories, or lifecycle decisions during `UserPromptSubmit`. Retrieved memories SHALL correspond to authoritative active Markdown artifacts after index reconciliation.
 
 #### Scenario: Submit retrieves without creating memory
 - **GIVEN** an active memory exists for the current project
 - **WHEN** a `UserPromptSubmit` hook receives a related prompt
 - **THEN** memassist SHALL retrieve the existing memory
-- **AND** memassist MAY update `retrieval_count` and `last_used_at` for the retrieved memory
+- **AND** memassist MAY update `retrieval_count` and `last_used_at` for the retrieved memory in derived telemetry
 - **AND** memassist SHALL NOT create a new memory record, source event, candidate, or lifecycle judgment for the submitted prompt
 
 #### Scenario: Submit injects only eligible memory
@@ -87,6 +87,12 @@ During `UserPromptSubmit`, memassist SHALL retrieve eligible existing memories, 
 - **WHEN** a `UserPromptSubmit` hook builds additional context
 - **THEN** memassist SHALL include the active memory when it passes confidence and scope gates
 - **AND** memassist SHALL NOT inject the candidate memory as prompt context
+
+#### Scenario: Submit ignores stale SQLite-only row
+- **GIVEN** SQLite contains a search row that matches the current prompt
+- **AND** no active Markdown artifact exists for that memory id
+- **WHEN** memassist reconciles the index or handles prompt retrieval after reconciliation
+- **THEN** memassist SHALL NOT inject that SQLite-only row as memory context
 
 ### Requirement: memassist SHALL inject source-grounded memory context
 Injected memory context SHALL be derived from stored memory records and their source evidence rather than compact summaries. memassist SHALL keep source evidence available for audit without requiring a `MEMORY.md` summary file.
@@ -97,3 +103,19 @@ Injected memory context SHALL be derived from stored memory records and their so
 - **THEN** memassist SHALL inject the memory content as relevant context
 - **AND** memassist SHALL keep the source quote or source reference available in the memory pack or storage record for audit
 - **AND** memassist SHALL NOT require a compact summary file to satisfy retrieval
+
+### Requirement: memassist SHALL retrieve from source-grounded Markdown-backed records
+Prompt-time retrieval MAY use SQLite for speed, but each injected memory SHALL represent an active Markdown-backed record whose content and source evidence can be audited from the authoritative artifact.
+
+#### Scenario: Retrieved context can be audited
+- **GIVEN** an active Markdown memory artifact includes content, source quote, and source reference
+- **AND** the derived SQLite index contains a matching row
+- **WHEN** prompt retrieval injects that memory
+- **THEN** the injected context SHALL include the Markdown-backed memory content
+- **AND** the source quote or source reference SHALL remain available from the authoritative artifact or memory pack for audit
+
+#### Scenario: Rebuild restores retrieval from Markdown
+- **GIVEN** an active Markdown memory artifact exists
+- **AND** SQLite index state is missing or stale
+- **WHEN** memassist rebuilds the memory index
+- **THEN** later prompt retrieval SHALL find the active memory through the rebuilt index

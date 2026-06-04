@@ -16,23 +16,8 @@ MEMORY_TYPES = {
 }
 
 MEMORY_STATUSES = {
-    "observed",
     "candidate",
-    "draft",
-    "auto_active",
-    "long_term",
-    "durable",
     "active",
-    "pinned",
-    "ephemeral",
-    "decaying",
-    "rejected",
-    "stale",
-    "superseded",
-    "disabled",
-    "expired",
-    "deleted",
-    "tombstoned",
     "archived",
 }
 

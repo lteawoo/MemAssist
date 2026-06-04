@@ -72,7 +72,7 @@ When memassist stores or updates a memory, it SHALL write a Markdown artifact co
 - **AND** the artifact SHALL include the memory content and source evidence
 
 ### Requirement: memassist SHALL use SQLite as a rebuildable runtime index
-SQLite SHALL be a derived index/cache for runtime retrieval, duplicate checks, and retrieval telemetry. Runtime prompt hooks SHALL use SQLite search state for speed, but memory content, source evidence, and lifecycle SHALL be rebuildable from Markdown artifacts.
+SQLite SHALL be a derived index/cache for runtime retrieval, duplicate checks, relationship lookup acceleration, and retrieval telemetry. Runtime prompt hooks MAY use SQLite search state for speed, but memory content, source evidence, lifecycle, management reads, import/export behavior, and GUI memory rows SHALL be authoritative from Markdown artifacts. SQLite-only memory rows SHALL be stale derived state and MUST NOT own memory lifecycle.
 
 #### Scenario: Runtime uses SQLite index state
 - **GIVEN** an active Markdown memory artifact has been indexed into SQLite
@@ -90,3 +90,40 @@ SQLite SHALL be a derived index/cache for runtime retrieval, duplicate checks, a
 - **GIVEN** a memory exists only in the SQLite cache after its Markdown artifact was removed
 - **WHEN** memassist rebuilds the memory index from artifacts
 - **THEN** the stale SQLite memory cache row SHALL be removed from retrieval eligibility
+
+#### Scenario: Management reads ignore SQLite-only rows
+- **GIVEN** a memory row exists only in SQLite
+- **AND** no Markdown artifact exists for that memory id
+- **WHEN** memassist lists, exports, displays, updates, activates, archives, or cleans up managed memories
+- **THEN** memassist SHALL NOT treat the SQLite-only row as a managed memory
+
+### Requirement: memassist SHALL keep memory management Markdown-authoritative
+Project-local memory management SHALL operate on Markdown artifacts as the authoritative store. After each successful management write, memassist SHALL refresh or reconcile the derived SQLite memory index.
+
+#### Scenario: List uses Markdown artifacts
+- **GIVEN** active, candidate, and archived Markdown memory artifacts exist
+- **AND** SQLite contains no memory index rows
+- **WHEN** a user lists all managed memories
+- **THEN** memassist SHALL return the memories represented by the Markdown artifacts
+- **AND** memassist MAY rebuild or refresh SQLite as derived index state
+
+#### Scenario: Update writes Markdown first
+- **GIVEN** an active Markdown memory artifact exists
+- **WHEN** a user updates the memory paths or lifecycle status
+- **THEN** memassist SHALL update or move the Markdown artifact first
+- **AND** memassist SHALL update SQLite only after the authoritative artifact update succeeds
+
+### Requirement: memassist SHALL export and import Markdown-authoritative memories
+Memory export and import SHALL use Markdown artifacts as the authoritative source and destination for managed memory. Export SHALL NOT include SQLite-only rows that lack corresponding Markdown artifacts.
+
+#### Scenario: Export excludes stale SQLite row
+- **GIVEN** one active Markdown memory artifact exists
+- **AND** one stale SQLite-only memory row exists
+- **WHEN** a user exports project memories
+- **THEN** the export SHALL include the Markdown-backed memory
+- **AND** the export SHALL NOT include the stale SQLite-only row
+
+#### Scenario: Import creates candidate artifacts
+- **WHEN** a user imports project memories
+- **THEN** memassist SHALL write imported memories as Markdown artifacts under `memories/candidates` unless activation is explicitly requested
+- **AND** memassist SHALL refresh the derived SQLite index after writing artifacts

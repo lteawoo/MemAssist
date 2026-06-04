@@ -28,7 +28,7 @@ class SeedMemory:
             content=str(value.get("content", "")),
             tags=_string_list(value.get("tags")),
             paths=_string_list(value.get("paths")),
-            status=status if status in MEMORY_STATUSES else "active",
+            status=status if status in MEMORY_STATUSES else "archived",
             importance=float(value.get("importance", 0.8)),
             confidence=float(value.get("confidence", 0.85)),
             enforcement=enforcement if enforcement in ENFORCEMENTS else "none",
@@ -60,7 +60,6 @@ def insert_seed_memories(store: Store, *, project_id: str, seed: list[SeedMemory
             enforcement=memory.enforcement,
             source_kind=source_kind,
             source_ref=f"{source_kind}:{uuid.uuid4().hex[:12]}",
-            persist_artifact=False,
         )
         ids.append(memory_id)
     return ids
@@ -69,20 +68,17 @@ def insert_seed_memories(store: Store, *, project_id: str, seed: list[SeedMemory
 def remove_seed_memories(store: Store, memory_ids: list[str]) -> None:
     if not memory_ids:
         return
-    placeholders = ", ".join("?" for _ in memory_ids)
-    store.conn.execute(f"DELETE FROM memory_links WHERE source_id IN ({placeholders})", memory_ids)
-    store.conn.execute(f"DELETE FROM memory_links WHERE target_id IN ({placeholders})", memory_ids)
-    store.conn.execute(f"DELETE FROM memory_fts WHERE memory_id IN ({placeholders})", memory_ids)
-    store.conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", memory_ids)
-    store.conn.commit()
+    for memory_id in memory_ids:
+        store.delete_memory(memory_id)
 
 
 def remove_seed_memories_by_source(store: Store, *, project_id: str, source_kind: str) -> None:
-    rows = store.conn.execute(
-        "SELECT id FROM memories WHERE project_id = ? AND source_kind = ?",
-        (project_id, source_kind),
-    ).fetchall()
-    remove_seed_memories(store, [str(row["id"]) for row in rows])
+    ids = [
+        memory.id
+        for memory in store.list_memories(project_id=project_id, include_global=False, status=None)
+        if memory.source_kind == source_kind
+    ]
+    remove_seed_memories(store, ids)
 
 
 def _string_list(value: object) -> list[str]:

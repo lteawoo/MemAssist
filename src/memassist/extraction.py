@@ -52,14 +52,14 @@ def extract_candidates(events: list[Row]) -> list[MemoryCandidate]:
                 tags=tags,
                 importance=0.4,
                 confidence=0.5,
-                reason="Derived from tool trace files; keep as draft until reviewed.",
+                reason="Derived from tool trace files; archive unless explicitly promoted.",
             )
         )
     if summary.denied_events:
         candidates.append(
             MemoryCandidate(
                 type="lesson",
-                content="A policy-denied tool call occurred; review whether a durable rule or workflow update is needed.",
+                content="A policy-denied tool call occurred; review whether a persistent rule or workflow update is needed.",
                 tags=["policy", "lesson"],
                 importance=0.8,
                 confidence=0.6,
@@ -81,7 +81,7 @@ def store_candidates(events: list[Row], add_memory: Any, *, project_id: str | No
             content=candidate.content,
             reason=candidate.reason,
             tags=candidate.tags,
-            status="draft",
+            status="candidate",
             importance=candidate.importance,
             confidence=candidate.confidence,
             source_kind="extracted",

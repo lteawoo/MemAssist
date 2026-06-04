@@ -17,6 +17,5 @@ def lesson_from_session(events: list[Row], feedback: str | None = None) -> str:
     if summary.test_commands:
         pieces.append("Verification observed: " + ", ".join(sorted(set(summary.test_commands))))
     if not pieces:
-        pieces.append("Review this session before turning it into a durable lesson.")
+        pieces.append("Review this session before turning it into a candidate lesson.")
     return " ".join(pieces)
-

@@ -19,20 +19,16 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
     reason = base.reason
 
     if status == "candidate" and decision != "keep_candidate" and total >= 0.68:
-        status = "auto_active"
-        decision = "auto_activate"
+        status = "active"
+        decision = "activate"
         reason = "Candidate met the memory quality threshold after evidence and specificity scoring."
-    elif status == "auto_active" and scores["repeat_score"] >= 0.75 and total >= 0.78:
-        status = "durable"
-        decision = "promote_durable"
-        reason = "Repeated high-quality memory was promoted to durable memory."
     elif decision == "keep_candidate" and scores["conflict_score"] < 0.35:
-        status = "rejected"
-        decision = "reject_conflict"
+        status = "archived"
+        decision = "archive_conflict"
         reason = "Candidate conflicts with an existing memory and needs to be discarded before activation."
     elif decision == "keep_candidate" and total < 0.50:
-        status = "rejected"
-        decision = "reject_low_quality"
+        status = "archived"
+        decision = "archive_low_quality"
         reason = "Risky candidate did not meet minimum evidence quality for inactive storage."
     elif decision == "keep_candidate" and candidate.type in {"rule", "lesson"} and total >= 0.72:
         enforcement = "warn"
@@ -111,7 +107,7 @@ def _conflict_score(candidate: MemoryCandidate, existing_memories: list[Memory])
     permissive = _contains_any(candidate_text, ["allow", "allowed", "can edit", "수정해도", "허용"])
     candidate_tokens = _tokens(candidate.content)
     for memory in existing_memories:
-        if memory.status in {"rejected", "expired", "superseded", "disabled", "deleted"}:
+        if memory.status == "archived":
             continue
         overlap = len(candidate_tokens & _tokens(memory.content)) / max(len(candidate_tokens), 1)
         if overlap < 0.4:

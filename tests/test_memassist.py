@@ -14,10 +14,11 @@ from memassist.cli import main
 from memassist.extraction import extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from memassist.memory_judge import INTERPRETER_ACTIVE_ENV
+from memassist.models import MEMORY_STATUSES, Memory
 from memassist.policy import default_policy_yaml, load_policy
 from memassist.project import detect_project, detect_project_for_init
 from memassist.retrieval import analyze_query_intent, build_memory_pack
-from memassist.storage import Store
+from memassist.storage import Store, now_iso
 from memassist.trace import extract_files
 
 
@@ -934,7 +935,7 @@ class MemassistTest(unittest.TestCase):
             stdout = StringIO()
             with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", stdout):
                 self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
-            self.assertEqual(stdout.getvalue(), "")
+            self.assertNotIn("SQLite-only stale retrieval sentinel", stdout.getvalue())
 
     def test_markdown_memory_rebuild_updates_sqlite_search_index(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -996,6 +997,342 @@ class MemassistTest(unittest.TestCase):
 
             self.assertNotIn(memory_id, indexed)
             self.assertFalse(any(memory.id == memory_id for memory in results))
+
+    def test_sqlite_deletion_and_rebuild_preserves_markdown_lifecycle_buckets(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                active_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="directive",
+                    content="Ask before changing refresh token behavior.",
+                    tags=["auth", "token"],
+                    paths=["src/auth/session.ts"],
+                    status="active",
+                    source_ref="turn://active",
+                    source_quote="ask before refresh token changes",
+                )
+                candidate_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Consider running focused auth regression tests.",
+                    tags=["auth", "test"],
+                    status="candidate",
+                    source_ref="turn://candidate",
+                    source_quote="run focused auth tests",
+                )
+                archived_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="fact",
+                    content="The old auth server used a legacy token table.",
+                    tags=["auth", "legacy"],
+                    status="archived",
+                    source_ref="turn://archived",
+                    source_quote="old auth server legacy table",
+                )
+
+            db = project_dir / ".memassist" / "memassist.db"
+            db.unlink()
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["memory", "rebuild-index", "--json"]), 0)
+            rebuilt = json.loads(out.getvalue())
+            self.assertEqual(set(rebuilt["indexed"]), {active_id, candidate_id, archived_id})
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["memory", "list", "--all", "--json"]), 0)
+            listed = {memory["id"]: memory for memory in json.loads(out.getvalue())}
+            self.assertEqual(listed[active_id]["status"], "active")
+            self.assertEqual(listed[candidate_id]["status"], "candidate")
+            self.assertEqual(listed[archived_id]["status"], "archived")
+            for memory_id, bucket, quote in (
+                (active_id, "active", "ask before refresh token changes"),
+                (candidate_id, "candidates", "run focused auth tests"),
+                (archived_id, "archived", "old auth server legacy table"),
+            ):
+                artifact = project_dir / ".memassist" / "memories" / bucket / f"{memory_id}.md"
+                self.assertTrue(artifact.exists())
+                self.assertIn(quote, artifact.read_text(encoding="utf-8"))
+
+            with Store() as store:
+                results = store.search_memories("refresh token", project_id=project.id)
+            self.assertTrue(any(memory.id == active_id for memory in results))
+
+    def test_sqlite_only_row_ignored_by_list_export_update_and_retrieval_after_rebuild(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                markdown_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="fact",
+                    content="Markdown-backed memory describes canonical artifact authority.",
+                    tags=["source"],
+                    status="active",
+                )
+                stale_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="fact",
+                    content="SQLite-only stale retrieval sentinel.",
+                    tags=["stale-sentinel"],
+                    status="active",
+                )
+                (project_dir / ".memassist" / "memories" / "active" / f"{stale_id}.md").unlink()
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["memory", "rebuild-index", "--json"]), 0)
+            self.assertNotIn(stale_id, json.loads(out.getvalue())["indexed"])
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["memory", "list", "--all", "--json"]), 0)
+            listed = json.loads(out.getvalue())
+            self.assertIn(markdown_id, {memory["id"] for memory in listed})
+            self.assertNotIn(stale_id, {memory["id"] for memory in listed})
+
+            export_path = project_dir / "memories-export.json"
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["memory", "export", str(export_path), "--all", "--json"]), 0)
+            exported = json.loads(export_path.read_text(encoding="utf-8"))["memories"]
+            self.assertTrue(
+                any(memory["content"] == "Markdown-backed memory describes canonical artifact authority." for memory in exported)
+            )
+            self.assertFalse(any(memory["content"] == "SQLite-only stale retrieval sentinel." for memory in exported))
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["memory", "activate", stale_id]), 1)
+            self.assertIn("Memory not found", out.getvalue())
+
+            payload = {
+                "session_id": "sess_stale_sqlite",
+                "cwd": str(project_dir),
+                "prompt": "SQLite-only stale retrieval sentinel",
+            }
+            stdout = StringIO()
+            with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", stdout):
+                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            self.assertEqual(stdout.getvalue(), "")
+
+            with Store() as store:
+                row = store.conn.execute("SELECT id FROM memories WHERE id = ?", (stale_id,)).fetchone()
+            self.assertIsNone(row)
+
+    def test_management_commands_work_when_sqlite_missing_or_empty(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                active_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Keep managed memories readable without SQLite.",
+                    tags=["sqlite"],
+                    status="active",
+                )
+                candidate_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Activate this candidate without relying on SQLite rows.",
+                    tags=["sqlite"],
+                    status="candidate",
+                )
+
+            db = project_dir / ".memassist" / "memassist.db"
+            db.unlink()
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["memory", "list", "--all", "--json"]), 0)
+            self.assertEqual({active_id, candidate_id}, {memory["id"] for memory in json.loads(out.getvalue())})
+
+            with patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["memory", "activate", candidate_id]), 0)
+            self.assertTrue((project_dir / ".memassist" / "memories" / "active" / f"{candidate_id}.md").exists())
+
+            with Store() as store:
+                store.conn.execute("DELETE FROM memory_fts")
+                store.conn.execute("DELETE FROM memories")
+                store.conn.commit()
+
+            with patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["memory", "deactivate", active_id]), 0)
+            self.assertTrue((project_dir / ".memassist" / "memories" / "archived" / f"{active_id}.md").exists())
+
+            export_path = project_dir / "empty-index-export.json"
+            with patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["memory", "export", str(export_path), "--all"]), 0)
+            exported_ids = {
+                memory["content"]
+                for memory in json.loads(export_path.read_text(encoding="utf-8"))["memories"]
+            }
+            self.assertIn("Keep managed memories readable without SQLite.", exported_ids)
+            self.assertIn("Activate this candidate without relying on SQLite rows.", exported_ids)
+
+    def test_markdown_write_failure_does_not_create_sqlite_only_memory(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                with patch("memassist.storage.sync_memory_artifact", side_effect=OSError("artifact write failed")):
+                    with self.assertRaises(OSError):
+                        store.add_memory(
+                            scope_type="project",
+                            project_id=project.id,
+                            type="fact",
+                            content="This should never become a SQLite-only managed memory.",
+                            tags=["artifact-failure"],
+                            status="active",
+                        )
+                row = store.conn.execute(
+                    "SELECT id FROM memories WHERE content = ?",
+                    ("This should never become a SQLite-only managed memory.",),
+                ).fetchone()
+                self.assertIsNone(row)
+
+    def test_lifecycle_bucket_path_overrides_conflicting_metadata_status(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                active_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="directive",
+                    content="Active bucket wins over archived metadata.",
+                    tags=["bucket"],
+                    status="active",
+                )
+                candidate_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Candidate bucket wins over active metadata.",
+                    tags=["bucket"],
+                    status="candidate",
+                )
+                archived_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="fact",
+                    content="Archived bucket wins over active metadata.",
+                    tags=["bucket"],
+                    status="archived",
+                )
+
+            _replace_artifact_metadata_status(
+                project_dir / ".memassist" / "memories" / "active" / f"{active_id}.md",
+                "archived",
+            )
+            _replace_artifact_metadata_status(
+                project_dir / ".memassist" / "memories" / "candidates" / f"{candidate_id}.md",
+                "active",
+            )
+            _replace_artifact_metadata_status(
+                project_dir / ".memassist" / "memories" / "archived" / f"{archived_id}.md",
+                "active",
+            )
+
+            with Store() as store:
+                indexed = store.rebuild_memory_index_from_artifacts()
+                listed = {memory.id: memory for memory in store.list_memories(project_id=project.id, include_global=False, status=None)}
+                active_results = store.search_memories("bucket wins", project_id=project.id)
+
+            self.assertEqual(set(indexed), {active_id, candidate_id, archived_id})
+            self.assertEqual(listed[active_id].status, "active")
+            self.assertEqual(listed[candidate_id].status, "candidate")
+            self.assertEqual(listed[archived_id].status, "archived")
+            self.assertTrue(any(memory.id == active_id for memory in active_results))
+            self.assertFalse(any(memory.id in {candidate_id, archived_id} for memory in active_results))
+
+    def test_retrieval_telemetry_can_reset_on_rebuild_without_losing_memory_or_evidence(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="directive",
+                    content="Review auth telemetry before changing refresh token TTL.",
+                    tags=["auth", "telemetry", "refresh"],
+                    paths=["src/auth/session.ts"],
+                    status="active",
+                    source_ref="turn://telemetry",
+                    source_quote="review auth telemetry first",
+                )
+                self.assertTrue(store.search_memories("refresh token telemetry", project_id=project.id))
+                used = store.get_memory(memory_id)
+                self.assertIsNotNone(used)
+                self.assertGreater(used.retrieval_count, 0)  # type: ignore[union-attr]
+
+            db = project_dir / ".memassist" / "memassist.db"
+            db.unlink()
+            with patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["memory", "rebuild-index"]), 0)
+
+            artifact = project_dir / ".memassist" / "memories" / "active" / f"{memory_id}.md"
+            artifact_text = artifact.read_text(encoding="utf-8")
+            self.assertIn("review auth telemetry first", artifact_text)
+            self.assertIn("turn://telemetry", artifact_text)
+            with Store() as store:
+                rebuilt = store.get_memory(memory_id)
+                results = store.search_memories("refresh token telemetry", project_id=project.id)
+            self.assertIsNotNone(rebuilt)
+            self.assertEqual(rebuilt.status, "active")  # type: ignore[union-attr]
+            self.assertEqual(rebuilt.content, "Review auth telemetry before changing refresh token TTL.")  # type: ignore[union-attr]
+            self.assertEqual(rebuilt.retrieval_count, 0)  # type: ignore[union-attr]
+            self.assertTrue(any(memory.id == memory_id for memory in results))
+
+    def test_legacy_statuses_do_not_create_retrieval_or_management_behavior(self) -> None:
+        legacy_statuses = {"draft", "pinned", "disabled", "deleted", "expired", "superseded", "durable"}
+        self.assertFalse(legacy_statuses & MEMORY_STATUSES)
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                legacy_ids = [
+                    _insert_legacy_sqlite_only_memory(store, project_id=project.id, status=status)
+                    for status in sorted(legacy_statuses)
+                ]
+                store.rebuild_memory_index_from_artifacts()
+                for memory_id in legacy_ids:
+                    self.assertIsNone(store.get_memory(memory_id))
+                self.assertFalse(store.search_memories("legacy sqlite status sentinel", project_id=project.id))
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["memory", "list", "--all", "--json"]), 0)
+            self.assertFalse(
+                any("legacy sqlite status sentinel" in memory["content"] for memory in json.loads(out.getvalue()))
+            )
+
+            payload = {
+                "session_id": "sess_legacy_status",
+                "cwd": str(project_dir),
+                "prompt": "legacy sqlite status sentinel",
+            }
+            stdout = StringIO()
+            with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", stdout):
+                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            self.assertEqual(stdout.getvalue(), "")
 
     def test_trace_extracts_apply_patch_files(self) -> None:
         files = extract_files(
@@ -2036,7 +2373,7 @@ class MemassistTest(unittest.TestCase):
 
             out = StringIO()
             with patch("sys.stdout", out):
-                code = main(["memory", "drafts"])
+                code = main(["memory", "pending"])
             self.assertEqual(code, 0)
             self.assertIn("Draft fact", out.getvalue())
 
@@ -2064,7 +2401,7 @@ class MemassistTest(unittest.TestCase):
             with patch("sys.stdout", StringIO()):
                 main(["memory", "cleanup"])
             with Store() as store:
-                self.assertEqual(store.get_memory(expired_id).status, "expired")  # type: ignore[union-attr]
+                self.assertEqual(store.get_memory(expired_id).status, "archived")  # type: ignore[union-attr]
 
     def test_lesson_from_session_does_not_promote_memory_to_policy(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -2125,17 +2462,17 @@ class MemassistTest(unittest.TestCase):
             self.assertGreaterEqual(result["candidate_count"], 1)
 
             with patch("sys.stdout", StringIO()):
-                code = main(["memory", "rollback", lesson_id])
+                code = main(["memory", "deactivate", lesson_id])
             self.assertEqual(code, 0)
             with Store() as store:
                 memory = store.get_memory(lesson_id)
-                self.assertEqual(memory.status, "rejected")  # type: ignore[union-attr]
+                self.assertEqual(memory.status, "archived")  # type: ignore[union-attr]
             self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
                 (project_dir / ".memassist" / "policy.yaml").read_text(),
             )
 
-    def test_memory_rollback_does_not_remove_manual_sensitive_path(self) -> None:
+    def test_memory_deactivate_does_not_remove_manual_sensitive_path(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
             project = detect_project()
@@ -2158,13 +2495,13 @@ class MemassistTest(unittest.TestCase):
                 )
 
             with patch("sys.stdout", StringIO()):
-                code = main(["memory", "rollback", memory_id])
+                code = main(["memory", "deactivate", memory_id])
             self.assertEqual(code, 0)
             policy_text = (project_dir / ".memassist" / "policy.yaml").read_text()
             self.assertIn("src/auth/session.py", policy_text)
             with Store() as store:
                 memory = store.get_memory(memory_id)
-                self.assertEqual(memory.status, "rejected")  # type: ignore[union-attr]
+                self.assertEqual(memory.status, "archived")  # type: ignore[union-attr]
 
     def test_memory_export_import_project_bundle(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -2240,10 +2577,10 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(result["session_id"], "sess_daemon")
             self.assertTrue(result["eval"]["passed"])
             self.assertGreaterEqual(len(result["stored_candidates"]), 1)
-            self.assertGreaterEqual(len(result["lifecycle"]["auto_active"]), 1)
+            self.assertGreaterEqual(len(result["lifecycle"]["active"]), 1)
 
             with Store() as store:
-                self.assertEqual(store.get_memory(expired_id).status, "expired")  # type: ignore[union-attr]
+                self.assertEqual(store.get_memory(expired_id).status, "archived")  # type: ignore[union-attr]
 
     def test_lifecycle_reinforces_duplicate_active_memory_without_status_promotion(self) -> None:
         with isolated_env():
@@ -2492,10 +2829,10 @@ class MemassistTest(unittest.TestCase):
                 code = main(["daemon", "once", "--session", "missing", "--json"])
             self.assertEqual(code, 0)
             result = json.loads(out.getvalue())
-            self.assertIn(candidate_id, result["cleanup"]["superseded"])
+            self.assertIn(candidate_id, result["cleanup"]["duplicates"])
             with Store() as store:
                 candidate = store.get_memory(candidate_id)
-                self.assertEqual(candidate.status, "superseded")  # type: ignore[union-attr]
+                self.assertEqual(candidate.status, "archived")  # type: ignore[union-attr]
                 self.assertEqual(candidate.superseded_by, memory_id)  # type: ignore[union-attr]
 
 
@@ -2662,6 +2999,53 @@ class ClaudeMemoryJudgeTest(unittest.TestCase):
 
 def tmpfile_root() -> Path:
     return Path(tempfile.gettempdir())
+
+
+def _replace_artifact_metadata_status(path: Path, status: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    start = text.index("<!-- memassist\n") + len("<!-- memassist\n")
+    end = text.index("\n-->", start)
+    metadata = json.loads(text[start:end])
+    metadata["status"] = status
+    path.write_text(
+        text[:start] + json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + text[end:],
+        encoding="utf-8",
+    )
+
+
+def _insert_legacy_sqlite_only_memory(store: Store, *, project_id: str, status: str) -> str:
+    memory_id = f"mem_legacy_{status}"
+    ts = now_iso()
+    memory = Memory(
+        id=memory_id,
+        scope_type="project",
+        project_id=project_id,
+        session_id=None,
+        type="fact",
+        content=f"legacy sqlite status sentinel {status}",
+        reason=None,
+        tags=["legacy", status],
+        paths=[],
+        status=status,
+        importance=0.9,
+        confidence=0.9,
+        strength=0.9,
+        recurrence=1,
+        retrieval_count=0,
+        utility=0.0,
+        half_life_days=30.0,
+        enforcement="none",
+        source_kind="legacy_sqlite_row",
+        source_ref=None,
+        created_at=ts,
+        updated_at=ts,
+        last_used_at=None,
+        expires_at=None,
+        superseded_by=None,
+    )
+    store._upsert_memory_index(memory)
+    store.conn.commit()
+    return memory_id
 
 
 if __name__ == "__main__":

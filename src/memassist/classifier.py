@@ -75,8 +75,8 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
     if duplicate_or_weak:
         return CandidateDecision(
             candidate=candidate,
-            decision="reject",
-            status="rejected",
+            decision="archive_low_quality",
+            status="archived",
             risk="low",
             memory_kind=memory_kind,
             enforcement="none",
@@ -86,8 +86,8 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
     if candidate.type == "workflow" and "test" in candidate.tags:
         return CandidateDecision(
             candidate=candidate,
-            decision="auto_activate",
-            status="auto_active",
+            decision="activate",
+            status="active",
             risk="low",
             memory_kind="procedural",
             enforcement="none",
@@ -97,12 +97,12 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
     if candidate.type == "fact" and candidate.content.startswith("Session touched"):
         return CandidateDecision(
             candidate=candidate,
-            decision="keep_ephemeral",
-            status="ephemeral",
+            decision="archive_session_evidence",
+            status="archived",
             risk="low",
             memory_kind="episodic",
             enforcement="none",
-            reason="Touched-file facts are session evidence, not durable project memory.",
+            reason="Touched-file facts are session evidence, not active project memory.",
         )
 
     if candidate.type in {"rule", "lesson"} or protective or high_risk:
@@ -122,8 +122,8 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
     if candidate.type in {"preference", "decision"}:
         return CandidateDecision(
             candidate=candidate,
-            decision="auto_activate",
-            status="auto_active",
+            decision="activate",
+            status="active",
             risk="low",
             memory_kind=memory_kind,
             enforcement="none",

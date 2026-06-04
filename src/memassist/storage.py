@@ -9,7 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .memory_artifacts import load_memory_artifacts, sync_memory_artifact
+from .memory_artifacts import (
+    delete_memory_artifact,
+    load_memory_artifacts,
+    read_memory_artifact_by_id,
+    sync_memory_artifact,
+)
 from .models import ENFORCEMENTS, MEMORY_STATUSES, MEMORY_TYPES, Memory
 from .paths import db_path
 from .project import Project
@@ -185,7 +190,6 @@ class Store:
         source_ref: str | None = None,
         source_quote: str | None = None,
         expires_at: str | None = None,
-        persist_artifact: bool = True,
     ) -> str:
         if scope_type not in {"global", "project", "session"}:
             raise ValueError(f"invalid scope_type: {scope_type}")
@@ -228,9 +232,8 @@ class Store:
             expires_at=expires_at,
             superseded_by=None,
         )
-        if persist_artifact:
-            sync_memory_artifact(self.path.parent, memory, source_quote=source_quote)
-        self._upsert_memory_cache(memory)
+        sync_memory_artifact(self.path.parent, memory, source_quote=source_quote)
+        self._upsert_memory_index(memory)
         self.conn.commit()
         return memory_id
 
@@ -242,7 +245,7 @@ class Store:
             candidate
             for candidate in self.list_memories(project_id=project_id, include_global=True)
             if candidate.id != memory_id
-            and candidate.status not in {"rejected", "expired", "disabled", "deleted", "superseded"}
+            and candidate.status != "archived"
         ]
         scored: list[tuple[float, Memory, str]] = []
         memory_tags = set(memory.tags)
@@ -275,17 +278,28 @@ class Store:
         return linked
 
     def memory_links(self, memory_id: str) -> list[dict[str, Any]]:
+        if not read_memory_artifact_by_id(self.path.parent, memory_id):
+            return []
         rows = self.conn.execute(
             """
-            SELECT l.*, m.content AS target_content, m.type AS target_type, m.status AS target_status
+            SELECT l.*
             FROM memory_links l
-            JOIN memories m ON m.id = l.target_id
             WHERE l.source_id = ?
             ORDER BY l.strength DESC, l.created_at DESC
             """,
             (memory_id,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        links: list[dict[str, Any]] = []
+        for row in rows:
+            target = self.get_memory(str(row["target_id"]))
+            if not target:
+                continue
+            item = dict(row)
+            item["target_content"] = target.content
+            item["target_type"] = target.type
+            item["target_status"] = target.status
+            links.append(item)
+        return links
 
     def list_memories(
         self,
@@ -294,32 +308,17 @@ class Store:
         include_global: bool = True,
         status: str | None = None,
     ) -> list[Memory]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if project_id and include_global:
-            clauses.append("(project_id = ? OR scope_type = 'global')")
-            params.append(project_id)
-        elif project_id:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        elif include_global:
-            clauses.append("scope_type = 'global'")
-        if status:
-            clauses.append("status = ?")
-            params.append(status)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self.conn.execute(
-            f"SELECT * FROM memories {where} ORDER BY importance DESC, updated_at DESC",
-            params,
-        ).fetchall()
-        return [self._row_to_memory(row) for row in rows]
+        memories = [
+            self._with_index_telemetry(memory)
+            for memory in load_memory_artifacts(self.path.parent)
+            if _memory_in_scope(memory, project_id=project_id, include_global=include_global)
+            and (status is None or memory.status == status)
+        ]
+        return sorted(memories, key=lambda memory: (memory.importance, memory.updated_at), reverse=True)
 
     def get_memory(self, memory_id: str) -> Memory | None:
-        row = self.conn.execute(
-            "SELECT * FROM memories WHERE id = ?",
-            (memory_id,),
-        ).fetchone()
-        return self._row_to_memory(row) if row else None
+        memory = read_memory_artifact_by_id(self.path.parent, memory_id)
+        return self._with_index_telemetry(memory) if memory else None
 
     def search_memories(
         self,
@@ -369,7 +368,19 @@ class Store:
                 """,
                 [like, like, project_id, *active_statuses, limit],
             ).fetchall()
-        memories = [self._row_to_memory(row) for row in rows]
+        memories: list[Memory] = []
+        stale_ids: list[str] = []
+        for row in rows:
+            memory_id = str(row["id"])
+            memory = read_memory_artifact_by_id(self.path.parent, memory_id)
+            if not memory or memory.status != "active":
+                stale_ids.append(memory_id)
+                continue
+            memories.append(self._with_index_telemetry(memory))
+        for memory_id in stale_ids:
+            self._delete_memory_index(memory_id)
+        if stale_ids:
+            self.conn.commit()
         for memory in memories:
             self.touch_memory(memory.id)
         return memories
@@ -381,7 +392,7 @@ class Store:
         if memory:
             updated = replace(memory, status=status, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
-            self._upsert_memory_cache(updated)
+            self._upsert_memory_index(updated)
             self.conn.commit()
 
     def update_paths(self, memory_id: str, paths: list[str]) -> None:
@@ -389,7 +400,7 @@ class Store:
         if memory:
             updated = replace(memory, paths=paths, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
-            self._upsert_memory_cache(updated)
+            self._upsert_memory_index(updated)
             self.conn.commit()
 
     def update_enforcement(self, memory_id: str, enforcement: str) -> None:
@@ -399,16 +410,22 @@ class Store:
         if memory:
             updated = replace(memory, enforcement=enforcement, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
-            self._upsert_memory_cache(updated)
+            self._upsert_memory_index(updated)
             self.conn.commit()
 
     def supersede(self, old_id: str, new_id: str) -> None:
         memory = self.get_memory(old_id)
         if memory:
-            updated = replace(memory, status="superseded", superseded_by=new_id, updated_at=now_iso())
+            updated = replace(memory, status="archived", superseded_by=new_id, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
-            self._upsert_memory_cache(updated)
+            self._upsert_memory_index(updated)
             self.conn.commit()
+
+    def delete_memory(self, memory_id: str) -> bool:
+        deleted = delete_memory_artifact(self.path.parent, memory_id)
+        self._delete_memory_index(memory_id)
+        self.conn.commit()
+        return deleted
 
     def touch_memory(self, memory_id: str) -> None:
         self.conn.execute(
@@ -513,22 +530,7 @@ class Store:
         type: str,
         statuses: tuple[str, ...] | None = None,
     ) -> bool:
-        clauses = ["content = ?", "type = ?"]
-        params: list[Any] = [content, type]
-        if project_id:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        else:
-            clauses.append("project_id IS NULL")
-        if statuses:
-            placeholders = ", ".join("?" for _ in statuses)
-            clauses.append(f"status IN ({placeholders})")
-            params.extend(statuses)
-        row = self.conn.execute(
-            f"SELECT 1 FROM memories WHERE {' AND '.join(clauses)} LIMIT 1",
-            params,
-        ).fetchone()
-        return row is not None
+        return self.find_memory(project_id=project_id, content=content, type=type, statuses=statuses) is not None
 
     def find_memory(
         self,
@@ -538,22 +540,14 @@ class Store:
         type: str,
         statuses: tuple[str, ...] | None = None,
     ) -> Memory | None:
-        clauses = ["content = ?", "type = ?"]
-        params: list[Any] = [content, type]
-        if project_id:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        else:
-            clauses.append("project_id IS NULL")
-        if statuses:
-            placeholders = ", ".join("?" for _ in statuses)
-            clauses.append(f"status IN ({placeholders})")
-            params.extend(statuses)
-        row = self.conn.execute(
-            f"SELECT * FROM memories WHERE {' AND '.join(clauses)} ORDER BY updated_at DESC LIMIT 1",
-            params,
-        ).fetchone()
-        return self._row_to_memory(row) if row else None
+        candidates = [
+            memory
+            for memory in self.list_memories(project_id=project_id, include_global=False, status=None)
+            if memory.content == content
+            and memory.type == type
+            and (statuses is None or memory.status in statuses)
+        ]
+        return sorted(candidates, key=lambda memory: memory.updated_at, reverse=True)[0] if candidates else None
 
     def reinforce_memory(
         self,
@@ -580,7 +574,7 @@ class Store:
             updated_at=now_iso(),
         )
         sync_memory_artifact(self.path.parent, updated)
-        self._upsert_memory_cache(updated)
+        self._upsert_memory_index(updated)
         self.conn.commit()
         return updated
 
@@ -588,10 +582,10 @@ class Store:
         indexed: list[str] = []
         for memory in load_memory_artifacts(self.path.parent):
             normalized = _with_required_timestamps(memory)
-            self._upsert_memory_cache(normalized)
+            self._upsert_memory_index(normalized)
             indexed.append(normalized.id)
         if prune_missing:
-            self._prune_memory_cache(set(indexed))
+            self._prune_memory_index(set(indexed))
         self.conn.commit()
         return indexed
 
@@ -679,7 +673,7 @@ class Store:
             (memory_id, index_text, tag_text),
         )
 
-    def _upsert_memory_cache(self, memory: Memory) -> None:
+    def _upsert_memory_index(self, memory: Memory) -> None:
         self.conn.execute(
             """
             INSERT INTO memories (
@@ -755,7 +749,7 @@ class Store:
             enforcement=memory.enforcement,
         )
 
-    def _prune_memory_cache(self, artifact_ids: set[str]) -> None:
+    def _prune_memory_index(self, artifact_ids: set[str]) -> None:
         rows = self.conn.execute("SELECT id FROM memories").fetchall()
         missing = [str(row["id"]) for row in rows if str(row["id"]) not in artifact_ids]
         if not missing:
@@ -766,19 +760,29 @@ class Store:
         self.conn.execute(f"DELETE FROM memory_fts WHERE memory_id IN ({placeholders})", missing)
         self.conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", missing)
 
-    def _refresh_fts(self, memory_id: str) -> None:
-        row = self.conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    def _delete_memory_index(self, memory_id: str) -> None:
+        self.conn.execute("DELETE FROM memory_links WHERE source_id = ? OR target_id = ?", (memory_id, memory_id))
+        self.conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))
+        self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+
+    def _with_index_telemetry(self, memory: Memory) -> Memory:
+        row = self.conn.execute(
+            """
+            SELECT retrieval_count, utility, strength, recurrence, last_used_at
+            FROM memories
+            WHERE id = ?
+            """,
+            (memory.id,),
+        ).fetchone()
         if not row:
-            return
-        self._upsert_fts(
-            memory_id,
-            str(row["content"]),
-            json.loads(row["tags_json"] or "[]"),
-            type=str(row["type"]),
-            reason=row["reason"],
-            paths=json.loads(row["paths_json"] or "[]"),
-            status=str(row["status"]),
-            enforcement=str(row["enforcement"]),
+            return memory
+        return replace(
+            memory,
+            retrieval_count=int(row["retrieval_count"] or 0),
+            utility=float(row["utility"] or memory.utility),
+            strength=float(row["strength"] or memory.strength),
+            recurrence=int(row["recurrence"] or memory.recurrence),
+            last_used_at=row["last_used_at"],
         )
 
     def _row_to_memory(self, row: sqlite3.Row) -> Memory:
@@ -880,6 +884,16 @@ def _with_required_timestamps(memory: Memory) -> Memory:
     created_at = memory.created_at or ts
     updated_at = memory.updated_at or created_at
     return replace(memory, created_at=created_at, updated_at=updated_at)
+
+
+def _memory_in_scope(memory: Memory, *, project_id: str | None, include_global: bool) -> bool:
+    if project_id and include_global:
+        return memory.project_id == project_id or memory.scope_type == "global"
+    if project_id:
+        return memory.project_id == project_id
+    if include_global:
+        return memory.scope_type == "global"
+    return True
 
 
 def _clamp(value: float) -> float:

@@ -31,7 +31,7 @@ def export_memories(store: Store, *, project_id: str, path: Path, include_all: b
         "memories": [
             _exportable(memory)
             for memory in memories
-            if include_all or memory.status in {"active", "auto_active", "long_term", "durable", "pinned"}
+            if include_all or memory.status == "active"
         ],
     }
     path.parent.mkdir(parents=True, exist_ok=True)

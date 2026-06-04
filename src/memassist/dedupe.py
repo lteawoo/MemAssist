@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from .models import Memory
 
 
-ACTIVE_STRONG_STATUSES = {"active", "auto_active", "long_term", "durable", "pinned"}
-INACTIVE_STATUSES = {"candidate", "draft", "stale"}
+ACTIVE_STRONG_STATUSES = {"active"}
+INACTIVE_STATUSES = {"candidate"}
 PROTECTIVE_TERMS = {
     "확인",
     "허락",
@@ -54,7 +54,7 @@ def find_semantic_duplicate(
     candidate_protective = _is_protective(candidate_content, candidate_enforcement)
     best: DuplicateMatch | None = None
     for memory in existing_memories:
-        if memory.status in {"rejected", "expired", "superseded", "disabled", "deleted", "ephemeral"}:
+        if memory.status == "archived":
             continue
         if not _compatible_type(candidate_type, memory.type):
             continue
@@ -91,12 +91,7 @@ def _compatible_type(candidate_type: str, memory_type: str) -> bool:
 def _is_stronger(memory_status: str, candidate_status: str) -> bool:
     rank = {
         "candidate": 1,
-        "draft": 1,
         "active": 2,
-        "auto_active": 2,
-        "long_term": 3,
-        "durable": 4,
-        "pinned": 5,
     }
     return rank.get(memory_status, 0) > rank.get(candidate_status, 0)
 

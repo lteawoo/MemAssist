@@ -103,36 +103,20 @@ def build_parser() -> argparse.ArgumentParser:
     mem_pack.add_argument("--json", action="store_true")
     mem_pack.set_defaults(func=cmd_memory_pack)
 
-    mem_candidates = memory_sub.add_parser("candidates", help="show or store draft memory candidates")
+    mem_candidates = memory_sub.add_parser("candidates", help="show or store memory candidates")
     mem_candidates.add_argument("--session", default="latest")
     mem_candidates.add_argument("--store", action="store_true")
     mem_candidates.add_argument("--json", action="store_true")
     mem_candidates.set_defaults(func=cmd_memory_candidates)
 
-    mem_disable = memory_sub.add_parser("disable", help="disable a memory")
-    mem_disable.add_argument("id")
-    mem_disable.set_defaults(func=cmd_memory_disable)
-
-    mem_pin = memory_sub.add_parser("pin", help="pin a memory")
-    mem_pin.add_argument("id")
-    mem_pin.set_defaults(func=cmd_memory_pin)
-
-    mem_supersede = memory_sub.add_parser("supersede", help="mark one memory superseded by another")
-    mem_supersede.add_argument("old_id")
-    mem_supersede.add_argument("new_id")
-    mem_supersede.set_defaults(func=cmd_memory_supersede)
-    mem_rollback = memory_sub.add_parser("rollback", help="reject a memory and remove its policy path if present")
-    mem_rollback.add_argument("id")
-    mem_rollback.add_argument("--protected-path")
-    mem_rollback.set_defaults(func=cmd_memory_rollback)
     mem_links = memory_sub.add_parser("links", help="show related memories")
     mem_links.add_argument("id")
     mem_links.add_argument("--json", action="store_true")
     mem_links.set_defaults(func=cmd_memory_links)
 
-    mem_drafts = memory_sub.add_parser("drafts", help="list candidate memories")
-    mem_drafts.add_argument("--json", action="store_true")
-    mem_drafts.set_defaults(func=cmd_memory_drafts)
+    mem_pending = memory_sub.add_parser("pending", help="list candidate memories")
+    mem_pending.add_argument("--json", action="store_true")
+    mem_pending.set_defaults(func=cmd_memory_pending)
 
     mem_activate = memory_sub.add_parser("activate", help="activate a memory")
     mem_activate.add_argument("id")
@@ -142,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     mem_deactivate.add_argument("id")
     mem_deactivate.set_defaults(func=cmd_memory_deactivate)
 
-    mem_cleanup = memory_sub.add_parser("cleanup", help="expire stale memories")
+    mem_cleanup = memory_sub.add_parser("cleanup", help="archive due or duplicate memories")
     mem_cleanup.add_argument("--json", action="store_true")
     mem_cleanup.set_defaults(func=cmd_memory_cleanup)
 
@@ -405,38 +389,6 @@ def cmd_memory_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_memory_disable(args: argparse.Namespace) -> int:
-    with _store() as store:
-        store.update_status(args.id, "disabled")
-    print(f"disabled {args.id}")
-    return 0
-
-
-def cmd_memory_pin(args: argparse.Namespace) -> int:
-    with _store() as store:
-        store.update_status(args.id, "pinned")
-    print(f"pinned {args.id}")
-    return 0
-
-
-def cmd_memory_supersede(args: argparse.Namespace) -> int:
-    with _store() as store:
-        store.supersede(args.old_id, args.new_id)
-    print(f"superseded {args.old_id} by {args.new_id}")
-    return 0
-
-
-def cmd_memory_rollback(args: argparse.Namespace) -> int:
-    with _store() as store:
-        memory = store.get_memory(args.id)
-        if not memory:
-            print(f"Memory not found: {args.id}")
-            return 1
-        store.update_status(args.id, "rejected")
-    print(f"rolled back {args.id}")
-    return 0
-
-
 def cmd_memory_links(args: argparse.Namespace) -> int:
     with _store() as store:
         links = store.memory_links(args.id)
@@ -451,7 +403,7 @@ def cmd_memory_links(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_memory_drafts(args: argparse.Namespace) -> int:
+def cmd_memory_pending(args: argparse.Namespace) -> int:
     project = detect_project()
     with _store() as store:
         memories = store.list_memories(project_id=project.id, include_global=True, status="candidate")
@@ -494,8 +446,10 @@ def cmd_memory_cleanup(args: argparse.Namespace) -> int:
         payload["suspect_echo_or_drift"] = [memory.as_dict() for memory in suspect]
         _print_json(payload)
     else:
-        for memory_id in result.expired:
-            print(f"expired {memory_id}")
+        for memory_id in result.archived:
+            print(f"archived {memory_id}")
+        for memory_id in result.duplicates:
+            print(f"duplicate archived {memory_id}")
         for memory in suspect:
             print(f"suspect echo/drift memory: {memory.id} {memory.content}")
     return 0
@@ -869,7 +823,7 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
     else:
         print(f"session: {session_id or '-'}")
         print(f"stored_candidates: {len(stored)}")
-        print(f"expired: {len(cleanup_result.expired)}")
+        print(f"archived: {len(cleanup_result.archived)}")
         if eval_result:
             print("eval: " + ("PASS" if eval_result.passed else "FAIL"))
     return 0 if eval_result is None or eval_result.passed else 1

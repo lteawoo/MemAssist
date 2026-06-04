@@ -8,6 +8,7 @@ import sys
 import threading
 import webbrowser
 from contextlib import contextmanager
+from dataclasses import replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .integrations.registry import SUPPORTED_TOOLS, status_tools
+from .memory_artifacts import load_memory_artifacts
 from .models import Memory
 from .paths import db_path
 from .policy import load_policy
@@ -42,15 +44,9 @@ SECRET_VALUE_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|AKIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,})"
 )
 GUI_STATUS_WEIGHTS = {
-    "pinned": 1.0,
-    "durable": 0.90,
-    "long_term": 0.85,
-    "auto_active": 0.70,
     "active": 0.65,
     "candidate": 0.35,
-    "draft": 0.30,
-    "observed": 0.25,
-    "decaying": 0.20,
+    "archived": 0.10,
 }
 GUI_I18N = {
     "en": {
@@ -283,34 +279,16 @@ def _api_summary(query: dict[str, str]) -> dict[str, Any]:
     scope = _project_scope(query.get("project_id"), project)
     with _readonly_conn() as conn:
         project_filter = scope.project_id
-        memory_where, memory_params = _memory_scope_clause(project_filter, include_global=scope.include_global)
         trace_where, trace_params = _event_scope_clause(project_filter)
+        memories = _load_gui_memories(conn, project_id=project_filter, include_global=scope.include_global)
 
-        memory_total = _count(conn, "memories", memory_where, memory_params)
+        memory_total = len(memories)
         trace_total = _count(conn, "trace_events", trace_where, trace_params)
         lifecycle_total = _count(conn, "lifecycle_events", trace_where, trace_params)
         session_total = _session_count(conn, project_filter)
-        status_counts = _group_counts(
-            conn,
-            "memories",
-            "status",
-            memory_where,
-            memory_params,
-        )
-        type_counts = _group_counts(
-            conn,
-            "memories",
-            "type",
-            memory_where,
-            memory_params,
-        )
-        recent_memories = [
-            _memory_dict(row)
-            for row in conn.execute(
-                f"SELECT * FROM memories {memory_where} ORDER BY updated_at DESC LIMIT 8",
-                memory_params,
-            ).fetchall()
-        ]
+        status_counts = _memory_group_counts(memories, "status")
+        type_counts = _memory_group_counts(memories, "type")
+        recent_memories = [_memory_dict(memory) for memory in sorted(memories, key=lambda item: item.updated_at or "", reverse=True)[:8]]
         recent_traces = [_trace_row(row) for row in _trace_rows(conn, project_filter, None, 8)]
 
     return {
@@ -333,10 +311,10 @@ def _api_summary(query: dict[str, str]) -> dict[str, Any]:
 def _api_projects() -> dict[str, Any]:
     current = detect_project()
     with _readonly_conn() as conn:
+        memories = _load_gui_memories(conn, project_id=None, include_global=False)
         rows = conn.execute(
             """
             SELECT p.*,
-              (SELECT COUNT(*) FROM memories m WHERE m.project_id = p.id) AS memory_count,
               (SELECT COUNT(*) FROM trace_events t WHERE t.project_id = p.id) AS trace_count,
               (SELECT COUNT(DISTINCT session_id) FROM trace_events t WHERE t.project_id = p.id) AS session_count
             FROM projects p
@@ -348,6 +326,7 @@ def _api_projects() -> dict[str, Any]:
     for row in rows:
         item = dict(row)
         item["is_current"] = row["id"] == current.id
+        item["memory_count"] = sum(1 for memory in memories if memory.project_id == row["id"])
         seen_current = seen_current or item["is_current"]
         projects.append(item)
     if not seen_current:
@@ -378,45 +357,16 @@ def _api_memories(query: dict[str, str]) -> dict[str, Any]:
     memory_type = _none_if_blank(query.get("type"))
     search = _none_if_blank(query.get("q"))
     limit = _limit(query.get("limit"), default=MAX_LIMIT)
-    clauses: list[str] = []
-    params: list[Any] = []
-    scope_clause, scope_params = _memory_scope_clause(
-        scope.project_id,
-        include_global=scope.include_global,
-        include_where=False,
-    )
-    if scope_clause:
-        clauses.append(scope_clause)
-        params.extend(scope_params)
-    if status:
-        clauses.append("status = ?")
-        params.append(status)
-    if memory_type:
-        clauses.append("type = ?")
-        params.append(memory_type)
-    if search:
-        like = f"%{search}%"
-        clauses.append(
-            "(id LIKE ? OR content LIKE ? OR reason LIKE ? OR tags_json LIKE ? OR paths_json LIKE ?)"
-        )
-        params.extend([like, like, like, like, like])
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-
     with _readonly_conn() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT * FROM memories
-            {where}
-            ORDER BY
-              CASE status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-              CASE status WHEN 'durable' THEN 1 ELSE 0 END DESC,
-              importance DESC,
-              updated_at DESC
-            LIMIT ?
-            """,
-            [*params, MAX_LIMIT],
-        ).fetchall()
-    memories = [_memory_dict(row, search=search) for row in rows]
+        records = _load_gui_memories(
+            conn,
+            project_id=scope.project_id,
+            include_global=scope.include_global,
+            status=status,
+            memory_type=memory_type,
+            search=search,
+        )
+    memories = [_memory_dict(memory, search=search) for memory in records]
     metric_key = "relevance" if search else "priority"
     memories.sort(
         key=lambda memory: (
@@ -570,6 +520,85 @@ def _project_as_dict(project: Project) -> dict[str, Any]:
     return {"id": project.id, "root_path": str(project.root), "git_remote": project.git_remote}
 
 
+def _load_gui_memories(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str | None,
+    include_global: bool,
+    status: str | None = None,
+    memory_type: str | None = None,
+    search: str | None = None,
+) -> list[Memory]:
+    memories: list[Memory] = []
+    query = (search or "").strip().lower()
+    for memory in load_memory_artifacts(db_path().parent):
+        if not _memory_matches_scope(memory, project_id=project_id, include_global=include_global):
+            continue
+        if status and memory.status != status:
+            continue
+        if memory_type and memory.type != memory_type:
+            continue
+        if query and not _memory_matches_query(memory, query):
+            continue
+        memories.append(_with_gui_telemetry(conn, memory))
+    return sorted(memories, key=lambda item: (item.importance, item.updated_at or ""), reverse=True)
+
+
+def _memory_matches_scope(memory: Memory, *, project_id: str | None, include_global: bool) -> bool:
+    if project_id and include_global:
+        return memory.project_id == project_id or memory.scope_type == "global"
+    if project_id:
+        return memory.project_id == project_id
+    return True
+
+
+def _memory_matches_query(memory: Memory, query: str) -> bool:
+    haystack = " ".join(
+        [
+            memory.id,
+            memory.type,
+            memory.status,
+            memory.content,
+            memory.reason or "",
+            " ".join(memory.tags),
+            " ".join(memory.paths),
+        ]
+    ).lower()
+    return query in haystack
+
+
+def _with_gui_telemetry(conn: sqlite3.Connection, memory: Memory) -> Memory:
+    try:
+        row = conn.execute(
+            """
+            SELECT retrieval_count, utility, strength, recurrence, last_used_at
+            FROM memories
+            WHERE id = ?
+            """,
+            (memory.id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if not row:
+        return memory
+    return replace(
+        memory,
+        retrieval_count=_int(_row_value(row, "retrieval_count")),
+        utility=_float(_row_value(row, "utility"), default=memory.utility),
+        strength=_float(_row_value(row, "strength"), default=memory.strength),
+        recurrence=_int(_row_value(row, "recurrence"), default=memory.recurrence),
+        last_used_at=_row_value(row, "last_used_at"),
+    )
+
+
+def _memory_group_counts(memories: list[Memory], field: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for memory in memories:
+        key = str(getattr(memory, field))
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[1], reverse=True))
+
+
 @contextmanager
 def _readonly_conn() -> Any:
     path = db_path()
@@ -656,24 +685,6 @@ def _init_empty_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _memory_scope_clause(
-    project_id: str | None,
-    *,
-    include_global: bool,
-    include_where: bool = True,
-) -> tuple[str, list[Any]]:
-    clauses: list[str] = []
-    params: list[Any] = []
-    if project_id and include_global:
-        clauses.append("(project_id = ? OR scope_type = 'global')")
-        params.append(project_id)
-    elif project_id:
-        clauses.append("project_id = ?")
-        params.append(project_id)
-    where = f"WHERE {' AND '.join(clauses)}" if include_where and clauses else " AND ".join(clauses)
-    return where, params
-
-
 def _event_scope_clause(project_id: str | None) -> tuple[str, list[Any]]:
     if not project_id:
         return "", []
@@ -692,20 +703,6 @@ def _session_count(conn: sqlite3.Connection, project_id: str | None) -> int:
         params,
     ).fetchone()
     return int(row["count"] if row else 0)
-
-
-def _group_counts(
-    conn: sqlite3.Connection,
-    table: str,
-    column: str,
-    where: str,
-    params: list[Any],
-) -> dict[str, int]:
-    rows = conn.execute(
-        f"SELECT {column} AS key, COUNT(*) AS count FROM {table} {where} GROUP BY {column} ORDER BY count DESC",
-        params,
-    ).fetchall()
-    return {str(row["key"]): int(row["count"]) for row in rows}
 
 
 def _trace_rows(
@@ -763,8 +760,8 @@ def _row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
     return row[key] if key in row.keys() else default
 
 
-def _memory_dict(row: sqlite3.Row, *, search: str | None = None) -> dict[str, Any]:
-    memory = _row_to_memory(row).as_dict()
+def _memory_dict(record: Memory | sqlite3.Row, *, search: str | None = None) -> dict[str, Any]:
+    memory = (record if isinstance(record, Memory) else _row_to_memory(record)).as_dict()
     metrics = _memory_metrics(memory, search=search)
     for key in ("content", "reason", "source_ref"):
         memory[key] = _redact_value(memory.get(key))

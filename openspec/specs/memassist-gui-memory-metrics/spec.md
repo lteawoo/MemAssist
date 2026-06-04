@@ -53,3 +53,25 @@ The GUI MUST NOT label raw `importance / confidence` values as `Score`.
 - **WHEN** the memory table is rendered
 - **THEN** the table does not show `Score` as the primary metric label
 - **AND** the table does not present `importance / confidence` as a single score
+
+### Requirement: GUI SHALL display Markdown-authoritative memories
+The read-only GUI SHALL derive memory list rows from authoritative Markdown memory artifacts rather than treating SQLite-only rows as managed memories. SQLite MAY supply search acceleration or non-authoritative metric telemetry, but it SHALL NOT cause stale database-only memories to appear in the GUI.
+
+#### Scenario: GUI excludes SQLite-only memory row
+- **GIVEN** a stale SQLite-only memory row exists
+- **AND** no Markdown artifact exists for that memory id
+- **WHEN** the GUI loads the memory list
+- **THEN** the GUI SHALL NOT show the stale SQLite-only row as a memory
+
+#### Scenario: GUI shows Markdown-backed memory without index row
+- **GIVEN** an active Markdown memory artifact exists
+- **AND** SQLite contains no row for that memory id
+- **WHEN** the GUI loads the memory list
+- **THEN** the GUI SHALL show the Markdown-backed memory
+- **AND** the GUI MAY use default metric values until derived telemetry is rebuilt
+
+#### Scenario: GUI search does not mutate memory authority
+- **GIVEN** active Markdown memory artifacts exist
+- **WHEN** the user searches memories in the GUI
+- **THEN** the GUI SHALL NOT update the authoritative Markdown artifacts
+- **AND** the GUI SHALL NOT create, activate, archive, or delete managed memories

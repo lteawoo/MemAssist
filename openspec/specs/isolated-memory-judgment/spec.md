@@ -136,7 +136,7 @@ memassist SHALL provide a Claude Code judge adapter that evaluates a source even
 
 - **WHEN** the Claude judge process returns an envelope whose `result` field contains the judge JSON object
 - **THEN** memassist SHALL parse the judgment from the `result` field
-- **AND** memassist SHALL apply the same storage rules as any other judge backend, including durable/transient separation and meaning preservation
+- **AND** memassist SHALL apply the same storage rules as any other judge backend, including persistent/transient separation and meaning preservation
 
 #### Scenario: Nested Claude hook does not re-run the judge
 

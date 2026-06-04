@@ -24,18 +24,15 @@ def sync_memory_artifact(
     *,
     source_quote: str | None = None,
 ) -> None:
-    try:
-        ensure_memory_artifact_dirs(memassist_dir)
-        target = _artifact_path(memassist_dir, memory)
-        previous = _find_existing_artifact(memassist_dir, memory.id)
-        if source_quote is None and previous and previous.exists():
-            source_quote = _existing_source_quote(previous)
-        if previous and previous != target:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(previous), str(target))
-        target.write_text(_render_artifact(memory, source_quote=source_quote), encoding="utf-8")
-    except OSError:
-        return
+    ensure_memory_artifact_dirs(memassist_dir)
+    target = _artifact_path(memassist_dir, memory)
+    previous = find_memory_artifact(memassist_dir, memory.id)
+    if source_quote is None and previous and previous.exists():
+        source_quote = _existing_source_quote(previous)
+    if previous and previous != target:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(previous), str(target))
+    target.write_text(_render_artifact(memory, source_quote=source_quote), encoding="utf-8")
 
 
 def load_memory_artifacts(memassist_dir: Path) -> list[Memory]:
@@ -49,6 +46,34 @@ def load_memory_artifacts(memassist_dir: Path) -> list[Memory]:
     return memories
 
 
+def find_memory_artifact(memassist_dir: Path, memory_id: str) -> Path | None:
+    ensure_memory_artifact_dirs(memassist_dir)
+    return _find_existing_artifact(memassist_dir, memory_id)
+
+
+def read_memory_artifact_by_id(memassist_dir: Path, memory_id: str) -> Memory | None:
+    path = find_memory_artifact(memassist_dir, memory_id)
+    return read_memory_artifact(path) if path else None
+
+
+def delete_memory_artifact(memassist_dir: Path, memory_id: str) -> bool:
+    path = find_memory_artifact(memassist_dir, memory_id)
+    if not path:
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def memory_artifact_exists(memassist_dir: Path, memory_id: str, *, status: str | None = None) -> bool:
+    path = find_memory_artifact(memassist_dir, memory_id)
+    if not path:
+        return False
+    return status is None or _status_from_bucket(path) == status
+
+
 def read_memory_artifact(path: Path) -> Memory | None:
     try:
         text = path.read_text(encoding="utf-8")
@@ -58,7 +83,7 @@ def read_memory_artifact(path: Path) -> Memory | None:
     if metadata is None:
         return None
     memory_id = str(metadata.get("id") or path.stem)
-    status = _status_from_bucket(path) or str(metadata.get("status") or "candidate")
+    status = _status_from_bucket(path)
     return Memory(
         id=memory_id,
         scope_type=str(metadata.get("scope_type") or "project"),
@@ -93,8 +118,10 @@ def _artifact_path(memassist_dir: Path, memory: Memory) -> Path:
         bucket = "active"
     elif memory.status in CANDIDATE_ARTIFACT_STATUSES:
         bucket = "candidates"
-    else:
+    elif memory.status == "archived":
         bucket = "archived"
+    else:
+        raise ValueError(f"invalid memory status: {memory.status}")
     return memassist_dir / "memories" / bucket / f"{memory.id}.md"
 
 

@@ -7,6 +7,7 @@ from typing import Any
 import uuid
 
 from .eval_seed import remove_seed_memories_by_source
+from .models import ENFORCEMENTS, MEMORY_STATUSES
 from .retrieval import MemoryPack, build_memory_pack
 from .storage import Store
 
@@ -43,16 +44,18 @@ class RagSeedMemory:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "RagSeedMemory":
         section = str(value.get("section", "context"))
+        status = str(value.get("status") or _default_status(section))
+        enforcement = str(value.get("enforcement") or _default_enforcement(section))
         return cls(
             type=str(value.get("type") or _default_type(section)),
             content=str(value.get("content", "")),
             section=section,
             tags=_string_list(value.get("tags")),
             paths=_string_list(value.get("paths")),
-            status=str(value.get("status") or _default_status(section)),
+            status=status if status in MEMORY_STATUSES else "archived",
             importance=float(value.get("importance", 0.8)),
             confidence=float(value.get("confidence", 0.85)),
-            enforcement=str(value.get("enforcement") or _default_enforcement(section)),
+            enforcement=enforcement if enforcement in ENFORCEMENTS else "none",
         )
 
 
@@ -266,7 +269,6 @@ def _insert_seed_memories(store: Store, *, project_id: str, seed: list[RagSeedMe
             enforcement=memory.enforcement,
             source_kind="rag_eval_seed",
             source_ref=f"rag_eval:{uuid.uuid4().hex[:12]}",
-            persist_artifact=False,
         )
         ids.append(memory_id)
     return ids
@@ -275,12 +277,8 @@ def _insert_seed_memories(store: Store, *, project_id: str, seed: list[RagSeedMe
 def _remove_seed_memories(store: Store, memory_ids: list[str]) -> None:
     if not memory_ids:
         return
-    placeholders = ", ".join("?" for _ in memory_ids)
-    store.conn.execute(f"DELETE FROM memory_links WHERE source_id IN ({placeholders})", memory_ids)
-    store.conn.execute(f"DELETE FROM memory_links WHERE target_id IN ({placeholders})", memory_ids)
-    store.conn.execute(f"DELETE FROM memory_fts WHERE memory_id IN ({placeholders})", memory_ids)
-    store.conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", memory_ids)
-    store.conn.commit()
+    for memory_id in memory_ids:
+        store.delete_memory(memory_id)
 
 
 def _rag_score(

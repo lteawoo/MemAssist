@@ -13,8 +13,8 @@
 > 같은 프로젝트 설명, 같은 테스트 명령, 같은 주의사항을 매번 다시 말하지 않게 한다.
 
 `memassist`는 로컬 우선 도구입니다. 프로젝트에서 `memassist init`을 실행하면
-프로젝트 루트의 `.memassist/` 하나에 정책, ignore 파일, Markdown memory, trace, SQLite
-검색 인덱스가 함께 저장됩니다. `~/.memassist`는 아직 초기화하지 않은 경로나 명시적인 전역 사용을 위한
+프로젝트 루트의 `.memassist/` 하나에 정책, ignore 파일, Markdown memory, trace, 재생성 가능한 SQLite
+검색 인덱스/텔레메트리 캐시가 함께 저장됩니다. `~/.memassist`는 아직 초기화하지 않은 경로나 명시적인 전역 사용을 위한
 fallback/global home입니다.
 
 > 현재 상태: 초기 로컬 도구입니다. CLI와 저장 구조는 사용할 수 있지만, 위험도가 높은
@@ -159,7 +159,7 @@ PreToolUse hook은 trace 기록만 수행합니다. 사용자가 "리프레시 �
 
 `memassist`는 모든 관찰을 곧바로 활성 기억으로 만들지 않습니다. Stop 시점의 isolated
 judge가 저장 후보를 만들고, deterministic policy가 `candidate`, `active`, `archived`
-중 하나로 정합니다. 상태의 권위는 Markdown 파일 위치와 metadata입니다.
+중 하나로 정합니다. 상태의 권위는 `.memassist/memories/{active,candidates,archived}` 아래의 Markdown 파일 위치입니다.
 
 ```mermaid
 stateDiagram-v2
@@ -242,11 +242,10 @@ verification_commands: []
 ```
 
 memory를 명시적으로 활성화해도 정책 파일은 변경되지 않습니다. 활성화는 retrieval 대상에
-포함할지를 바꾸는 memory lifecycle 동작입니다. judge가 만든 memory를 되돌리려면 rollback을
-사용합니다.
+포함할지를 바꾸는 memory lifecycle 동작입니다. judge가 만든 memory를 retrieval에서 제외하려면
+archive/deactivate합니다.
 
 ```bash
-memassist memory rollback <memory-id>
 memassist memory deactivate <memory-id>
 ```
 
@@ -446,7 +445,7 @@ memassist tools status
 memassist memory list --all
 memassist memory search "session timeout"
 memassist memory pack "session timeout fix"
-memassist memory drafts
+memassist memory pending
 ```
 
 메모리 수동 관리:
@@ -455,14 +454,13 @@ memassist memory drafts
 memassist memory add --type decision --content "Use pnpm for this repo" --tag tooling
 memassist memory activate <memory-id>
 memassist memory deactivate <memory-id>
-memassist memory rollback <memory-id>
 memassist memory cleanup
 ```
 
 `memory cleanup`은 오래되거나 낮은 품질의 memory뿐 아니라 assistant가 사용자의 말을
 다시 말한 문장, 또는 원래 subject가 왜곡된 것으로 보이는 memory도 함께 보고합니다.
 이 항목은 자동 삭제하지 않고 `suspect_echo_or_drift`로 노출해서 사용자가 확인한 뒤
-deactivate 또는 rollback할 수 있게 합니다.
+deactivate할 수 있게 합니다.
 
 세션 검증:
 
@@ -480,11 +478,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 ## 저장 위치와 개인정보
 
 - 프로젝트 memory의 원본은 프로젝트 루트의 `.memassist/memories/{active,candidates,archived}` Markdown 파일입니다.
-- 기본 SQLite 인덱스는 프로젝트 루트의 `.memassist/memassist.db`에 저장됩니다.
+- 기본 SQLite 인덱스는 프로젝트 루트의 `.memassist/memassist.db`에 저장되는 파생 검색 인덱스/텔레메트리 캐시입니다.
 - 프로젝트 정책과 ignore 파일도 같은 `.memassist/`에 저장됩니다.
 - memory와 trace는 기본적으로 로컬에 남습니다.
 - 민감 파일이나 생성물은 `.memassist/ignore`에 추가해 trace-derived memory 후보에서 제외할 수 있습니다.
-- Markdown memory를 직접 편집한 뒤에는 `memassist memory rebuild-index`로 SQLite 검색 인덱스를 갱신할 수 있습니다.
+- Markdown memory를 직접 편집하거나 SQLite 파일을 삭제한 뒤에는 `memassist memory rebuild-index`로 SQLite 검색 인덱스를 다시 만들 수 있습니다.
 - 프로젝트 memory는 SQLite 데이터베이스를 공유하지 않고 Markdown 파일 또는 export/import로 이동할 수 있습니다.
 - `~/.memassist`는 초기화되지 않은 경로나 명시적인 global/user home 용도로만 사용됩니다.
 

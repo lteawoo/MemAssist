@@ -13,22 +13,20 @@ from .storage import Store
 
 @dataclass(frozen=True)
 class CleanupResult:
-    expired: list[str]
-    stale: list[str]
-    superseded: list[str]
+    archived: list[str]
+    duplicates: list[str]
 
     def as_dict(self) -> dict[str, Any]:
-        return {"expired": self.expired, "stale": self.stale, "superseded": self.superseded}
+        return {"archived": self.archived, "duplicates": self.duplicates}
 
 
 @dataclass(frozen=True)
 class LifecycleResult:
     session_id: str | None
     stored: list[str]
-    auto_active: list[str]
+    active: list[str]
     candidates: list[str]
-    ephemeral: list[str]
-    rejected: list[str]
+    archived: list[str]
     duplicates: int
     decisions: list[dict[str, Any]]
     cleanup: CleanupResult
@@ -37,10 +35,9 @@ class LifecycleResult:
         return {
             "session_id": self.session_id,
             "stored": self.stored,
-            "auto_active": self.auto_active,
+            "active": self.active,
             "candidates": self.candidates,
-            "ephemeral": self.ephemeral,
-            "rejected": self.rejected,
+            "archived": self.archived,
             "duplicates": self.duplicates,
             "decisions": self.decisions,
             "cleanup": self.cleanup.as_dict(),
@@ -55,10 +52,9 @@ def process_session_lifecycle(
 ) -> LifecycleResult:
     events = store.trace_events(session_id) if session_id else []
     stored: list[str] = []
-    auto_active: list[str] = []
+    active: list[str] = []
     candidates: list[str] = []
-    ephemeral: list[str] = []
-    rejected: list[str] = []
+    archived: list[str] = []
     decisions: list[dict[str, Any]] = []
     duplicates = 0
 
@@ -69,17 +65,7 @@ def process_session_lifecycle(
             project_id=project_id,
             content=candidate.content,
             type=candidate.type,
-            statuses=(
-                "candidate",
-                "draft",
-                "auto_active",
-                "active",
-                "pinned",
-                "ephemeral",
-                "long_term",
-                "durable",
-                "decaying",
-            ),
+            statuses=("candidate", "active"),
         )
         if duplicate:
             duplicates += 1
@@ -125,17 +111,17 @@ def process_session_lifecycle(
             )
             continue
 
-        memory_id = _store_decision(store, decision, session_id=session_id, project_id=project_id)
-        store.link_related_memories(memory_id, project_id=project_id)
-        stored.append(memory_id)
-        if decision.status == "auto_active":
-            auto_active.append(memory_id)
-        elif decision.status == "candidate":
-            candidates.append(memory_id)
-        elif decision.status == "ephemeral":
-            ephemeral.append(memory_id)
-        elif decision.status == "rejected":
-            rejected.append(memory_id)
+        memory_id: str | None = None
+        if decision.status in {"active", "candidate"}:
+            memory_id = _store_decision(store, decision, session_id=session_id, project_id=project_id)
+            store.link_related_memories(memory_id, project_id=project_id)
+            stored.append(memory_id)
+            if decision.status == "active":
+                active.append(memory_id)
+            else:
+                candidates.append(memory_id)
+        else:
+            archived.append(candidate.content)
         store.add_lifecycle_event(
             session_id=session_id,
             project_id=project_id,
@@ -151,10 +137,9 @@ def process_session_lifecycle(
     return LifecycleResult(
         session_id=session_id,
         stored=stored,
-        auto_active=auto_active,
+        active=active,
         candidates=candidates,
-        ephemeral=ephemeral,
-        rejected=rejected,
+        archived=archived,
         duplicates=duplicates,
         decisions=decisions,
         cleanup=cleanup,
@@ -163,90 +148,38 @@ def process_session_lifecycle(
 
 def cleanup_memories(store: Store) -> CleanupResult:
     now_dt = datetime.now(timezone.utc)
-    now = now_dt.isoformat(timespec="seconds")
-    rows = store.conn.execute(
-        """
-        SELECT id FROM memories
-        WHERE expires_at IS NOT NULL
-          AND expires_at <= ?
-          AND status NOT IN ('expired', 'deleted', 'disabled')
-        """,
-        (now,),
-    ).fetchall()
-    expired = [str(row["id"]) for row in rows]
-    for memory_id in expired:
-        store.update_status(memory_id, "expired")
-    decay_rows = store.conn.execute(
-        """
-        SELECT id, created_at, updated_at, last_used_at, strength, half_life_days, status
-        FROM memories
-        WHERE status IN ('active', 'auto_active', 'long_term', 'durable', 'decaying')
-        """
-    ).fetchall()
-    for row in decay_rows:
-        status = str(row["status"])
-        half_life_days = max(float(row["half_life_days"] or 30.0), 1.0)
-        anchor = row["last_used_at"] or row["updated_at"] or row["created_at"]
-        try:
-            anchor_dt = datetime.fromisoformat(str(anchor))
-        except ValueError:
-            continue
-        if anchor_dt.tzinfo is None:
-            anchor_dt = anchor_dt.replace(tzinfo=timezone.utc)
-        age_days = max((now_dt - anchor_dt).total_seconds() / 86400.0, 0.0)
-        decayed_strength = float(row["strength"] or 0.0) * (0.5 ** (age_days / half_life_days))
-        if status == "decaying" and decayed_strength < 0.15:
-            store.update_status(str(row["id"]), "expired")
-            expired.append(str(row["id"]))
-        elif status not in {"durable", "long_term"} and decayed_strength < 0.25:
-            store.update_status(str(row["id"]), "decaying")
-    stale_rows = store.conn.execute(
-        """
-        SELECT id FROM memories
-        WHERE status IN ('candidate', 'decaying')
-          AND updated_at <= datetime('now', '-14 days')
-        """
-    ).fetchall()
-    stale = [str(row["id"]) for row in stale_rows]
-    for memory_id in stale:
-        store.update_status(memory_id, "stale")
+    memories = store.list_memories(include_global=False, status=None)
+    archived: list[str] = []
+    for memory in memories:
+        if memory.status in {"active", "candidate"} and memory.expires_at:
+            try:
+                expires_at = datetime.fromisoformat(memory.expires_at)
+            except ValueError:
+                continue
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= now_dt:
+                store.update_status(memory.id, "archived")
+                archived.append(memory.id)
 
-    duplicate_rows = store.conn.execute(
-        """
-        SELECT old.id AS old_id, new.id AS new_id
-        FROM memories old
-        JOIN memories new
-          ON old.project_id IS new.project_id
-         AND old.type = new.type
-         AND lower(old.content) = lower(new.content)
-         AND old.id != new.id
-        WHERE old.status IN ('active', 'auto_active', 'long_term', 'durable')
-          AND new.status IN ('active', 'auto_active', 'long_term', 'durable')
-          AND old.updated_at < new.updated_at
-        """
-    ).fetchall()
-    superseded: list[str] = []
-    for row in duplicate_rows:
-        memory_id = str(row["old_id"])
-        if memory_id in superseded:
+    duplicates: list[str] = []
+    active = [memory for memory in memories if memory.status == "active" and memory.id not in archived]
+    by_key: dict[tuple[str | None, str, str], Any] = {}
+    for memory in sorted(active, key=lambda item: item.updated_at or ""):
+        key = (memory.project_id, memory.type, memory.content.lower())
+        newer = by_key.get(key)
+        if newer is None:
+            by_key[key] = memory
             continue
-        store.supersede(memory_id, str(row["new_id"]))
-        superseded.append(memory_id)
-    semantic_candidates = store.conn.execute(
-        """
-        SELECT * FROM memories
-        WHERE status = 'candidate'
-        ORDER BY updated_at ASC
-        """
-    ).fetchall()
-    for row in semantic_candidates:
-        candidate = store._row_to_memory(row)
-        if not candidate:
-            continue
+        store.supersede(newer.id, memory.id)
+        duplicates.append(newer.id)
+        by_key[key] = memory
+
+    for candidate in [memory for memory in memories if memory.status == "candidate"]:
         existing = [
             memory
             for memory in store.list_memories(project_id=candidate.project_id, include_global=True, status=None)
-            if memory.id != candidate.id
+            if memory.id != candidate.id and memory.status == "active"
         ]
         duplicate = find_semantic_duplicate(
             candidate.content,
@@ -258,8 +191,8 @@ def cleanup_memories(store: Store) -> CleanupResult:
         )
         if duplicate and should_suppress_candidate(candidate.status, duplicate.memory):
             store.supersede(candidate.id, duplicate.memory.id)
-            superseded.append(candidate.id)
-    return CleanupResult(expired=expired, stale=stale, superseded=superseded)
+            duplicates.append(candidate.id)
+    return CleanupResult(archived=archived, duplicates=duplicates)
 
 
 def _store_decision(
