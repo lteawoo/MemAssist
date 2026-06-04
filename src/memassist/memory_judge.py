@@ -33,7 +33,6 @@ MAX_DEBUG_CHARS = 4000
 @dataclass(frozen=True)
 class MemoryIntentEvent:
     event_id: str
-    immediate: bool
 
 
 @dataclass(frozen=True)
@@ -102,9 +101,11 @@ def observe_memory_intent(
     prompt: str,
 ) -> MemoryIntentEvent | None:
     content = " ".join(prompt.strip().split())
-    if not content or not _looks_like_memory_intent(content):
+    if not content:
         return None
-    immediate = _looks_like_explicit_directive(content)
+    # Record every prompt as a pending source event. No keyword gate: whether the
+    # prompt yields durable memory is decided by the isolated judge at turn end,
+    # not by a keyword whitelist.
     event_id = store.add_trace_event(
         session_id=session_id,
         project_id=project_id,
@@ -113,12 +114,11 @@ def observe_memory_intent(
         input_json={
             "source_role": "user",
             "content": content[:MAX_SOURCE_CHARS],
-            "immediate": immediate,
             "status": "pending",
             "allowed_hints": {},
         },
     )
-    return MemoryIntentEvent(event_id=event_id, immediate=immediate)
+    return MemoryIntentEvent(event_id=event_id)
 
 
 def process_memory_intent_event(
@@ -658,37 +658,6 @@ def _coerce_output(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
-
-
-def _looks_like_memory_intent(content: str) -> bool:
-    lowered = content.lower()
-    terms = {
-        "remember",
-        "always",
-        "앞으로",
-        "항상",
-        "다음부터",
-        "담부터",
-        "기억",
-        "하지마",
-        "하지 마",
-        "건드리지",
-        "먼저",
-        "전에",
-        "before",
-        "ask",
-        "tell",
-    }
-    return any(term in lowered for term in terms)
-
-
-def _looks_like_explicit_directive(content: str) -> bool:
-    lowered = content.lower()
-    future = any(term in lowered for term in {"remember", "always", "앞으로", "항상", "다음부터", "담부터", "기억"})
-    gate = any(term in lowered for term in {"먼저", "전에", "전", "before", "ask", "tell", "확인", "알려"})
-    durable = any(term in lowered for term in {"하지마", "하지 마", "해야", "must", "require"})
-    durable = durable or "건드리지" in lowered
-    return future or durable or (gate and any(term in lowered for term in {"수정", "변경", "change", "edit", "고치"}))
 
 
 def _trace_event_by_id(store: Store, event_id: str) -> dict[str, Any] | None:

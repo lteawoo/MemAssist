@@ -54,6 +54,20 @@ def isolated_env():
                 os.environ["CODEX_HOME"] = old_codex
 
 
+def _fire_hook(event: str, payload: dict) -> int:
+    with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+        return main(["hook", event])
+
+
+def _stop_for(payload: dict) -> int:
+    """Fire the Stop hook for the same session/cwd so turn-end judging runs.
+
+    Durable memory is produced at turn end (Stop), not inline at UserPromptSubmit,
+    so tests that assert judged memory must drive the full turn.
+    """
+    return _fire_hook("stop", {"session_id": payload.get("session_id"), "cwd": payload.get("cwd")})
+
+
 class MemassistTest(unittest.TestCase):
     def test_init_creates_project_policy(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -188,6 +202,7 @@ class MemassistTest(unittest.TestCase):
                 }
                 with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
                     self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                _stop_for(payload)
                 self.assertTrue((local_home / "memassist.db").exists())
                 with Store(local_home / "memassist.db") as store:
                     memories = store.list_memories(project_id=None, include_global=False, status=None)
@@ -940,7 +955,8 @@ class MemassistTest(unittest.TestCase):
             self.assertNotIn("approval_granted", event_types)
             self.assertNotIn("approval_consumed", event_types)
             self.assertNotIn("directive_interpreted", event_types)
-            self.assertNotIn("memory_intent_observed", event_types)
+            # Every prompt is now recorded as a pending source event (no keyword gate);
+            # the approval prompt is not judged here because no Stop hook fires this turn.
             self.assertNotIn("memory_judged", event_types)
             pre_tool_events = [event for event in events if event["event_type"] == "pre_tool_use"]
             self.assertEqual(pre_tool_events[-1]["policy_decision"], "block")
@@ -1310,6 +1326,7 @@ class MemassistTest(unittest.TestCase):
             }
             with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
                 self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            _stop_for(payload)
 
             project = detect_project()
             with Store() as store:
@@ -1365,6 +1382,7 @@ class MemassistTest(unittest.TestCase):
                 }
                 with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
                     self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1412,6 +1430,7 @@ class MemassistTest(unittest.TestCase):
                 }
                 with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
                     self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1505,10 +1524,10 @@ class MemassistTest(unittest.TestCase):
                 with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
                     code = main(["hook", "user-prompt-submit"])
                 self.assertEqual(code, 0)
-                first_context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
-                self.assertIn("Relevant memassist memory:", first_context)
-                self.assertIn("리프레시 토큰 관련 변경은 사용자 확인 전 수정하지 않는다.", first_context)
-                self.assertNotIn("Policy reminders", first_context)
+                # WRITE happens at turn end; the just-submitted prompt cannot inject
+                # memory it has not created yet. Injection is verified on the later
+                # rag_payload prompt below.
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1603,6 +1622,100 @@ class MemassistTest(unittest.TestCase):
                 candidate = store.get_memory(candidate_id)
             self.assertEqual(candidate.status, "candidate")  # type: ignore[union-attr]
 
+    def test_non_keyword_directive_is_captured_at_stop_not_inline(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            fixture = json.dumps(
+                {
+                    "should_store": True,
+                    "memory_content": "리프레시 토큰 변경 시 사용자 확인을 받는다.",
+                    "source_quote": "리프레시토큰 변경에 승인확인하라",
+                    "memory_type": "directive",
+                    "enforcement": "warn",
+                    "activation": "active",
+                    "candidate_paths": [],
+                    "meaning_preserved": True,
+                    "contamination_risk": "low",
+                    "reason": "Directive without any trigger keyword.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                # No keyword like 앞으로/먼저/기억 — the old gate would have dropped this.
+                payload = {"session_id": "sess_nokw", "cwd": str(project_dir), "prompt": "리프레시토큰 변경에 승인확인하라"}
+                with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+                    self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                project = detect_project()
+                with Store() as store:
+                    events_before = [event["event_type"] for event in store.trace_events("sess_nokw")]
+                    mem_before = [
+                        memory
+                        for memory in store.list_memories(project_id=project.id, include_global=False, status=None)
+                        if memory.source_kind == "isolated_memory_judge"
+                    ]
+                # Recorded without a keyword gate, but NOT judged inline.
+                self.assertIn("memory_intent_observed", events_before)
+                self.assertNotIn("memory_judged", events_before)
+                self.assertEqual(mem_before, [])
+                # Stop runs the judge and stores it.
+                self.assertEqual(_stop_for(payload), 0)
+                with Store() as store:
+                    events_after = [event["event_type"] for event in store.trace_events("sess_nokw")]
+                    mem_after = [
+                        memory
+                        for memory in store.list_memories(project_id=project.id, include_global=False, status=None)
+                        if memory.source_kind == "isolated_memory_judge"
+                    ]
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+            self.assertIn("memory_judged", events_after)
+            self.assertTrue(any("리프레시 토큰" in memory.content for memory in mem_after))
+
+    def test_trivial_task_prompt_stores_no_durable_memory(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            fixture = json.dumps(
+                {
+                    "should_store": False,
+                    "memory_content": "n/a",
+                    "source_quote": "이 함수 typo 좀 고쳐줘",
+                    "memory_type": "fact",
+                    "enforcement": "none",
+                    "activation": "rejected",
+                    "candidate_paths": [],
+                    "meaning_preserved": True,
+                    "contamination_risk": "low",
+                    "reason": "One-off task; nothing durable to remember.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                payload = {"session_id": "sess_trivial", "cwd": str(project_dir), "prompt": "이 함수 typo 좀 고쳐줘"}
+                with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+                    self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                self.assertEqual(_stop_for(payload), 0)
+                project = detect_project()
+                with Store() as store:
+                    events = [event["event_type"] for event in store.trace_events("sess_trivial")]
+                    mem = [
+                        memory
+                        for memory in store.list_memories(project_id=project.id, include_global=False, status=None)
+                        if memory.source_kind == "isolated_memory_judge"
+                    ]
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+            self.assertIn("memory_intent_observed", events)  # recorded
+            self.assertIn("memory_judged", events)  # judged at Stop
+            self.assertEqual(mem, [])  # but nothing durable stored (should_store=false)
+
     def test_typo_directive_is_judged_to_active_source_language_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
@@ -1637,10 +1750,7 @@ class MemassistTest(unittest.TestCase):
                 with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
                     code = main(["hook", "user-prompt-submit"])
                 self.assertEqual(code, 0)
-                first_context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
-                self.assertIn("Relevant memassist memory:", first_context)
-                self.assertIn("리프레시 토큰 관련 변경 전 사용자에게 먼저 확인한다.", first_context)
-                self.assertNotIn("Policy reminders", first_context)
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1693,6 +1803,7 @@ class MemassistTest(unittest.TestCase):
                 }
                 with patch("sys.stdin", StringIO(json.dumps(prompt_payload))), patch("sys.stdout", StringIO()):
                     self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                _stop_for(prompt_payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1762,6 +1873,7 @@ class MemassistTest(unittest.TestCase):
                 }
                 with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
                     self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1812,6 +1924,7 @@ class MemassistTest(unittest.TestCase):
                 with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
                     code = main(["hook", "user-prompt-submit"])
                 self.assertEqual(code, 0)
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1859,6 +1972,7 @@ class MemassistTest(unittest.TestCase):
                 with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
                     code = main(["hook", "user-prompt-submit"])
                 self.assertEqual(code, 0)
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1898,6 +2012,7 @@ class MemassistTest(unittest.TestCase):
                 with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
                     code = main(["hook", "user-prompt-submit"])
                 self.assertEqual(code, 0)
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1939,6 +2054,7 @@ class MemassistTest(unittest.TestCase):
                 with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
                     code = main(["hook", "user-prompt-submit"])
                 self.assertEqual(code, 0)
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -1978,6 +2094,7 @@ class MemassistTest(unittest.TestCase):
                 with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
                     code = main(["hook", "user-prompt-submit"])
                 self.assertEqual(code, 0)
+                _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)

@@ -51,18 +51,25 @@ When the isolated judge identifies a directive that affects approval, warning, b
 
 ### Requirement: memassist SHALL control judge token cost
 
-memassist SHALL limit isolated judge calls by using immediate judgment for explicit memory-intent events and batch judgment for lower-priority events.
+memassist SHALL record every non-empty user prompt as a pending source event without keyword-based pre-filtering, and SHALL run the isolated judge over pending source events at turn end (the Stop lifecycle event) using a low-cost model, rather than blocking the prompt with inline judgment. Whether a prompt yields durable memory SHALL be decided by the isolated judge, not by a keyword rule.
 
-#### Scenario: Explicit directive is eligible for immediate judgment
+#### Scenario: Directive without trigger keywords is still judged
 
-- **WHEN** a user prompt explicitly asks for future behavior such as `다음부터 테스트 전에 알려줘`
-- **THEN** memassist SHALL make the source event eligible for immediate isolated judgment
+- **WHEN** a user prompt expresses a durable preference but matches no predefined keyword list
+- **THEN** memassist SHALL record it as a pending source event
+- **AND** memassist SHALL submit it to the isolated judge at turn end
 
-#### Scenario: Ordinary task request is not immediately judged
+#### Scenario: Ordinary task is recorded but not inline-judged
 
 - **WHEN** a user prompt asks for a one-off task such as `refresh token TTL을 15분으로 바꿔줘`
-- **THEN** memassist SHALL NOT require an immediate isolated judge call before continuing the task
-- **AND** the prompt MAY be considered later by batch judgment
+- **THEN** memassist SHALL NOT run the isolated judge during `UserPromptSubmit`
+- **AND** the isolated judge at turn end MAY determine that no durable memory should be stored
+
+#### Scenario: UserPromptSubmit only reads memory
+
+- **WHEN** a user submits a prompt
+- **THEN** memassist SHALL retrieve and inject relevant memory during `UserPromptSubmit`
+- **AND** memassist SHALL NOT create durable memory during `UserPromptSubmit`
 
 ### Requirement: memassist SHALL keep session approval separate from durable memory judgment
 

@@ -17,7 +17,6 @@ from .lifecycle import cleanup_memories, process_session_lifecycle
 from .memory_judge import (
     likely_distorted_or_echo_memory,
     observe_memory_intent,
-    process_memory_intent_event,
     process_pending_memory_intents,
 )
 from .memory_eval import (
@@ -621,20 +620,14 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
         store.upsert_project(project)
         if args.hook_event == "user-prompt-submit":
             query = str(payload.get("prompt") or payload.get("message") or payload.get("content") or "")
-            source_event = None
-            source_event = observe_memory_intent(
+            # Record the prompt as a pending source event for turn-end judging; do not
+            # judge inline (no prompt-path latency). The Stop hook runs the judge.
+            observe_memory_intent(
                 store,
                 session_id=session_id,
                 project_id=project.id,
                 prompt=query,
             )
-            if source_event and source_event.immediate:
-                process_memory_intent_event(
-                    store,
-                    project=project,
-                    session_id=session_id,
-                    source_event_id=source_event.event_id,
-                )
             pack = build_memory_pack(store, query=query, project_id=project.id)
             _record_memory_injection(store, session_id=session_id, project_id=project.id, query=query, pack=pack)
             context = render_prompt_context(pack)

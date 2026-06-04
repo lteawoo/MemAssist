@@ -76,12 +76,12 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                 "cwd": str(project),
                 "prompt": "리프레쉬 토큰 정책은 담부터 묻지 않고 고치지마",
             }
-            with patch("sys.stdin", StringIO(json.dumps(prompt_payload))), patch("sys.stdout", StringIO()) as stdout:
+            with patch("sys.stdin", StringIO(json.dumps(prompt_payload))), patch("sys.stdout", StringIO()):
                 self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
-            first_context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
-            self.assertIn("Relevant memassist memory:", first_context)
-            self.assertIn("Do not change refresh token policy without asking first.", first_context)
-            self.assertNotIn("Policy reminders", first_context)
+            # WRITE happens at turn end (Stop); the creating prompt cannot inject memory
+            # it has not stored yet. Next-turn injection is verified via rag_payload below.
+            with patch("sys.stdin", StringIO(json.dumps({"session_id": "sess_e2e", "cwd": str(project)}))), patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["hook", "stop"]), 0)
 
             with Store() as store:
                 project_memories = store.list_memories(project_id=None, include_global=False, status=None)
