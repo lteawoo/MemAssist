@@ -31,7 +31,6 @@ The refresh-token case exposed the gap: the memory was stored in English, Korean
 
 - `memory-derived-enforcement`: Remove memory-derived enforcement requirements and limit pre-tool policy checks to explicit manually configured policy.
 - `isolated-memory-judgment`: Require source-language memory preservation and remove policy-like activation/compilation behavior.
-- `llm-memory-directive-interpretation`: Reframe directive interpretation as memory metadata for retrieval, not enforcement or policy activation.
 
 ## Impact
 
