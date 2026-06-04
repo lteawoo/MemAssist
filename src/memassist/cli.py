@@ -11,7 +11,7 @@ from .doctor import run_doctor
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .integrations import install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
-from .interpreter import INTERPRETER_ACTIVE_ENV
+from .memory_judge import INTERPRETER_ACTIVE_ENV
 from .lesson import lesson_from_session
 from .lifecycle import cleanup_memories, process_session_lifecycle
 from .memory_judge import (

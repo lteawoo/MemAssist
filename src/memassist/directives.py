@@ -1,34 +1,10 @@
 from __future__ import annotations
 
-import json
-import re
-from dataclasses import dataclass
 from pathlib import Path
-from sqlite3 import Row
-from typing import Any
 
-from .interpreter import DEFAULT_CONFIDENCE_THRESHOLD, DRAFT_CONFIDENCE_THRESHOLD, DirectiveCandidate, interpret_directive
-from .models import Memory
-from .project import Project
-from .storage import Store
-
-
-DIRECTIVE_TERMS = {
-    "remember",
-    "always",
-    "must",
-    "require",
-    "ask before",
-    "tell me before",
-    "앞으로",
-    "항상",
-    "기억",
-    "해야",
-    "받아야",
-    "묻지",
-    "하지마",
-    "하지 마",
-}
+# Helper utilities shared with the isolated memory judge. The former directive
+# interpreter that also lived here was removed once the judge superseded it; only
+# the tag helpers the judge still calls remain.
 
 GATE_WORDING_TERMS = {
     "approv",
@@ -40,277 +16,6 @@ GATE_WORDING_TERMS = {
     "허락",
     "확인",
 }
-
-@dataclass(frozen=True)
-class DirectiveResult:
-    action: str
-    applied: list[str]
-    rejected: list[str]
-    simulations: list[dict[str, object]]
-    message: str | None
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "action": self.action,
-            "applied": self.applied,
-            "rejected": self.rejected,
-            "simulations": self.simulations,
-            "message": self.message,
-        }
-
-
-def handle_direct_user_instruction(
-    store: Store,
-    *,
-    project: Project,
-    session_id: str,
-    prompt: str,
-) -> DirectiveResult:
-    project_id = project.id
-    result = interpret_directive(prompt, project=project)
-    candidate = result.candidate
-    _record_interpreter_trace(store, session_id=session_id, project_id=project_id, result=result.as_dict())
-    if not candidate.is_directive or candidate.confidence < DRAFT_CONFIDENCE_THRESHOLD:
-        store.add_lifecycle_event(
-            session_id=session_id,
-            project_id=project_id,
-            memory_id=None,
-            candidate=result.as_dict(),
-            decision="directive_interpreter_ignored",
-            risk="low",
-            reason="Interpreter did not find a confident direct memory directive.",
-        )
-        return DirectiveResult("none", [], [], [], None)
-    content = candidate.normalized_prompt.strip() or candidate.original_prompt.strip()
-    enforcement = candidate.memory_enforcement
-
-    existing = store.find_memory(
-        project_id=project_id,
-        content=content,
-        type="directive",
-        statuses=(
-            "candidate",
-            "draft",
-            "auto_active",
-            "active",
-            "pinned",
-            "long_term",
-            "durable",
-        ),
-    )
-    if existing:
-        if enforcement == "none" and existing.status in {"active", "pinned", "long_term", "durable"}:
-            return DirectiveResult("directive_already_recorded", [existing.id], [], [], None)
-        if enforcement != "none" and existing.enforcement != enforcement:
-            store.update_enforcement(existing.id, enforcement)
-            refreshed = store.get_memory(existing.id)
-            if refreshed:
-                existing = refreshed
-        applied, policy_events, decision = _apply_directive_memory(
-            store,
-            project_root=project.root,
-            project_id=project_id,
-            memory=existing,
-            candidate=candidate,
-        )
-        _record_directive_lifecycle(store, project_id=project_id, memory=existing, decision=decision)
-        message = "Direct memassist directive was remembered."
-        return DirectiveResult("directive_recorded", [existing.id], [], policy_events, message)
-
-    if candidate.confidence < DEFAULT_CONFIDENCE_THRESHOLD or enforcement == "none":
-        memory_id = store.add_memory(
-            scope_type="project",
-            project_id=project_id,
-            session_id=session_id,
-            type="directive",
-            content=content,
-            reason="Interpreter found an ambiguous or low-confidence direct memory directive.",
-            tags=_instruction_tags(content, candidate=candidate),
-            paths=_normalize_project_files(candidate.candidate_paths, project.root),
-            status="candidate",
-            importance=0.65,
-            confidence=candidate.confidence,
-            enforcement=enforcement,
-            source_kind="user_prompt_directive",
-            source_ref=session_id,
-        )
-        memory = store.get_memory(memory_id)
-        store.add_lifecycle_event(
-            session_id=session_id,
-            project_id=project_id,
-            memory_id=memory_id,
-            candidate=memory.as_dict() if memory else candidate.as_dict(),
-            decision="directive_candidate",
-            risk="medium",
-            reason="Directive interpretation was stored for retrieval without policy compilation.",
-        )
-        return DirectiveResult("directive_recorded", [memory_id], [], [], "Direct memassist directive was remembered as a candidate.")
-
-    memory_id = store.add_memory(
-        scope_type="project",
-        project_id=project_id,
-        session_id=session_id,
-        type="directive",
-        content=content,
-        reason="User directly instructed memassist to remember this directive.",
-        tags=_instruction_tags(content, candidate=candidate),
-        paths=_normalize_project_files(candidate.candidate_paths, project.root),
-        status="active",
-        importance=0.9,
-        confidence=candidate.confidence,
-        enforcement=enforcement,
-        source_kind="user_prompt_directive",
-        source_ref=session_id,
-    )
-    memory = store.get_memory(memory_id)
-    if not memory:
-        return DirectiveResult("none", [], [], [], None)
-    applied, policy_events, decision = _apply_directive_memory(
-        store,
-        project_root=project.root,
-        project_id=project_id,
-        memory=memory,
-        candidate=candidate,
-    )
-    _record_directive_lifecycle(store, project_id=project_id, memory=memory, decision=decision)
-    message = "Direct memassist directive was remembered."
-    return DirectiveResult("directive_recorded", [memory_id], [], policy_events, message)
-
-
-def _apply_directive_memory(
-    store: Store,
-    *,
-    project_root: Path,
-    project_id: str,
-    memory: Memory,
-    candidate: DirectiveCandidate | None = None,
-) -> tuple[bool, list[dict[str, object]], str]:
-    if memory.enforcement in {"warn", "block"} and candidate:
-        inferred_path = _infer_protected_path(store, memory, project_root, candidate=candidate)
-        if inferred_path:
-            store.update_paths(memory.id, list(dict.fromkeys([*memory.paths, inferred_path])))
-    store.update_status(memory.id, "active")
-    return True, [], "directive_active"
-
-
-def _record_directive_lifecycle(
-    store: Store,
-    *,
-    project_id: str,
-    memory: Memory,
-    decision: str,
-) -> None:
-    store.add_lifecycle_event(
-        session_id=memory.session_id,
-        project_id=project_id,
-        memory_id=memory.id,
-        candidate=memory.as_dict(),
-        decision=decision,
-        risk="medium",
-        reason="User directly supplied this memory directive for retrieval context.",
-    )
-
-
-def _record_interpreter_trace(
-    store: Store,
-    *,
-    session_id: str,
-    project_id: str,
-    result: dict[str, object],
-) -> None:
-    store.add_trace_event(
-        session_id=session_id,
-        project_id=project_id,
-        event_type="directive_interpreted",
-        tool_name="memassist",
-        input_json=result,
-        files=[],
-    )
-
-
-def _infer_protected_path(
-    store: Store,
-    memory: Memory,
-    project_root: Path,
-    *,
-    candidate: DirectiveCandidate | None = None,
-) -> str | None:
-    semantic_content = " ".join(
-        [
-            memory.content,
-            candidate.subject if candidate else "",
-            " ".join(candidate.scope_terms) if candidate else "",
-            candidate.normalized_prompt if candidate else "",
-        ]
-    )
-    if memory.paths:
-        normalized_paths = _normalize_project_files(memory.paths, project_root)
-        for path in normalized_paths:
-            if candidate is None or _path_match_score(path, semantic_content) >= 2:
-                return path
-    if candidate:
-        for path in _normalize_project_files(candidate.candidate_paths, project_root):
-            if path and _path_match_score(path, semantic_content) >= 2:
-                return path
-    events = store.trace_events(memory.session_id) if memory.session_id else []
-    files = _normalize_project_files(_files_from_events(events), project_root)
-    content = semantic_content.lower()
-    matched = _best_content_path_match(files, content)
-    if matched:
-        return matched
-    project_matches = _project_files_from_content(project_root, semantic_content)
-    return project_matches[0] if project_matches else None
-
-
-def _files_from_events(events: list[Row]) -> list[str]:
-    files: list[str] = []
-    for event in events:
-        try:
-            raw_files = json.loads(event["files_json"] or "[]")
-        except json.JSONDecodeError:
-            raw_files = []
-        for file in raw_files:
-            if isinstance(file, str) and file not in files:
-                files.append(file)
-    return files
-
-
-def _path_terms(path: str) -> list[str]:
-    terms = [part for part in re.split(r"[\s/_.-]+", path) if len(part) > 2]
-    text = path.lower()
-    synonyms = {
-        "리프레시": "refresh",
-        "토큰": "token",
-        "정책": "policy",
-        "세션": "session",
-        "쿠키": "cookie",
-        "인증": "auth",
-    }
-    for korean, english in synonyms.items():
-        if korean in text and english not in terms:
-            terms.append(english)
-    return terms
-
-
-def _project_files_from_content(project_root: Path, content: str) -> list[str]:
-    content_terms = set(_path_terms(content.lower()))
-    if not content_terms:
-        return []
-    ignored_dirs = {".git", ".codex", ".memassist", "node_modules", "__pycache__"}
-    scored: list[tuple[int, str]] = []
-    for path in project_root.rglob("*"):
-        if not path.is_file():
-            continue
-        relative_parts = path.relative_to(project_root).parts
-        if any(part in ignored_dirs or part.startswith(".memassist-") for part in relative_parts):
-            continue
-        relative = path.relative_to(project_root).as_posix()
-        path_terms = set(_path_terms(relative.lower()))
-        score = len(content_terms & path_terms)
-        if score >= 2:
-            scored.append((score, relative))
-    scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
-    return [relative for _score, relative in scored[:5]]
 
 
 def _normalize_project_files(files: list[str], project_root: Path) -> list[str]:
@@ -328,42 +33,6 @@ def _normalize_project_files(files: list[str], project_root: Path) -> list[str]:
         if file not in normalized:
             normalized.append(file)
     return normalized
-
-
-def _best_content_path_match(files: list[str], content: str) -> str | None:
-    content_terms = set(_path_terms(content))
-    if not content_terms:
-        return None
-    scored: list[tuple[int, str]] = []
-    for file in files:
-        score = len(content_terms & set(_path_terms(file.lower())))
-        if score >= 2:
-            scored.append((score, file))
-    if not scored:
-        return None
-    scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
-    return scored[0][1]
-
-
-def _path_match_score(path: str, content: str) -> int:
-    return len(set(_path_terms(content.lower())) & set(_path_terms(path.lower())))
-
-
-def _direct_instruction_content(prompt: str) -> str:
-    content = " ".join(prompt.strip().split())
-    if not content:
-        return ""
-    if not _looks_like_new_user_directive(content.lower()):
-        return ""
-    return content[:300]
-
-
-def _looks_like_new_user_directive(text: str) -> bool:
-    has_directive = any(term in text for term in DIRECTIVE_TERMS)
-    has_gate_wording = any(term in text for term in GATE_WORDING_TERMS) and any(
-        term in text for term in {"before", "change", "edit", "변경", "수정", "전에", "전"}
-    )
-    return has_directive or has_gate_wording
 
 
 def _directive_enforcement(content: str) -> str:
@@ -394,16 +63,12 @@ def _directive_enforcement(content: str) -> str:
     return "none"
 
 
-def _instruction_tags(content: str, *, candidate: DirectiveCandidate | None = None) -> list[str]:
+def _instruction_tags(content: str) -> list[str]:
     lowered = content.lower()
     tags = ["directive", "explicit", "user_prompt"]
-    enforcement = candidate.memory_enforcement if candidate else _directive_enforcement(content)
+    enforcement = _directive_enforcement(content)
     if enforcement != "none":
         tags.append(enforcement)
-    if candidate:
-        tags.extend(candidate.scope_terms)
-        if candidate.subject:
-            tags.extend(_path_terms(candidate.subject.lower()))
     if any(term in lowered for term in {"auth", "인증", "token", "토큰", "refresh", "리프레시"}):
         tags.append("auth")
     if any(term in lowered for term in {"token", "토큰"}):

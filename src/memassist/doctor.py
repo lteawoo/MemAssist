@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .integrations import status_tools
-from .interpreter import interpreter_diagnostics
+from .memory_judge import judge_backend_diagnostics
 from .paths import db_path, memassist_home
 from .project import Project
 
@@ -81,23 +79,14 @@ def run_doctor(project: Project) -> DoctorReport:
             ),
         )
     )
-    interpreter = interpreter_diagnostics(project)
+    judge = judge_backend_diagnostics(project)
     checks.append(
         DoctorCheck(
-            name="directive_interpreter",
-            status="pass" if interpreter["llm_available"] else "warn",
-            detail=(
-                f"adapter={interpreter['adapter']}; initialized_tools={', '.join(interpreter['initialized_tools']) or '-'}; "
-                f"{interpreter['detail']}"
-            ),
+            name="memory_judge",
+            status="pass" if judge["available"] else "warn",
+            detail=str(judge["detail"]),
         )
     )
-
-    codex_path = shutil.which("codex")
-    if codex_path:
-        checks.append(DoctorCheck("codex_cli", "pass", _codex_version(codex_path)))
-    else:
-        checks.append(DoctorCheck("codex_cli", "warn", "`codex` executable was not found on PATH."))
 
     checks.append(
         DoctorCheck(
@@ -119,18 +108,3 @@ def _path_check(name: str, path: Path, remediation: str) -> DoctorCheck:
     if path.exists():
         return DoctorCheck(name=name, status="pass", detail=str(path))
     return DoctorCheck(name=name, status="fail", detail=f"Missing {path}; {remediation}.")
-
-
-def _codex_version(codex_path: str) -> str:
-    try:
-        result = subprocess.run(
-            [codex_path, "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return f"{codex_path}; version check failed."
-    version = (result.stdout or result.stderr).strip()
-    return f"{codex_path}; {version or 'version unknown'}"
