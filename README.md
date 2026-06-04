@@ -213,11 +213,14 @@ memory를 찾고, 결과를 `additionalContext`로 주입합니다.
 - 원문 전체는 `source_quote`로 lifecycle metadata에 보존합니다. 예를 들어 “앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.”라면 앞 문장만 retrieval 대상 memory가 되고, `응답은 OK만 해`는 현재 턴 지시로 남습니다.
 - 관련 memory는 `Relevant memassist memory` context로 주입됩니다. `memassist`는 이 기억을 자동 정책으로 컴파일하거나 tool 실행을 강제 차단하지 않습니다.
 
-judge는 `memassist init --tools ...`에서 설치한 도구를 backend로 사용할 수 있습니다. 예를
-들어 Codex integration을 설치한 프로젝트에서는 Codex adapter가 가능하면 별도 `codex exec`
-프로세스로 구조화된 judge JSON을 만듭니다. hook 재귀를 막기 위해 judge 실행에는 guard
-환경 변수를 설정합니다. adapter를 사용할 수 없거나 JSON이 유효하지 않으면 durable memory를
-쓰지 않고 trace diagnostic만 남깁니다.
+judge는 `memassist init --tools ...`에서 설치한 도구를 backend로 사용할 수 있습니다. backend는
+초기화된 도구 중에서 고정된 우선순위(Codex, 그다음 Claude)로 선택됩니다. Codex integration을
+설치한 프로젝트에서는 Codex adapter가 별도 `codex exec` 프로세스로, Claude Code integration만
+설치한 프로젝트에서는 Claude adapter가 별도 `claude -p --output-format json` 프로세스로 구조화된
+judge JSON을 만듭니다. 어느 쪽이든 hook 재귀를 막기 위해 judge 실행에는 guard 환경 변수를
+설정합니다. `claude -p`는 자식 세션에서 자체 hook을 발동하지만, guard 환경 변수가 자식 hook으로
+전파되어 그 hook은 trace·retrieval·judge 없이 즉시 빠져나갑니다. 초기화된 judge adapter가 없거나
+JSON이 유효하지 않으면 durable memory를 쓰지 않고 trace diagnostic만 남깁니다.
 
 judge payload는 컨텍스트 오염을 줄이기 위해 제한됩니다. 포함되는 것은 사용자 source event,
 프로젝트 파일 힌트, 기존 memory conflict의 식별자와 상태 같은 최소 정보입니다. assistant

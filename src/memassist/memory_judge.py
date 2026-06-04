@@ -11,10 +11,15 @@ from typing import Any, Protocol
 
 from .directives import _instruction_tags, _normalize_project_files
 from .integrations import status_tools
-from .interpreter import INTERPRETER_ACTIVE_ENV
 from .models import ENFORCEMENTS, MEMORY_TYPES
 from .project import Project
 from .storage import Store
+
+# Hook recursion guard. The judge sets this on child tool subprocesses so any
+# memassist hook invoked by that child session short-circuits in cmd_hook_event.
+# Name and string value are preserved from the removed interpreter module so the
+# guard behaves identically for already-installed hooks.
+INTERPRETER_ACTIVE_ENV = "MEMASSIST_INTERPRETER_ACTIVE"
 
 JUDGE_ACTIVE_ENV = "MEMASSIST_MEMORY_JUDGE_ACTIVE"
 JUDGE_DEBUG_ENV = "MEMASSIST_MEMORY_JUDGE_DEBUG"
@@ -216,10 +221,44 @@ def select_memory_judge(project: Project) -> MemoryJudge:
         return UnavailableMemoryJudge(reason="recursion guard active")
     if os.environ.get(JUDGE_FIXTURE_ENV):
         return FixtureMemoryJudge()
-    for status in status_tools(project, tools=[], scope="project"):
-        if status.installed and status.tool == "codex":
-            return CodexMemoryJudge()
+    adapters: tuple[tuple[str, type[_SubprocessMemoryJudge]], ...] = (
+        ("codex", CodexMemoryJudge),
+        ("claude", ClaudeMemoryJudge),
+    )
+    installed = {status.tool for status in status_tools(project, tools=[], scope="project") if status.installed}
+    for tool_name, adapter in adapters:
+        if tool_name in installed:
+            return adapter()
     return UnavailableMemoryJudge(reason="no initialized tool with memory judge adapter")
+
+
+def judge_backend_diagnostics(project: Project) -> dict[str, object]:
+    """Report which initialized tool backs the isolated judge, for diagnostics.
+
+    Env-independent (does not honor fixture/recursion-guard envs), so `doctor`
+    reports the backend a normal hook run would select based on installed tools.
+    """
+    statuses = status_tools(project, tools=[], scope="project")
+    installed = {status.tool for status in statuses if status.installed}
+    adapters: tuple[tuple[str, type[_SubprocessMemoryJudge]], ...] = (
+        ("codex", CodexMemoryJudge),
+        ("claude", ClaudeMemoryJudge),
+    )
+    for tool_name, adapter in adapters:
+        if tool_name in installed:
+            executable = adapter().executable
+            available = bool(shutil.which(executable))
+            detail = (
+                f"judge backend={tool_name} ({executable})"
+                if available
+                else f"judge backend={tool_name}; {executable} executable not found on PATH"
+            )
+            return {"backend": tool_name, "available": available, "detail": detail}
+    return {
+        "backend": None,
+        "available": False,
+        "detail": "no initialized tool provides an isolated judge backend",
+    }
 
 
 class UnavailableMemoryJudge:
@@ -244,9 +283,42 @@ class FixtureMemoryJudge:
         return MemoryJudgeResult(candidate, self.name, [], payload)
 
 
-class CodexMemoryJudge:
-    name = "codex"
-    executable = "codex"
+def _build_judge_instruction(payload: dict[str, object]) -> str:
+    return (
+        "You are an isolated memory judge. Return only one compact JSON object with fields: "
+        "should_store boolean, memory_content string, source_quote string, memory_type one of "
+        "fact/preference/rule/decision/lesson/workflow/open_thread/directive, enforcement one of "
+        "none/warn/block, activation one of candidate/active/auto_active/rejected, "
+        "candidate_paths string array, meaning_preserved boolean, "
+        "contamination_risk one of low/medium/high, reason string. "
+        "Use only source_event and project_hints. Do not infer from assistant responses or retrieved memory. "
+        "Write memory_content as only the durable future memory in the user's source language when possible. "
+        "Do not include one-shot current-turn instructions, output formatting requests, or commands like "
+        "'respond only OK' in memory_content unless the user explicitly asks to remember that response format "
+        "for future turns. Preserve the full original wording separately in source_quote. "
+        "Judge payload: "
+        + json.dumps(payload, ensure_ascii=False)
+    )
+
+
+class _SubprocessMemoryJudge:
+    """Run the isolated judge in a separate tool process.
+
+    Subclasses set ``name``/``executable`` and build the command. The shared flow
+    sets the recursion-guard environment, runs the process, writes optional debug
+    records, and parses the judge JSON from the process output. The recursion guard
+    is load-bearing: child sessions that re-trigger hooks short-circuit because
+    ``cmd_hook_event`` returns early when ``INTERPRETER_ACTIVE_ENV`` is set.
+    """
+
+    name = "subprocess"
+    executable = ""
+
+    def _command(self, instruction: str, project: Project) -> list[str]:
+        raise NotImplementedError
+
+    def _stdin(self) -> int | None:
+        return None
 
     def judge(self, payload: dict[str, object], *, project: Project) -> MemoryJudgeResult:
         if not shutil.which(self.executable):
@@ -255,32 +327,8 @@ class CodexMemoryJudge:
         env[JUDGE_ACTIVE_ENV] = "1"
         env[INTERPRETER_ACTIVE_ENV] = "1"
         timeout = float(os.environ.get(JUDGE_TIMEOUT_ENV, "30"))
-        instruction = (
-            "You are an isolated memory judge. Return only one compact JSON object with fields: "
-            "should_store boolean, memory_content string, source_quote string, memory_type one of "
-            "fact/preference/rule/decision/lesson/workflow/open_thread/directive, enforcement one of "
-            "none/warn/block, activation one of candidate/active/auto_active/rejected, "
-            "candidate_paths string array, meaning_preserved boolean, "
-            "contamination_risk one of low/medium/high, reason string. "
-            "Use only source_event and project_hints. Do not infer from assistant responses or retrieved memory. "
-            "Write memory_content as only the durable future memory in the user's source language when possible. "
-            "Do not include one-shot current-turn instructions, output formatting requests, or commands like "
-            "'respond only OK' in memory_content unless the user explicitly asks to remember that response format "
-            "for future turns. Preserve the full original wording separately in source_quote. "
-            "Judge payload: "
-            + json.dumps(payload, ensure_ascii=False)
-        )
-        command = [
-            "codex",
-            "exec",
-            "--json",
-            "--cd",
-            str(project.root),
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            instruction,
-        ]
+        instruction = _build_judge_instruction(payload)
+        command = self._command(instruction, project)
         try:
             result = subprocess.run(
                 command,
@@ -289,6 +337,7 @@ class CodexMemoryJudge:
                 text=True,
                 timeout=timeout,
                 env=env,
+                stdin=self._stdin(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             diagnostics = [f"memory judge failed: {exc}"]
@@ -325,6 +374,45 @@ class CodexMemoryJudge:
             ]
             return MemoryJudgeResult(None, self.name, diagnostics, payload)
         return MemoryJudgeResult(candidate, self.name, [], payload)
+
+
+class CodexMemoryJudge(_SubprocessMemoryJudge):
+    name = "codex"
+    executable = "codex"
+
+    def _command(self, instruction: str, project: Project) -> list[str]:
+        return [
+            "codex",
+            "exec",
+            "--json",
+            "--cd",
+            str(project.root),
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            instruction,
+        ]
+
+
+class ClaudeMemoryJudge(_SubprocessMemoryJudge):
+    name = "claude"
+    executable = "claude"
+
+    def _command(self, instruction: str, project: Project) -> list[str]:
+        # Keep ``instruction`` last so _debug_command masks it. stdin is closed so
+        # the CLI does not block waiting for piped input. No sandbox flag: the judge
+        # prompt is read-only by construction, and recursion (not file writes) is the
+        # real risk, which the guard environment covers.
+        return [
+            "claude",
+            "-p",
+            "--output-format",
+            "json",
+            instruction,
+        ]
+
+    def _stdin(self) -> int | None:
+        return subprocess.DEVNULL
 
 
 def store_judge_result(
@@ -482,16 +570,29 @@ def _extract_json_object(output: str) -> dict[str, object]:
             event_text = event.get("text")
             if isinstance(event_text, str):
                 candidates.append(event_text)
+            result_text = event.get("result")
+            if isinstance(result_text, str):
+                candidates.append(result_text)
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if match:
         candidates.append(match.group(0))
+    # Prefer a judgment object. A CLI result envelope (e.g. Claude's
+    # {"type":"result",...,"result":"<judge json>"}) is itself a valid dict, so
+    # returning the first dict would yield the envelope; the judgment lives in the
+    # nested "result"/"text" string that was appended to candidates above.
+    fallback: dict[str, object] | None = None
     for candidate in candidates:
         try:
             value = json.loads(candidate)
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
-            return value
+            if "should_store" in value:
+                return value
+            if fallback is None:
+                fallback = value
+    if fallback is not None:
+        return fallback
     raise ValueError("no JSON object found")
 
 

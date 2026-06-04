@@ -10,10 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from memassist.cli import main
-from memassist.directives import handle_direct_user_instruction
 from memassist.extraction import extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
-from memassist.interpreter import INTERPRETER_ACTIVE_ENV, interpret_directive
+from memassist.memory_judge import INTERPRETER_ACTIVE_ENV
 from memassist.policy import PolicyEngine, default_policy_yaml, load_policy
 from memassist.project import detect_project, detect_project_for_init
 from memassist.retrieval import analyze_query_intent, build_memory_pack
@@ -231,17 +230,34 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(checks["project_config"]["status"], "pass")
             self.assertEqual(checks["tool_integrations"]["status"], "pass")
 
-    def test_doctor_warns_when_codex_interpreter_executable_is_missing(self) -> None:
+    def test_doctor_reports_judge_backend_and_warns_when_executable_missing(self) -> None:
         with isolated_env():
             self.assertEqual(main(["init", "--tools", "codex"]), 0)
             out = StringIO()
-            with patch("memassist.interpreter.shutil.which", return_value=None), patch("sys.stdout", out):
+            with patch("memassist.memory_judge.shutil.which", return_value=None), patch("sys.stdout", out):
                 code = main(["doctor", "--json"])
             self.assertEqual(code, 0)
             report = json.loads(out.getvalue())
             checks = {check["name"]: check for check in report["checks"]}
-            self.assertEqual(checks["directive_interpreter"]["status"], "warn")
-            self.assertIn("codex executable not found", checks["directive_interpreter"]["detail"])
+            # The directive interpreter and codex_cli checks were removed; doctor now
+            # reports the live judge backend instead.
+            self.assertNotIn("directive_interpreter", checks)
+            self.assertNotIn("codex_cli", checks)
+            self.assertEqual(checks["memory_judge"]["status"], "warn")
+            self.assertIn("codex", checks["memory_judge"]["detail"])
+            self.assertIn("executable not found", checks["memory_judge"]["detail"])
+
+    def test_doctor_reports_claude_judge_backend_ready(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init", "--tools", "claude"]), 0)
+            out = StringIO()
+            with patch("memassist.memory_judge.shutil.which", return_value="/usr/bin/claude"), patch("sys.stdout", out):
+                code = main(["doctor", "--json"])
+            self.assertEqual(code, 0)
+            checks = {check["name"]: check for check in json.loads(out.getvalue())["checks"]}
+            self.assertEqual(checks["memory_judge"]["status"], "pass")
+            self.assertIn("claude", checks["memory_judge"]["detail"])
+            self.assertNotIn("directive_interpreter", checks)
 
     def test_init_tools_all_installs_supported_project_integrations(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -260,7 +276,10 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue(all(item["installed"] for item in statuses.values()))
             self.assertTrue(statuses["codex"]["capabilities"]["prompt_memory_injection"])
             self.assertTrue(statuses["codex"]["capabilities"]["llm_directive_interpretation"])
-            self.assertFalse(statuses["claude"]["capabilities"]["llm_directive_interpretation"])
+            # Claude now has a judge adapter (claude -p), so it is judge-capable;
+            # OpenCode has no adapter and stays non-judge-capable.
+            self.assertTrue(statuses["claude"]["capabilities"]["llm_directive_interpretation"])
+            self.assertFalse(statuses["opencode"]["capabilities"]["llm_directive_interpretation"])
 
     def test_tools_uninstall_removes_selected_integration(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -1584,25 +1603,6 @@ class MemassistTest(unittest.TestCase):
                 candidate = store.get_memory(candidate_id)
             self.assertEqual(candidate.status, "candidate")  # type: ignore[union-attr]
 
-    def test_fallback_interpreter_recognizes_multilingual_typo_directive(self) -> None:
-        with isolated_env() as (_root, project_dir, _home):
-            main(["init"])
-            protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
-            protected.parent.mkdir(parents=True)
-            protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
-            project = detect_project()
-
-            result = interpret_directive(
-                "리프레쉬 토큰 쪽은 담부터 고치기 전에 꼭 나한테 먼저 말해줘",
-                project=project,
-            )
-
-            self.assertTrue(result.candidate.is_directive)
-            self.assertEqual(result.candidate.enforcement, "warn")
-            self.assertGreaterEqual(result.candidate.confidence, 0.85)
-            self.assertIn("refresh", result.candidate.scope_terms)
-            self.assertIn("token", result.candidate.scope_terms)
-
     def test_typo_directive_is_judged_to_active_source_language_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
@@ -1779,49 +1779,6 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(len(memories), 1)
             self.assertEqual(memories[0].content, "Ask before changing refresh token settings.")
             self.assertFalse(any(memory.id == memories[0].id for memory in transient_results))
-
-    def test_directive_interpreter_stores_normalized_durable_prompt_not_original_prompt(self) -> None:
-        with isolated_env() as (_root, project_dir, _home):
-            main(["init", "--tools", "codex"])
-            project = detect_project()
-            fixture = json.dumps(
-                {
-                    "is_directive": True,
-                    "intent": "future_memory_directive",
-                    "subject": "refresh token",
-                    "enforcement": "warn",
-                    "scope_terms": ["refresh", "token"],
-                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "confidence": 0.95,
-                    "rationale": "Durable edit gate with transient response format excluded.",
-                    "normalized_prompt": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다.",
-                }
-            )
-            old_fixture = os.environ.get("MEMASSIST_INTERPRETER_FIXTURE_RESPONSE")
-            os.environ["MEMASSIST_INTERPRETER_FIXTURE_RESPONSE"] = fixture
-            try:
-                with Store() as store:
-                    store.upsert_project(project)
-                    result = handle_direct_user_instruction(
-                        store,
-                        project=project,
-                        session_id="sess_direct_interpreter_mixed",
-                        prompt="앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
-                    )
-                    self.assertEqual(result.action, "directive_recorded")
-                    memories = store.list_memories(project_id=project.id, include_global=False, status=None)
-                    transient_results = store.search_memories("응답은 OK만 해", project_id=project.id)
-            finally:
-                if old_fixture is None:
-                    os.environ.pop("MEMASSIST_INTERPRETER_FIXTURE_RESPONSE", None)
-                else:
-                    os.environ["MEMASSIST_INTERPRETER_FIXTURE_RESPONSE"] = old_fixture
-
-            self.assertTrue(
-                any(memory.content == "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다." for memory in memories)
-            )
-            self.assertFalse(any("응답은 OK" in memory.content for memory in memories))
-            self.assertFalse(transient_results)
 
     def test_initialized_codex_fixture_judge_stores_source_language_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -2417,6 +2374,134 @@ class MemassistTest(unittest.TestCase):
                 candidate = store.get_memory(candidate_id)
                 self.assertEqual(candidate.status, "superseded")  # type: ignore[union-attr]
                 self.assertEqual(candidate.superseded_by, memory_id)  # type: ignore[union-attr]
+
+
+class ClaudeMemoryJudgeTest(unittest.TestCase):
+    @staticmethod
+    def _status(tool: str, installed: bool):
+        from memassist.integrations.base import IntegrationStatus
+
+        return IntegrationStatus(
+            tool=tool,
+            installed=installed,
+            path=Path(tmpfile_root() / f"{tool}.json"),
+            events=("UserPromptSubmit", "Stop") if installed else (),
+            detail="installed" if installed else "not installed",
+        )
+
+    @contextmanager
+    def _clean_judge_env(self):
+        keys = (
+            "MEMASSIST_MEMORY_JUDGE_MODE",
+            "MEMASSIST_MEMORY_JUDGE_ACTIVE",
+            INTERPRETER_ACTIVE_ENV,
+            "MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE",
+        )
+        saved = {key: os.environ.pop(key, None) for key in keys}
+        try:
+            yield
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def _select(self, installed_tools: set[str]):
+        from memassist import memory_judge
+
+        statuses = [self._status(tool, tool in installed_tools) for tool in ("codex", "claude", "opencode")]
+        with patch.object(memory_judge, "status_tools", return_value=statuses):
+            return memory_judge.select_memory_judge(object())
+
+    def test_select_returns_claude_when_only_claude_installed(self) -> None:
+        from memassist.memory_judge import ClaudeMemoryJudge
+
+        with self._clean_judge_env():
+            judge = self._select({"claude"})
+        self.assertIsInstance(judge, ClaudeMemoryJudge)
+
+    def test_select_prefers_codex_when_both_installed(self) -> None:
+        from memassist.memory_judge import CodexMemoryJudge
+
+        with self._clean_judge_env():
+            judge = self._select({"codex", "claude"})
+        self.assertIsInstance(judge, CodexMemoryJudge)
+
+    def test_select_unavailable_when_no_judge_tool_installed(self) -> None:
+        from memassist.memory_judge import UnavailableMemoryJudge
+
+        with self._clean_judge_env():
+            judge = self._select({"opencode"})
+        self.assertIsInstance(judge, UnavailableMemoryJudge)
+
+    def test_recursion_guard_blocks_selection(self) -> None:
+        from memassist.memory_judge import UnavailableMemoryJudge
+
+        with self._clean_judge_env():
+            os.environ[INTERPRETER_ACTIVE_ENV] = "1"
+            judge = self._select({"claude"})
+        self.assertIsInstance(judge, UnavailableMemoryJudge)
+
+    def test_claude_command_shape_and_stdin(self) -> None:
+        import subprocess
+
+        from memassist.memory_judge import ClaudeMemoryJudge
+
+        judge = ClaudeMemoryJudge()
+        self.assertEqual(judge.name, "claude")
+        self.assertEqual(judge.executable, "claude")
+        self.assertEqual(judge._stdin(), subprocess.DEVNULL)
+        command = judge._command("INSTRUCTION", project=object())
+        self.assertEqual(command, ["claude", "-p", "--output-format", "json", "INSTRUCTION"])
+        # instruction stays last so _debug_command masks it
+        self.assertEqual(command[-1], "INSTRUCTION")
+
+    def test_parses_judge_json_from_claude_result_envelope(self) -> None:
+        from memassist.memory_judge import _candidate_from_output
+
+        inner = {
+            "should_store": True,
+            "memory_content": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다",
+            "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
+            "memory_type": "rule",
+            "enforcement": "block",
+            "activation": "active",
+            "candidate_paths": [],
+            "meaning_preserved": True,
+            "contamination_risk": "low",
+            "reason": "durable directive",
+        }
+        envelope = json.dumps({"type": "result", "subtype": "success", "result": json.dumps(inner, ensure_ascii=False)})
+        candidate = _candidate_from_output(envelope)
+        self.assertTrue(candidate.should_store)
+        self.assertEqual(candidate.memory_type, "rule")
+        # durable/transient separation: the one-shot instruction is not in memory_content
+        self.assertNotIn("응답은 OK만 해", candidate.memory_content)
+        self.assertIn("리프레시 토큰", candidate.memory_content)
+
+    def test_parser_still_handles_raw_and_codex_jsonl(self) -> None:
+        from memassist.memory_judge import _candidate_from_output
+
+        raw = {
+            "should_store": False,
+            "memory_content": "x",
+            "source_quote": "y",
+            "memory_type": "fact",
+            "enforcement": "none",
+            "activation": "rejected",
+            "candidate_paths": [],
+            "meaning_preserved": True,
+            "contamination_risk": "low",
+            "reason": "r",
+        }
+        self.assertFalse(_candidate_from_output(json.dumps(raw)).should_store)
+        jsonl = json.dumps({"type": "item", "item": {"text": json.dumps(raw, ensure_ascii=False)}})
+        self.assertEqual(_candidate_from_output(jsonl).memory_type, "fact")
+
+
+def tmpfile_root() -> Path:
+    return Path(tempfile.gettempdir())
 
 
 if __name__ == "__main__":
