@@ -12,6 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from memassist.cli import main
+from memassist.memory_judge import judge_backend_diagnostics
+from memassist.project import detect_project
 from memassist.storage import Store
 
 
@@ -172,82 +174,104 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                 "real Codex CLI command completed, but no memassist hook lifecycle events were captured",
             )
 
-    @unittest.skipUnless(os.environ.get("MEMASSIST_RUN_REAL_CODEX_E2E") == "1", "real Codex CLI E2E is opt-in")
-    def test_real_codex_mixed_prompt_stores_no_transient_response_text(self) -> None:
-        """Tasks 3.1/3.2: real Codex CLI E2E over a mixed durable+transient Korean
-        prompt. Evaluation metric: 0 one-shot response-format phrases in the stored
-        or retrieved durable memory for the target prompt set.
-        """
-        if not shutil.which("codex"):
-            self.skipTest("codex executable not found")
-        transient = "응답은 OK만 해"
-        mixed_prompt = "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해."
-        with temp_project() as (_root, project):
-            self.assertEqual(main(["init", "--tools", "codex", "--mode", "full"]), 0)
-            result = subprocess.run(
-                [
-                    "codex",
-                    "exec",
-                    "--cd",
-                    str(project),
-                    "--dangerously-bypass-hook-trust",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                    mixed_prompt,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+    # --- Tool-parametrized durable/transient separation E2E (tasks 3.1/3.2) ----
+    #
+    # The judge backend is selected from the initialized tool (select_memory_judge:
+    # codex > claude; opencode has no judge adapter). Rather than hard-coding one host
+    # CLI, these exercise the judge layer for the tool used at `init` by firing the
+    # hooks directly. The real-judge cases are opt-in and require the tool CLI on PATH;
+    # the opencode (no-judge) case is deterministic and always runs.
 
-            # Turn-end judging happens on Stop, which the real Codex session fires.
-            with Store() as store:
-                project_memories = store.list_memories(
+    _MIXED_PROMPT = "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해."
+    _TRANSIENT = "응답은 OK만 해"
+
+    def _ingest_mixed_prompt(self, project: Path) -> None:
+        """Fire user-prompt-submit then stop for the mixed prompt so the init tool's
+        real judge backend runs turn-end judging (no fixture judge)."""
+        os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+        submit = {"session_id": "sess_judge_e2e", "cwd": str(project), "prompt": self._MIXED_PROMPT}
+        with patch("sys.stdin", StringIO(json.dumps(submit))), patch("sys.stdout", StringIO()):
+            self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+        stop = {"session_id": "sess_judge_e2e", "cwd": str(project)}
+        with patch("sys.stdin", StringIO(json.dumps(stop))), patch("sys.stdout", StringIO()):
+            self.assertEqual(main(["hook", "stop"]), 0)
+
+    def _judged_memories(self) -> list:
+        with Store() as store:
+            return [
+                memory
+                for memory in store.list_memories(
                     project_id=None, include_global=False, status=None
                 )
-                judged = [
-                    memory
-                    for memory in project_memories
-                    if memory.source_kind == "isolated_memory_judge"
-                ]
+                if memory.source_kind == "isolated_memory_judge"
+            ]
 
-            # The real judge must have stored a durable directive from the mixed prompt;
-            # an empty set means ingestion (task 3.1) did not happen.
+    def _assert_real_judge_excludes_transient(self, tool: str) -> None:
+        with temp_project() as (_root, project):
+            self.assertEqual(main(["init", "--tools", tool, "--mode", "full"]), 0)
+            self._ingest_mixed_prompt(project)
+
+            judged = self._judged_memories()
+            # Ingestion (task 3.1) must have happened via the real judge for this tool.
             self.assertTrue(
                 judged,
-                "real Codex judge stored no durable memory for the mixed directive prompt",
+                f"{tool} judge stored no durable memory for the mixed directive prompt",
             )
             # Metric (task 3.2): 0 transient response-format phrases in stored content.
             for memory in judged:
                 self.assertNotIn(
-                    transient,
+                    self._TRANSIENT,
                     memory.content,
-                    "transient response-format text leaked into stored durable memory content",
+                    f"{tool}: transient response-format text leaked into stored durable memory",
                 )
-
-            # The transient phrase must not be retrievable as durable memory, and a
-            # relevant follow-up prompt must not inject it as context.
+            # Transient text is not retrievable, and a relevant follow-up does not inject it.
             judged_project_id = judged[0].project_id
             with Store() as store:
-                transient_hits = store.search_memories(transient, project_id=judged_project_id)
+                transient_hits = store.search_memories(self._TRANSIENT, project_id=judged_project_id)
             self.assertFalse(
                 any(memory.source_kind == "isolated_memory_judge" for memory in transient_hits),
-                "transient response-format text is retrievable as durable memory",
+                f"{tool}: transient response-format text is retrievable as durable memory",
             )
-
-            rag_payload = {
-                "session_id": "sess_real_mixed_e2e",
+            rag = {
+                "session_id": "sess_judge_e2e_rag",
                 "cwd": str(project),
                 "prompt": "리프레시 토큰 15분으로 변경해줘",
             }
             rag_out = StringIO()
-            with patch("sys.stdin", StringIO(json.dumps(rag_payload))), patch("sys.stdout", rag_out):
+            with patch("sys.stdin", StringIO(json.dumps(rag))), patch("sys.stdout", rag_out):
                 self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
             self.assertNotIn(
-                transient,
+                self._TRANSIENT,
                 rag_out.getvalue(),
-                "transient response-format text leaked into injected RAG context",
+                f"{tool}: transient response-format text leaked into injected RAG context",
+            )
+
+    @unittest.skipUnless(os.environ.get("MEMASSIST_RUN_REAL_JUDGE_E2E") == "1", "real judge E2E is opt-in")
+    def test_real_judge_codex_mixed_prompt_excludes_transient(self) -> None:
+        if not shutil.which("codex"):
+            self.skipTest("codex executable not found")
+        self._assert_real_judge_excludes_transient("codex")
+
+    @unittest.skipUnless(os.environ.get("MEMASSIST_RUN_REAL_JUDGE_E2E") == "1", "real judge E2E is opt-in")
+    def test_real_judge_claude_mixed_prompt_excludes_transient(self) -> None:
+        if not shutil.which("claude"):
+            self.skipTest("claude executable not found")
+        self._assert_real_judge_excludes_transient("claude")
+
+    def test_opencode_init_has_no_judge_backend(self) -> None:
+        """opencode provides no judge adapter, so init'ing only opencode must leave
+        the isolated judge unavailable and store no durable prompt-derived memory
+        (spec: 'No initialized judge tool'). Deterministic; requires no tool CLI."""
+        with temp_project() as (_root, project):
+            self.assertEqual(main(["init", "--tools", "opencode", "--mode", "full"]), 0)
+            diagnostics = judge_backend_diagnostics(detect_project())
+            self.assertIsNone(diagnostics["backend"])
+            self.assertFalse(diagnostics["available"])
+            self._ingest_mixed_prompt(project)
+            self.assertEqual(
+                self._judged_memories(),
+                [],
+                "opencode has no judge backend; no durable prompt-derived memory should be stored",
             )
 
 
