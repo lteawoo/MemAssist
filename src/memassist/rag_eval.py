@@ -95,6 +95,7 @@ class RagEvalResult:
     verifier_recall: float
     pass_rate: float
     score: float
+    profile_id: str | None
     cases: list[dict[str, Any]]
 
     def as_dict(self) -> dict[str, Any]:
@@ -108,6 +109,7 @@ class RagEvalResult:
             "verifier_recall": self.verifier_recall,
             "pass_rate": self.pass_rate,
             "score": self.score,
+            "profile_id": self.profile_id,
             "cases": self.cases,
         }
 
@@ -120,7 +122,7 @@ def load_rag_cases(path: Path) -> list[RagCase]:
     return [RagCase.from_dict(case) for case in raw_cases if isinstance(case, dict)]
 
 
-def evaluate_rag(store: Store, *, project_id: str, cases: list[RagCase]) -> RagEvalResult:
+def evaluate_rag(store: Store, *, project_id: str, cases: list[RagCase], profile_id: str | None = None) -> RagEvalResult:
     rows: list[dict[str, Any]] = []
     section_total = 0.0
     relevance_total = 0.0
@@ -132,7 +134,7 @@ def evaluate_rag(store: Store, *, project_id: str, cases: list[RagCase]) -> RagE
         remove_seed_memories_by_source(store, project_id=project_id, source_kind="rag_eval_seed")
         seed_ids = _insert_seed_memories(store, project_id=project_id, seed=case.seed)
         try:
-            pack = build_memory_pack(store, query=case.query, project_id=project_id)
+            pack = build_memory_pack(store, query=case.query, project_id=project_id, embedding_profile_id=profile_id)
             section_hits = _section_hits(pack, case.expect)
             forbidden_hits = _section_hits(pack, case.forbid)
             expected_count = len([expect for expect in case.expect if expect.term])
@@ -174,7 +176,7 @@ def evaluate_rag(store: Store, *, project_id: str, cases: list[RagCase]) -> RagE
 
     count = len(cases)
     if count == 0:
-        return RagEvalResult(True, 0, 1.0, 1.0, 0.0, 1.0, 1.0, 5.0, [])
+        return RagEvalResult(True, 0, 1.0, 1.0, 0.0, 1.0, 1.0, 5.0, profile_id, [])
     section_accuracy = section_total / count
     context_relevance = relevance_total / count
     policy_leak_rate = policy_leaks / count
@@ -196,6 +198,7 @@ def evaluate_rag(store: Store, *, project_id: str, cases: list[RagCase]) -> RagE
         verifier_recall=verifier_recall,
         pass_rate=pass_rate,
         score=score,
+        profile_id=profile_id,
         cases=rows,
     )
 

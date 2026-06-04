@@ -7,7 +7,21 @@ name = "memassist"
 version = "0.1.0"
 description = "Project-local memory RAG and trace helper for AI coding agents"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "model2vec",
+]
+
+[project.optional-dependencies]
+sentence-transformers = [
+    "sentence-transformers",
+]
+flagembedding = [
+    "FlagEmbedding",
+]
+embeddings = [
+    "sentence-transformers",
+    "FlagEmbedding",
+]
 
 [project.scripts]
 memassist = "memassist.cli:main"

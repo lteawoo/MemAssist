@@ -13,6 +13,7 @@ from .directives import _instruction_tags, _normalize_project_files
 from .integrations import status_tools
 from .models import CAUTION_LEVELS, MEMORY_TYPES
 from .project import Project
+from .source_ledger import append_source_record
 from .storage import Store
 
 # Hook recursion guard. The judge sets this on child tool subprocesses so any
@@ -35,6 +36,7 @@ SOURCE_EVENT_TYPE = "memory_source_observed"
 @dataclass(frozen=True)
 class MemorySourceEvent:
     event_id: str
+    source_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,14 @@ def observe_turn_end_memory_source(
     source = extract_turn_end_memory_source(payload, session_id=session_id)
     if not source or not source.content.strip():
         return None
+    source_record = append_source_record(
+        store.path.parent,
+        kind=source.source_kind,
+        text=source.content,
+        session_id=session_id,
+        project_id=project_id,
+        source_ref=source.source_ref,
+    )
     existing = _find_existing_source_event(
         store,
         session_id=session_id,
@@ -150,13 +160,15 @@ def observe_turn_end_memory_source(
         source_ref=source.source_ref,
     )
     if existing:
-        return MemorySourceEvent(event_id=existing)
+        return MemorySourceEvent(event_id=existing, source_id=source_record.id)
     event_id = store.add_trace_event(
         session_id=session_id,
         project_id=project_id,
         event_type="memory_source_observed",
         tool_name="memassist",
         input_json={
+            "source_id": source_record.id,
+            "source_hash": source_record.source_hash,
             "source_role": "user",
             "content": source.content,
             "source_ref": source.source_ref,
@@ -164,7 +176,7 @@ def observe_turn_end_memory_source(
             "status": "pending",
         },
     )
-    return MemorySourceEvent(event_id=event_id)
+    return MemorySourceEvent(event_id=event_id, source_id=source_record.id)
 
 
 def process_memory_intent_event(
@@ -246,6 +258,8 @@ def build_judge_payload(
     return {
         "source_event": {
             "id": str(source_event["id"]),
+            "source_id": str(input_json.get("source_id") or ""),
+            "source_hash": str(input_json.get("source_hash") or ""),
             "role": "user",
             "content": content,
             "source_ref": str(input_json.get("source_ref") or source_event["id"]),
@@ -510,6 +524,8 @@ def store_judge_result(
     source_event = _trace_event_by_id(store, source_event_id) or {}
     source_input = _event_input(source_event)
     source_ref = str(source_input.get("source_ref") or source_event_id)
+    source_id = source_input.get("source_id")
+    source_ids = [str(source_id)] if isinstance(source_id, str) and source_id else []
     existing = store.find_memory(
         project_id=project.id,
         content=content,
@@ -537,6 +553,7 @@ def store_judge_result(
         source_kind="isolated_memory_judge",
         source_ref=source_ref,
         source_quote=candidate.source_quote,
+        source_ids=source_ids,
     )
     memory = store.get_memory(memory_id)
     store.add_lifecycle_event(
@@ -546,6 +563,7 @@ def store_judge_result(
         candidate={
             "judge": candidate.as_dict(),
             "source_event_id": source_event_id,
+            "source_id": source_id,
             "source_ref": source_ref,
             "source_quote": candidate.source_quote,
             "payload": result.payload,

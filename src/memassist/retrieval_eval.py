@@ -13,6 +13,7 @@ from .eval_seed import (
     seed_from_value,
 )
 from .models import Memory
+from .retrieval import build_memory_pack
 from .storage import Store
 
 
@@ -43,6 +44,7 @@ class RetrievalEvalResult:
     precision_at_k: float
     mrr: float
     forbidden_recall_rate: float
+    profile_id: str | None
     cases: list[dict[str, Any]]
 
     def as_dict(self) -> dict[str, Any]:
@@ -53,6 +55,7 @@ class RetrievalEvalResult:
             "precision_at_k": self.precision_at_k,
             "mrr": self.mrr,
             "forbidden_recall_rate": self.forbidden_recall_rate,
+            "profile_id": self.profile_id,
             "cases": self.cases,
         }
 
@@ -70,6 +73,7 @@ def evaluate_retrieval(
     *,
     project_id: str,
     cases: list[RetrievalCase],
+    profile_id: str | None = None,
 ) -> RetrievalEvalResult:
     case_results: list[dict[str, Any]] = []
     recall_total = 0.0
@@ -86,9 +90,17 @@ def evaluate_retrieval(
             source_kind="retrieval_eval_seed",
         )
         try:
-            retrieved = store.search_memories(case.query, project_id=project_id, limit=case.limit)
+            pack = build_memory_pack(
+                store,
+                query=case.query,
+                project_id=project_id,
+                context_limit=case.limit,
+                embedding_profile_id=profile_id,
+            )
+            retrieved = pack.context[: case.limit]
             hit_indexes = _hit_indexes(retrieved, case.expect)
             forbidden = _matched_terms(retrieved, case.forbid)
+            diagnostics = pack.diagnostics or {}
         finally:
             remove_seed_memories(store, seed_ids)
         recall = 1.0 if case.expect and len(hit_indexes) == len(case.expect) else 0.0
@@ -105,6 +117,7 @@ def evaluate_retrieval(
                 "expect": case.expect,
                 "forbid": case.forbid,
                 "retrieved": [_memory_result(memory) for memory in retrieved],
+                "diagnostics": diagnostics,
                 "recall": recall,
                 "precision": precision,
                 "reciprocal_rank": reciprocal_rank,
@@ -115,7 +128,7 @@ def evaluate_retrieval(
 
     count = len(cases)
     if count == 0:
-        return RetrievalEvalResult(True, 0, 1.0, 1.0, 1.0, 0.0, [])
+        return RetrievalEvalResult(True, 0, 1.0, 1.0, 1.0, 0.0, profile_id, [])
     recall_at_k = recall_total / count
     precision_at_k = precision_total / count
     mrr = reciprocal_total / count
@@ -127,6 +140,7 @@ def evaluate_retrieval(
         precision_at_k=precision_at_k,
         mrr=mrr,
         forbidden_recall_rate=forbidden_recall_rate,
+        profile_id=profile_id,
         cases=case_results,
     )
 

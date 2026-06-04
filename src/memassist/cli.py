@@ -4,10 +4,19 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from .doctor import run_doctor
+from .embedding_profiles import (
+    EmbeddingProfileError,
+    activate_embedding_profile,
+    ensure_embedding_profiles,
+    get_embedding_profile,
+    load_embedding_profile_config,
+)
+from .embeddings import build_memory_embeddings
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .integrations import install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
@@ -36,6 +45,7 @@ from .rag_eval import RagCase, RagExpectation, evaluate_rag, load_rag_cases
 from .retrieval import build_memory_pack, render_prompt_context
 from .retrieval_eval import RetrievalCase, evaluate_retrieval, load_cases
 from .session import summarize_session
+from .source_ledger import ensure_source_ledger
 from .storage import Store
 from .sync import export_memories, import_memories
 from .trace import record_tool_event
@@ -101,11 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
     mem_search.set_defaults(func=cmd_memory_search)
 
     mem_rebuild = memory_sub.add_parser("rebuild-index", help="rebuild SQLite search index from Markdown memories")
+    mem_rebuild.add_argument("--profile")
     mem_rebuild.add_argument("--json", action="store_true")
     mem_rebuild.set_defaults(func=cmd_memory_rebuild_index)
 
     mem_pack = memory_sub.add_parser("pack", help="build a memory pack")
     mem_pack.add_argument("query")
+    mem_pack.add_argument("--profile")
     mem_pack.add_argument("--json", action="store_true")
     mem_pack.set_defaults(func=cmd_memory_pack)
 
@@ -213,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_retrieval.add_argument("--expect", action="append", default=[])
     eval_retrieval.add_argument("--forbid", action="append", default=[])
     eval_retrieval.add_argument("--limit", type=int, default=5)
+    eval_retrieval.add_argument("--profile")
     eval_retrieval.add_argument("--json", action="store_true")
     eval_retrieval.set_defaults(func=cmd_eval_retrieval)
     eval_memory = eval_sub.add_parser("memory", help="evaluate memory quality cases")
@@ -228,8 +241,32 @@ def build_parser() -> argparse.ArgumentParser:
     eval_rag.add_argument("--query")
     eval_rag.add_argument("--expect", action="append", default=[])
     eval_rag.add_argument("--forbid", action="append", default=[])
+    eval_rag.add_argument("--profile")
     eval_rag.add_argument("--json", action="store_true")
     eval_rag.set_defaults(func=cmd_eval_rag)
+    eval_compare = eval_sub.add_parser("compare", help="compare retrieval eval results across embedding profiles")
+    eval_compare.add_argument("--case-file", required=True)
+    eval_compare.add_argument("--profiles", required=True, help="comma-separated embedding profile ids")
+    eval_compare.add_argument("--json", action="store_true")
+    eval_compare.set_defaults(func=cmd_eval_compare)
+
+    embedding = sub.add_parser("embedding", help="manage local embedding profiles and caches")
+    embedding_sub = embedding.add_subparsers(required=True)
+    emb_profiles = embedding_sub.add_parser("profiles", help="list embedding profiles")
+    emb_profiles.add_argument("--json", action="store_true")
+    emb_profiles.set_defaults(func=cmd_embedding_profiles)
+    emb_activate = embedding_sub.add_parser("activate", help="activate an embedding profile")
+    emb_activate.add_argument("profile")
+    emb_activate.add_argument("--json", action="store_true")
+    emb_activate.set_defaults(func=cmd_embedding_activate)
+    emb_build = embedding_sub.add_parser("build", help="build embedding cache for a profile")
+    emb_build.add_argument("--profile")
+    emb_build.add_argument("--json", action="store_true")
+    emb_build.set_defaults(func=cmd_embedding_build)
+    emb_cleanup = embedding_sub.add_parser("cleanup", help="remove derived embedding cache rows")
+    emb_cleanup.add_argument("--profile")
+    emb_cleanup.add_argument("--json", action="store_true")
+    emb_cleanup.set_defaults(func=cmd_embedding_cleanup)
 
     daemon = sub.add_parser("daemon", help="run maintenance tasks")
     daemon_sub = daemon.add_subparsers(required=True)
@@ -246,6 +283,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     mem_dir = project_memassist_home(project.root)
     mem_dir.mkdir(exist_ok=True)
     ensure_memory_artifact_dirs(mem_dir)
+    ensure_source_ledger(mem_dir)
+    ensure_embedding_profiles(mem_dir)
     config_path = mem_dir / "verification.yaml"
     if not config_path.exists():
         config_path.write_text(default_verification_config_yaml(), encoding="utf-8")
@@ -351,9 +390,9 @@ def cmd_memory_search(args: argparse.Namespace) -> int:
 
 def cmd_memory_rebuild_index(args: argparse.Namespace) -> int:
     with _store() as store:
-        indexed = store.rebuild_memory_index_from_artifacts()
+        indexed = store.rebuild_memory_index_from_artifacts(embedding_profile_id=args.profile)
     if args.json:
-        _print_json({"indexed": indexed, "count": len(indexed)})
+        _print_json({"indexed": indexed, "count": len(indexed), "profile_id": args.profile})
     else:
         print(f"Indexed {len(indexed)} memories from Markdown.")
     return 0
@@ -362,7 +401,7 @@ def cmd_memory_rebuild_index(args: argparse.Namespace) -> int:
 def cmd_memory_pack(args: argparse.Namespace) -> int:
     project = detect_project()
     with _store() as store:
-        pack = build_memory_pack(store, query=args.query, project_id=project.id)
+        pack = build_memory_pack(store, query=args.query, project_id=project.id, embedding_profile_id=args.profile)
     if args.json:
         _print_json(pack.as_dict())
     else:
@@ -571,7 +610,7 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
     session_id = str(payload.get("sessionId") or payload.get("session_id") or "unknown")
     tool_name = str(payload.get("toolName") or payload.get("tool_name") or payload.get("tool") or "")
     tool_args = _coerce_tool_args(payload)
-    with _store() as store:
+    with Store(project_memassist_home(project.root) / "memassist.db") as store:
         store.upsert_project(project)
         if args.hook_event == "user-prompt-submit":
             query = str(payload.get("prompt") or payload.get("message") or payload.get("content") or "")
@@ -722,7 +761,7 @@ def cmd_eval_retrieval(args: argparse.Namespace) -> int:
         print("Provide --case-file or --query with at least one --expect.")
         return 1
     with _store() as store:
-        result = evaluate_retrieval(store, project_id=project.id, cases=cases)
+        result = evaluate_retrieval(store, project_id=project.id, cases=cases, profile_id=args.profile)
     if args.json:
         _print_json(result.as_dict())
     else:
@@ -785,7 +824,7 @@ def cmd_eval_rag(args: argparse.Namespace) -> int:
         print("Provide --case-file or --query.")
         return 1
     with _store() as store:
-        result = evaluate_rag(store, project_id=project.id, cases=cases)
+        result = evaluate_rag(store, project_id=project.id, cases=cases, profile_id=args.profile)
     if args.json:
         _print_json(result.as_dict())
     else:
@@ -797,6 +836,124 @@ def cmd_eval_rag(args: argparse.Namespace) -> int:
         print(f"pass_rate: {result.pass_rate:.3f}")
         print(f"score: {result.score:.3f}")
     return 0 if result.passed else 1
+
+
+def cmd_eval_compare(args: argparse.Namespace) -> int:
+    project = detect_project()
+    cases = load_cases(Path(args.case_file))
+    profile_ids = [profile.strip() for profile in args.profiles.split(",") if profile.strip()]
+    if not profile_ids:
+        print("Provide at least one profile id.")
+        return 1
+    rows: list[dict[str, Any]] = []
+    with _store() as store:
+        for profile_id in profile_ids:
+            try:
+                profile = get_embedding_profile(profile_id, mem_dir=store.path.parent)
+            except EmbeddingProfileError as exc:
+                rows.append({"profile_id": profile_id, "passed": False, "error": str(exc)})
+                continue
+            started = time.perf_counter()
+            result = evaluate_retrieval(store, project_id=project.id, cases=cases, profile_id=profile_id)
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            cache = store.embedding_cache_summary(profile_id=profile_id)
+            rows.append(
+                {
+                    "profile_id": profile_id,
+                    "provider": profile.provider,
+                    "model": profile.model,
+                    "quantization": profile.quantization,
+                    "dimension": profile.dimension,
+                    "fingerprint": profile.fingerprint,
+                    "passed": result.passed,
+                    "recall_at_k": result.recall_at_k,
+                    "precision_at_k": result.precision_at_k,
+                    "mrr": result.mrr,
+                    "forbidden_recall_rate": result.forbidden_recall_rate,
+                    "elapsed_ms": elapsed_ms,
+                    "cache": cache,
+                    "cases": result.cases,
+                }
+            )
+    payload = {"profiles": rows, "case_count": len(cases)}
+    if args.json:
+        _print_json(payload)
+    else:
+        for row in rows:
+            status = "PASS" if row.get("passed") else "FAIL"
+            print(
+                f"{status} {row['profile_id']} "
+                f"recall={float(row.get('recall_at_k', 0.0)):.3f} "
+                f"mrr={float(row.get('mrr', 0.0)):.3f} "
+                f"forbidden={float(row.get('forbidden_recall_rate', 0.0)):.3f}"
+            )
+    return 0 if all(row.get("passed") for row in rows) else 1
+
+
+def cmd_embedding_profiles(args: argparse.Namespace) -> int:
+    project = detect_project()
+    mem_dir = project_memassist_home(project.root)
+    try:
+        config = load_embedding_profile_config(mem_dir)
+    except EmbeddingProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    payload = config.as_dict()
+    if args.json:
+        _print_json(payload)
+    else:
+        print(f"active: {config.active}")
+        for profile_id, profile in config.profiles.items():
+            active = "*" if profile_id == config.active else " "
+            print(f"{active} {profile_id}: {profile.provider} {profile.model} quantization={profile.quantization} dimension={profile.dimension}")
+    return 0
+
+
+def cmd_embedding_activate(args: argparse.Namespace) -> int:
+    project = detect_project()
+    mem_dir = project_memassist_home(project.root)
+    try:
+        config = activate_embedding_profile(args.profile, mem_dir=mem_dir)
+    except EmbeddingProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json({"active": config.active})
+    else:
+        print(f"active embedding profile: {config.active}")
+    return 0
+
+
+def cmd_embedding_build(args: argparse.Namespace) -> int:
+    project = detect_project()
+    with _store() as store:
+        try:
+            profile = get_embedding_profile(args.profile, mem_dir=store.path.parent)
+        except EmbeddingProfileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        result = build_memory_embeddings(store, project_id=project.id, profile=profile)
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"profile: {result['profile_id']}")
+        print(f"status: {result['status']}")
+        print(f"built: {len(result['built'])}")
+        print(f"skipped: {len(result['skipped'])}")
+    return 0 if result.get("status") in {"ok", "partial"} else 1
+
+
+def cmd_embedding_cleanup(args: argparse.Namespace) -> int:
+    with _store() as store:
+        profile_id = args.profile
+        removed = store.cleanup_embedding_cache(profile_id=profile_id)
+    payload = {"profile_id": profile_id, "removed": removed}
+    if args.json:
+        _print_json(payload)
+    else:
+        target = profile_id or "all profiles"
+        print(f"removed {removed} embedding cache rows for {target}")
+    return 0
 
 
 def cmd_daemon_once(args: argparse.Namespace) -> int:

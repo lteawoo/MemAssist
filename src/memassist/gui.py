@@ -656,6 +656,11 @@ def _init_empty_schema(conn: sqlite3.Connection) -> None:
           caution_level TEXT,
           source_kind TEXT,
           source_ref TEXT,
+          source_ids_json TEXT,
+          source_quote TEXT,
+          content_hash TEXT,
+          artifact_path TEXT,
+          indexed_at TEXT,
           created_at TEXT,
           updated_at TEXT,
           last_used_at TEXT,
@@ -757,6 +762,9 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         last_used_at=_row_value(row, "last_used_at"),
         expires_at=_row_value(row, "expires_at"),
         superseded_by=_row_value(row, "superseded_by"),
+        source_quote=_row_value(row, "source_quote"),
+        source_ids=_json_list(_row_value(row, "source_ids_json")),
+        content_hash=_row_value(row, "content_hash"),
     )
 
 

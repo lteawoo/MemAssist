@@ -1,0 +1,41 @@
+{
+  "cases": [
+    {
+      "query": "refresh token 변경 전에 확인해야 할 기억",
+      "expect": ["refresh token changes require confirmation"],
+      "forbid": ["hidden approval gate"],
+      "limit": 5,
+      "seed": [
+        {
+          "type": "directive",
+          "content": "Remember that refresh token changes require confirmation from the user.",
+          "tags": ["auth", "refresh-token"],
+          "paths": ["src/auth/refresh-token-policy.ts"],
+          "status": "active",
+          "source_quote": "refresh token 변경 전에 확인받기"
+        },
+        {
+          "type": "fact",
+          "content": "A hidden approval gate must not be created from memory retrieval.",
+          "tags": ["policy"],
+          "status": "candidate"
+        }
+      ]
+    },
+    {
+      "query": "src/memassist/retrieval.py hybrid diagnostics",
+      "expect": ["vector status diagnostics"],
+      "forbid": ["permission decision"],
+      "limit": 5,
+      "seed": [
+        {
+          "type": "decision",
+          "content": "Hybrid retrieval must report vector status diagnostics.",
+          "tags": ["retrieval", "hybrid"],
+          "paths": ["src/memassist/retrieval.py"],
+          "status": "active"
+        }
+      ]
+    }
+  ]
+}

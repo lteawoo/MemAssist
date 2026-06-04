@@ -51,6 +51,9 @@ class Memory:
     last_used_at: str | None
     expires_at: str | None
     superseded_by: str | None
+    source_quote: str | None = None
+    source_ids: list[str] | None = None
+    content_hash: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -79,4 +82,7 @@ class Memory:
             "last_used_at": self.last_used_at,
             "expires_at": self.expires_at,
             "superseded_by": self.superseded_by,
+            "source_quote": self.source_quote,
+            "source_ids": self.source_ids or [],
+            "content_hash": self.content_hash,
         }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -84,13 +85,14 @@ def read_memory_artifact(path: Path) -> Memory | None:
         return None
     memory_id = str(metadata.get("id") or path.stem)
     status = _status_from_bucket(path)
+    content = _artifact_content(text)
     return Memory(
         id=memory_id,
         scope_type=str(metadata.get("scope_type") or "project"),
         project_id=_optional_str(metadata.get("project_id")),
         session_id=_optional_str(metadata.get("session_id")),
         type=str(metadata.get("type") or "fact"),
-        content=_artifact_content(text),
+        content=content,
         reason=_optional_str(metadata.get("reason")) or _section_text(text, "Reason"),
         tags=_string_list(metadata.get("tags")),
         paths=_string_list(metadata.get("paths")),
@@ -110,6 +112,9 @@ def read_memory_artifact(path: Path) -> Memory | None:
         last_used_at=_optional_str(metadata.get("last_used_at")),
         expires_at=_optional_str(metadata.get("expires_at")),
         superseded_by=_optional_str(metadata.get("superseded_by")),
+        source_quote=_existing_source_quote(path),
+        source_ids=_string_list(metadata.get("source_ids")),
+        content_hash=memory_content_hash(content),
     )
 
 
@@ -149,6 +154,8 @@ def _existing_source_quote(path: Path) -> str | None:
 
 
 def _render_artifact(memory: Memory, *, source_quote: str | None) -> str:
+    source_ids = memory.source_ids or []
+    content_hash = memory_content_hash(memory.content)
     metadata: dict[str, Any] = {
         "id": memory.id,
         "scope_type": memory.scope_type,
@@ -167,7 +174,9 @@ def _render_artifact(memory: Memory, *, source_quote: str | None) -> str:
         "caution_level": memory.caution_level,
         "source_kind": memory.source_kind,
         "source_ref": memory.source_ref,
+        "source_ids": source_ids,
         "source_quote": source_quote,
+        "content_hash": content_hash,
         "created_at": memory.created_at,
         "updated_at": memory.updated_at,
         "last_used_at": memory.last_used_at,
@@ -189,6 +198,11 @@ def _render_artifact(memory: Memory, *, source_quote: str | None) -> str:
     if reason:
         sections.extend(["", "## Reason", "", reason.strip()])
     return "\n".join(sections).rstrip() + "\n"
+
+
+def memory_content_hash(content: str) -> str:
+    normalized = "\n".join(line.rstrip() for line in content.strip().splitlines()).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _metadata_from_text(text: str) -> dict[str, Any] | None:

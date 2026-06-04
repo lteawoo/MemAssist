@@ -84,6 +84,8 @@ def import_memories(store: Store, *, project_id: str, path: Path, activate: bool
             caution_level=memory["caution_level"],
             source_kind="import",
             source_ref=str(path),
+            source_quote=memory["source_quote"],
+            source_ids=memory["source_ids"],
         )
         imported.append(memory_id)
         existing.add(key)
@@ -109,6 +111,9 @@ def _exportable(memory: Memory) -> dict[str, object]:
         "caution_level",
         "source_kind",
         "source_ref",
+        "source_quote",
+        "source_ids",
+        "content_hash",
         "expires_at",
         "superseded_by",
     ]
@@ -136,6 +141,9 @@ def _normalize_import(raw: dict[str, object]) -> dict[str, object]:
         "utility": _float(raw.get("utility"), 0.0),
         "half_life_days": _float(raw.get("half_life_days"), 30.0),
         "caution_level": caution_level if caution_level in CAUTION_LEVELS else "none",
+        "source_quote": raw.get("source_quote") if isinstance(raw.get("source_quote"), str) else None,
+        "source_ids": _string_list(raw.get("source_ids")),
+        "content_hash": raw.get("content_hash") if isinstance(raw.get("content_hash"), str) else None,
     }
 
 

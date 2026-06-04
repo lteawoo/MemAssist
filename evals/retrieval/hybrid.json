@@ -1,0 +1,31 @@
+{
+  "cases": [
+    {
+      "query": "hybrid retrieval verification",
+      "expect": ["focused retrieval tests"],
+      "forbid": ["hidden approval gate"],
+      "seed": [
+        {
+          "type": "workflow",
+          "content": "Run focused retrieval tests after hybrid search changes.",
+          "tags": ["verification", "retrieval", "hybrid"],
+          "paths": ["src/memassist/retrieval.py"],
+          "status": "active",
+          "importance": 0.85,
+          "source_quote": "Run focused retrieval tests after hybrid search changes.",
+          "source_ref": "evals/retrieval/hybrid.json#case-1-workflow"
+        },
+        {
+          "type": "preference",
+          "content": "Stored memories are retrieval context, not a hidden approval gate.",
+          "tags": ["memory", "context"],
+          "status": "candidate",
+          "importance": 0.85,
+          "source_quote": "Stored memories are retrieval context, not a hidden approval gate.",
+          "source_ref": "evals/retrieval/hybrid.json#case-1-candidate"
+        }
+      ],
+      "limit": 5
+    }
+  ]
+}

@@ -13,8 +13,8 @@
 > 같은 프로젝트 설명, 같은 테스트 명령, 같은 주의사항을 매번 다시 말하지 않게 한다.
 
 `memassist`는 로컬 우선 도구입니다. 프로젝트에서 `memassist init`을 실행하면
-프로젝트 루트의 `.memassist/` 하나에 정책, ignore 파일, Markdown memory, trace, 재생성 가능한 SQLite
-검색 인덱스/텔레메트리 캐시가 함께 저장됩니다. `~/.memassist`는 아직 초기화하지 않은 경로나 명시적인 전역 사용을 위한
+프로젝트 루트의 `.memassist/` 하나에 정책, ignore 파일, Markdown memory, trace, embedding profile,
+재생성 가능한 SQLite 검색 인덱스/텔레메트리/embedding 캐시가 함께 저장됩니다. `~/.memassist`는 아직 초기화하지 않은 경로나 명시적인 전역 사용을 위한
 fallback/global home입니다.
 
 > 현재 상태: 초기 로컬 도구입니다. CLI와 저장 구조는 사용할 수 있지만, 위험도가 높은
@@ -26,6 +26,15 @@ fallback/global home입니다.
 
 ```bash
 python3 -m pip install -e .
+```
+
+기본 설치에는 active `local-default` embedding profile이 사용하는 `model2vec` runtime이
+포함됩니다. 비교 평가용으로 더 무거운 provider를 테스트할 때만 extra dependency를 설치합니다.
+
+```bash
+python3 -m pip install -e ".[sentence-transformers]"
+python3 -m pip install -e ".[flagembedding]"
+python3 -m pip install -e ".[embeddings]"
 ```
 
 개발 중에는 설치하지 않고 `PYTHONPATH=src`로 실행할 수도 있습니다.
@@ -197,10 +206,10 @@ memory를 찾고, 결과를 `additionalContext`로 주입합니다.
 기억 적재와 RAG 주입은 다음 흐름으로 동작합니다.
 
 - `UserPromptSubmit`은 관련 memory retrieval과 `additionalContext` 주입만 수행합니다. 검색된 memory의 `retrieval_count`, `last_used_at` 같은 read-side telemetry는 갱신될 수 있습니다.
-- `Stop`에서 host payload, transcript path, history 같은 turn-end source evidence를 확인한 뒤 분리된 memory judge를 실행합니다.
+- `Stop`에서 host payload, transcript path, history 같은 turn-end source evidence를 확인한 뒤 프로젝트 로컬 `sources.jsonl` source ledger에 compact evidence를 남기고, 분리된 memory judge를 실행합니다.
 - 분리된 memory judge가 사용자 source evidence만 보고 `should_store`, `source_quote`, `memory_content`, `candidate_paths`, `meaning_preserved` 같은 구조화 결과를 만듭니다.
 - 저장되는 primary memory content는 `memory_content`입니다. judge는 가능한 한 사용자의 원문 언어로, 오래 유지될 기억만 분리해 씁니다.
-- 원문 전체는 `source_quote`로 lifecycle metadata에 보존합니다. 예를 들어 “앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.”라면 앞 문장만 retrieval 대상 memory가 되고, `응답은 OK만 해`는 현재 턴 지시로 남습니다.
+- 원문 근거는 source ledger의 `source_id`와 artifact의 `source_quote`로 보존합니다. 예를 들어 “앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.”라면 앞 문장만 retrieval 대상 memory가 되고, `응답은 OK만 해`는 현재 턴 지시로 남습니다.
 - 관련 memory는 `Relevant memassist memory` context로 주입됩니다. `memassist`는 이 기억을 자동 정책으로 컴파일하거나 tool 실행을 강제 차단하지 않습니다.
 
 judge는 `memassist init --tools ...`에서 설치한 도구를 backend로 사용할 수 있습니다. backend는
@@ -223,7 +232,8 @@ flowchart TD
     B --> C[Relevant memassist memory 주입]
     C --> D[Stop]
     D --> E[source evidence 확인]
-    E --> F[isolated memory judge]
+    E --> E2[sources.jsonl 기록]
+    E2 --> F[isolated memory judge]
     F --> G{저장할 가치가 있는가?}
     G -->|아니오| H[trace diagnostic only]
     G -->|예| I[Markdown memory 작성]
@@ -259,7 +269,10 @@ memassist doctor --json
 ## 메모리 탐색 기법: RAG 방식
 
 `memassist`의 retrieval은 일반 문서 QA용 RAG가 아니라 코딩 agent reminder를 위한
-로컬 memory-pack RAG입니다.
+로컬 memory-pack RAG입니다. 기본 검색 엔진은 exact lexical 검색과 active embedding profile의
+vector 검색을 하나로 합친 mandatory hybrid retrieval입니다. vector provider가 없거나 cache가
+없으면 prompt 처리는 실패하지 않지만, `vector_status` diagnostics에 `missing_dependency`,
+`missing_cache`, `disabled` 같은 degradation 이유를 명시합니다.
 
 새 요청이 들어오면 먼저 요청의 의도를 분석합니다.
 
@@ -276,8 +289,8 @@ memassist doctor --json
 flowchart TD
     A[사용자 요청] --> B[의도 분석]
     B --> C[lexical 검색]
-    B --> D[metadata 검색]
-    B --> E[directive/context 검색]
+    B --> D[profile vector 검색]
+    B --> E[metadata 검색]
     B --> F[verifier 검색]
     B --> G[path/link 검색]
     C --> H[rank fusion]
@@ -295,8 +308,8 @@ flowchart TD
 | 채널 | 목적 |
 | --- | --- |
 | `lexical` | 요청 문장과 memory 본문이 직접 맞는지 검색합니다. |
+| `vector` | active embedding profile로 의미적으로 가까운 memory를 찾습니다. provider/cache가 없으면 diagnostics에 degradation 상태를 남깁니다. |
 | `metadata` | tag, path, type, status 같은 구조화 정보를 사용합니다. |
-| `directive/context` | 규칙이나 주의사항처럼 보이는 memory도 agent 판단용 context로 탐색합니다. |
 | `verifier` | 테스트 명령, 검증 방식, 재현 절차를 찾습니다. |
 | `links_path` | 같은 파일, 같은 tag, 관련 memory link를 따라 확장합니다. |
 
@@ -307,8 +320,8 @@ flowchart TD
 ```mermaid
 flowchart LR
     A[lexical 순위] --> E[RRF 점수]
-    B[metadata 순위] --> E
-    C[directive/context 순위] --> E
+    B[vector 순위] --> E
+    C[metadata 순위] --> E
     D[verifier 순위] --> E
     F[path/link 순위] --> E
     E --> G[최종 순위]
@@ -324,6 +337,36 @@ memory는 `context`, 검증 관련 memory는 `verifier` reminder로 주입됩니
 | `verifier` | 실행해야 할 테스트, 검증 명령, 확인 절차를 담습니다. |
 
 직접 확인하려면 다음 명령을 사용합니다.
+
+```bash
+memassist embedding profiles
+memassist embedding activate local-default
+memassist embedding build --profile local-default --json
+memassist memory pack "retrieval.py 하이브리드 검색" --profile local-default --json
+```
+
+embedding profile은 provider, model, quantization, dimension, prefix, normalization을 분리합니다.
+기본 후보는 일반 사무용 PC에서도 가볍게 검증할 수 있는 local quantized profile입니다. 제품 후보는
+실제 local embedding provider만 사용하며, hash pseudo-vector는 semantic 비교 대상이나 fallback이
+아닙니다. 초기 비교 후보는 다음과 같습니다.
+
+`pip install -e .` 기본 설치는 `local-default`의 `model2vec` runtime을 설치합니다. 모델
+artifact는 provider가 사용할 때 로컬 cache로 준비되며, `sentence-transformers`와
+`FlagEmbedding` 계열 비교 후보는 extra dependency를 설치한 뒤 profile로 선택합니다.
+
+| 후보 | 역할 |
+| --- | --- |
+| `model2vec + minishlab/potion-multilingual-128M` | 기본 local/quantized 후보 |
+| `google/embeddinggemma-300m` QAT/Q4 계열 | 최신 경량 품질 후보 |
+| `Qwen3-Embedding-0.6B` quantized | 강한 multilingual 품질 baseline |
+| `BAAI/bge-m3` dense-only | hybrid 철학에 잘 맞는 advanced 품질 baseline |
+
+profile별 비교는 같은 eval case를 대상으로 실행합니다.
+
+```bash
+memassist eval retrieval --case-file evals/retrieval/embedding_profiles.json --profile local-default --json
+memassist eval compare --case-file evals/retrieval/embedding_profiles.json --profiles local-default,none --json
+```
 
 ```bash
 memassist memory pack "login session bug"
@@ -479,7 +522,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 ## 저장 위치와 개인정보
 
 - 프로젝트 memory의 원본은 프로젝트 루트의 `.memassist/memories/{active,candidates,archived}` Markdown 파일입니다.
-- 기본 SQLite 인덱스는 프로젝트 루트의 `.memassist/memassist.db`에 저장되는 파생 검색 인덱스/텔레메트리 캐시입니다.
+- Stop에서 관찰한 memory source evidence는 프로젝트 루트의 `.memassist/sources.jsonl`에 compact JSONL ledger로 저장됩니다.
+- embedding profile 설정은 프로젝트 루트의 `.memassist/embedding-profiles.yaml`에 저장됩니다.
+- 기본 SQLite 인덱스는 프로젝트 루트의 `.memassist/memassist.db`에 저장되는 파생 검색 인덱스/텔레메트리/profile별 embedding 캐시입니다.
 - 프로젝트 정책과 ignore 파일도 같은 `.memassist/`에 저장됩니다.
 - memory와 trace는 기본적으로 로컬에 남습니다.
 - 민감 파일이나 생성물은 `.memassist/ignore`에 추가해 trace-derived memory 후보에서 제외할 수 있습니다.
@@ -498,7 +543,7 @@ import된 memory는 기본적으로 candidate입니다. 필요하면 `memassist 
 
 - 이 프로젝트는 아직 초기 로컬 도구입니다.
 - 추론된 memory는 고위험 프로젝트에서 반드시 검토해야 합니다.
-- 현재 retrieval은 로컬 deterministic RAG에 가깝고, 외부 embedding 서비스나 네트워크 의존성은 없습니다.
+- vector retrieval은 active embedding profile을 통해 항상 시도됩니다. provider dependency나 cache가 없으면 FTS/metadata/path/link retrieval로 계속 동작하되 diagnostics에 degradation 이유를 남깁니다.
 - Codex CLI 버전과 실행 모드에 따라 project lifecycle hook 동작이 다를 수 있습니다. 특히 `codex exec`는 interactive Codex CLI와 hook 실행 범위가 다를 수 있으므로, `memassist tools status --json`의 capability와 interactive CLI 기반 E2E를 함께 확인하는 것이 안전합니다.
 
 ## 추가 참고

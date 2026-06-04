@@ -1,0 +1,47 @@
+{
+  "cases": [
+    {
+      "query": "embedding profile vector status for memory pack",
+      "expect": [
+        {
+          "term": "active embedding profile",
+          "section": "context"
+        },
+        {
+          "term": "run retrieval profile comparison",
+          "section": "verifier"
+        }
+      ],
+      "forbid": [
+        {
+          "term": "hidden approval gate",
+          "section": "*"
+        }
+      ],
+      "seed": [
+        {
+          "section": "context",
+          "type": "decision",
+          "content": "Memory packs include active embedding profile vector status diagnostics.",
+          "tags": ["embedding", "retrieval"],
+          "paths": ["src/memassist/retrieval.py"],
+          "status": "active"
+        },
+        {
+          "section": "verifier",
+          "type": "workflow",
+          "content": "Run retrieval profile comparison before selecting the default local embedding model.",
+          "tags": ["verification", "embedding"],
+          "status": "active"
+        },
+        {
+          "section": "context",
+          "type": "directive",
+          "content": "Do not turn embedding profile diagnostics into a hidden approval gate.",
+          "tags": ["policy"],
+          "status": "candidate"
+        }
+      ]
+    }
+  ]
+}

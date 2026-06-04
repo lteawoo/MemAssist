@@ -1,0 +1,33 @@
+{
+  "cases": [
+    {
+      "query": "hybrid search memory pack for retrieval.py",
+      "seed": [
+        {
+          "section": "context",
+          "type": "decision",
+          "content": "Hybrid memory retrieval combines FTS, optional vector search, metadata, path, and link signals.",
+          "tags": ["retrieval", "hybrid", "memory"],
+          "paths": ["src/memassist/retrieval.py"],
+          "source_quote": "Hybrid retrieval should be the default engine with FTS fallback.",
+          "source_ref": "evals/rag/hybrid.json#case-1-context"
+        },
+        {
+          "section": "verifier",
+          "type": "workflow",
+          "content": "Run PYTHONPATH=src python3 -m unittest tests.test_memassist tests.test_memassist_e2e after hybrid retrieval changes.",
+          "tags": ["verification", "test", "retrieval"],
+          "source_quote": "Run focused unit and E2E tests after hybrid retrieval changes.",
+          "source_ref": "evals/rag/hybrid.json#case-1-verifier"
+        }
+      ],
+      "expect": [
+        { "term": "optional vector search", "section": "context" },
+        { "term": "unittest tests.test_memassist", "section": "verifier" }
+      ],
+      "forbid": [
+        { "term": "hidden approval gate", "section": "*" }
+      ]
+    }
+  ]
+}

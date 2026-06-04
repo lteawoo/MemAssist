@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime
 import re
 
+from .embedding_profiles import EmbeddingProfile
+from .embeddings import VectorSearchResult, selected_embedding_profile, vector_search
 from .models import Memory
 from .storage import Store
 
@@ -15,84 +17,12 @@ STATUS_WEIGHT = {
 }
 CHANNEL_WEIGHTS = {
     "lexical": 1.00,
+    "vector": 0.95,
     "metadata": 0.90,
     "verifier": 1.00,
     "links_path": 0.85,
 }
 RRF_K = 60
-
-DOMAIN_KEYWORDS = {
-    "auth": {"auth", "login", "logout", "session", "token", "jwt", "oauth", "permission", "role", "access"},
-    "security": {"security", "secret", "credential", "password", "encrypt", "sanitize", "xss", "csrf", "policy"},
-    "database": {"database", "db", "sql", "sqlite", "postgres", "migration", "schema", "store", "storage"},
-    "frontend": {"frontend", "ui", "react", "component", "css", "html", "browser", "viewport", "page"},
-    "backend": {"backend", "api", "server", "endpoint", "route", "handler", "service", "fastapi"},
-    "tests": {"test", "tests", "pytest", "unittest", "verify", "verification", "ci", "coverage"},
-    "docs": {"readme", "doc", "docs", "documentation", "markdown"},
-    "cli": {"cli", "command", "argparse", "terminal", "shell"},
-    "retrieval": {"retrieval", "retrieve", "rag", "memory", "memassist", "query", "rank", "intent"},
-    "deployment": {"deploy", "release", "production", "env", "config", "rollback"},
-}
-
-DOMAIN_PATH_HINTS = {
-    "auth": ["auth", "session", "token"],
-    "security": ["policy", "security"],
-    "database": ["storage", "store", "db", "migration"],
-    "frontend": ["app", "components", "pages", "styles"],
-    "backend": ["api", "server", "routes", "handlers"],
-    "tests": ["test", "tests", "spec"],
-    "docs": ["README", "docs"],
-    "cli": ["cli"],
-    "retrieval": ["retrieval", "memassist"],
-    "deployment": ["deploy", "config"],
-}
-
-TASK_TYPE_KEYWORDS = {
-    "bugfix": {"fix", "bug", "error", "failing", "failure", "broken", "regression", "crash"},
-    "feature": {"implement", "add", "build", "create", "support", "enable", "new"},
-    "refactor": {"refactor", "cleanup", "simplify", "restructure", "rename"},
-    "test": {"test", "tests", "verify", "coverage", "assert", "unittest", "pytest"},
-    "review": {"review", "audit", "inspect", "assess"},
-    "docs": {"doc", "docs", "readme", "documentation", "write"},
-    "debug": {"debug", "trace", "diagnose", "root", "cause", "investigate"},
-    "config": {"config", "setting", "env", "yaml", "toml", "json"},
-}
-
-HIGH_RISK_TERMS = {
-    "auth",
-    "authorization",
-    "authentication",
-    "token",
-    "secret",
-    "credential",
-    "password",
-    "permission",
-    "policy",
-    "security",
-    "migration",
-    "schema",
-    "delete",
-    "drop",
-    "production",
-    "deploy",
-    "payment",
-    "admin",
-}
-MEDIUM_RISK_TERMS = {
-    "api",
-    "database",
-    "db",
-    "storage",
-    "session",
-    "refactor",
-    "integration",
-    "workflow",
-    "hook",
-    "retrieval",
-    "rank",
-}
-VERIFIER_TERMS = {"test", "tests", "verify", "verification", "ci", "coverage", "run", "assert", "failing"}
-CAUTION_TERMS = {"policy", "rule", "block", "warn", "permission", "security", "secret", "auth", "protect"}
 
 
 @dataclass(frozen=True)
@@ -122,12 +52,14 @@ class MemoryPack:
     context: list[Memory]
     verifier: list[Memory]
     intent: QueryIntent | None = None
+    diagnostics: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
             "context": [memory.as_dict() for memory in self.context],
             "verifier": [memory.as_dict() for memory in self.verifier],
             "intent": self.intent.as_dict() if self.intent else None,
+            "diagnostics": self.diagnostics or {},
         }
 
 
@@ -137,10 +69,18 @@ def build_memory_pack(
     query: str,
     project_id: str,
     context_limit: int = 5,
+    embedding_profile_id: str | None = None,
 ) -> MemoryPack:
     intent = analyze_query_intent(query)
     scoped = _active_memories(store, project_id)
-    channels = retrieve_channels(store, query=query, project_id=project_id, intent=intent, scoped=scoped)
+    channels, retrieval_info = retrieve_channels(
+        store,
+        query=query,
+        project_id=project_id,
+        intent=intent,
+        scoped=scoped,
+        embedding_profile_id=embedding_profile_id,
+    )
     candidates = fuse_retrieval_channels(query, intent, channels)
     verifier = _section_memories(candidates, intent, section="verifier", limit=5)
     context = _section_memories(
@@ -149,30 +89,24 @@ def build_memory_pack(
         section="context",
         limit=context_limit,
     )
-    return MemoryPack(context=context, verifier=verifier, intent=intent)
+    return MemoryPack(
+        context=context,
+        verifier=verifier,
+        intent=intent,
+        diagnostics=_retrieval_diagnostics(channels, candidates, retrieval_info),
+    )
 
 
 def analyze_query_intent(query: str) -> QueryIntent:
-    tokens = _tokens(query)
     explicit_paths = _extract_paths(query)
-    task_type = _task_type(tokens)
-    domains = _domains(tokens, explicit_paths)
-    likely_paths = _likely_paths(explicit_paths, domains)
-    risk_level = _risk_level(tokens, domains, likely_paths)
-    needs_caution_context = risk_level in {"medium", "high"} or bool(tokens & CAUTION_TERMS) or any(domain in {"auth", "security"} for domain in domains)
-    needs_verifier = (
-        task_type in {"bugfix", "feature", "refactor", "test", "debug"}
-        or bool(tokens & VERIFIER_TERMS)
-        or risk_level in {"medium", "high"}
-    )
-    retrieval_queries = _retrieval_queries(query, task_type, domains, likely_paths)
+    retrieval_queries = _retrieval_queries(query, explicit_paths)
     return QueryIntent(
-        task_type=task_type,
-        domains=domains,
-        likely_paths=likely_paths,
-        risk_level=risk_level,
-        needs_caution_context=needs_caution_context,
-        needs_verifier=needs_verifier,
+        task_type="general",
+        domains=[],
+        likely_paths=explicit_paths,
+        risk_level="low",
+        needs_caution_context=False,
+        needs_verifier=False,
         retrieval_queries=retrieval_queries,
     )
 
@@ -184,19 +118,25 @@ def retrieve_channels(
     project_id: str,
     intent: QueryIntent | None = None,
     scoped: list[Memory] | None = None,
-) -> dict[str, list[Memory]]:
+    embedding_profile_id: str | None = None,
+) -> tuple[dict[str, list[Memory]], dict[str, object]]:
     intent = intent or analyze_query_intent(query)
     scoped = scoped or _active_memories(store, project_id)
     lexical = _lexical_channel(store, intent, project_id=project_id)
+    vector_result = _vector_channel(store, query, project_id=project_id, embedding_profile_id=embedding_profile_id)
     metadata = _metadata_channel(query, intent, scoped)
     verifier = _verifier_channel(query, intent, scoped)
-    links_path = _links_path_channel(store, query, intent, scoped, seeds=[*lexical[:5], *metadata[:5]])
-    return {
-        "lexical": lexical,
-        "metadata": metadata,
-        "verifier": verifier,
-        "links_path": links_path,
-    }
+    links_path = _links_path_channel(store, query, intent, scoped, seeds=[*lexical[:5], *vector_result.memories[:5], *metadata[:5]])
+    return (
+        {
+            "lexical": lexical,
+            "vector": vector_result.memories,
+            "metadata": metadata,
+            "verifier": verifier,
+            "links_path": links_path,
+        },
+        {"vector": vector_result.diagnostics()},
+    )
 
 
 def fuse_retrieval_channels(
@@ -254,20 +194,31 @@ def _lexical_channel(store: Store, intent: QueryIntent, *, project_id: str) -> l
     return results
 
 
+def _vector_channel(store: Store, query: str, *, project_id: str, embedding_profile_id: str | None = None) -> VectorSearchResult:
+    try:
+        profile = selected_embedding_profile(embedding_profile_id, store=store)
+    except Exception as exc:
+        fallback = EmbeddingProfile(id=embedding_profile_id or "active", provider="none", model="none", dimension=0, normalize=False)
+        return VectorSearchResult([], "profile_error", fallback, error=str(exc))
+    return vector_search(store, query=query, project_id=project_id, profile=profile, limit=15)
+
+
 def _metadata_channel(query: str, intent: QueryIntent, memories: list[Memory]) -> list[Memory]:
     relevant = [
         memory
         for memory in memories
         if _metadata_score(query, intent, memory) > 0
-        or memory.type in {"lesson", "decision", "open_thread"}
     ]
     return sorted(relevant, key=lambda memory: _metadata_score(query, intent, memory), reverse=True)[:20]
 
 
 def _verifier_channel(query: str, intent: QueryIntent, memories: list[Memory]) -> list[Memory]:
-    if not intent.needs_verifier:
-        return []
-    verifier_memories = [memory for memory in memories if _is_verifier_memory(memory)]
+    verifier_memories = [
+        memory
+        for memory in memories
+        if _is_verifier_memory(memory)
+        and (_metadata_score(query, intent, memory) > 0 or _content_score(query, memory) > 0)
+    ]
     return sorted(verifier_memories, key=lambda memory: _section_score(query, intent, memory, "verifier"), reverse=True)[:12]
 
 
@@ -306,8 +257,6 @@ def _section_memories(
     excluded_ids: set[str] | None = None,
 ) -> list[Memory]:
     excluded_ids = excluded_ids or set()
-    if section == "verifier" and not intent.needs_verifier:
-        return []
     section_candidates = [
         memory
         for memory in candidates
@@ -323,22 +272,15 @@ def _belongs_to_section(memory: Memory, section: str) -> bool:
 
 
 def _is_verifier_memory(memory: Memory) -> bool:
-    tags = set(memory.tags)
-    return memory.type == "workflow" or bool(tags & {"test", "tests", "verification", "verify", "ci"})
+    return memory.type == "workflow"
 
 
 def _metadata_score(query: str, intent: QueryIntent, memory: Memory) -> float:
-    memory_terms = _memory_terms(memory)
-    domain_score = sum(1.0 for domain in intent.domains if domain in memory_terms)
-    tag_score = len(set(intent.domains) & set(memory.tags)) * 1.5
     path_score = _path_score(intent, memory) * 2.0
-    query_overlap = len(_tokens(query) & memory_terms) / max(len(_tokens(query)), 1)
-    type_score = 0.0
-    if intent.task_type == "test" and _is_verifier_memory(memory):
-        type_score += 1.0
-    if intent.needs_caution_context and (memory.type == "rule" or memory.caution_level != "none"):
-        type_score += 1.0
-    return domain_score + tag_score + path_score + query_overlap + type_score
+    query_tokens = _tokens(query)
+    metadata_terms = _metadata_terms(memory)
+    metadata_overlap = len(query_tokens & metadata_terms) / max(len(query_tokens), 1)
+    return path_score + metadata_overlap
 
 
 def _section_score(query: str, intent: QueryIntent, memory: Memory, section: str) -> float:
@@ -346,8 +288,6 @@ def _section_score(query: str, intent: QueryIntent, memory: Memory, section: str
     if section == "verifier":
         if memory.type == "workflow":
             base += 1.0
-        if set(memory.tags) & {"verification", "test", "tests", "ci"}:
-            base += 0.8
     else:
         if memory.type in {"directive", "lesson", "decision", "fact", "open_thread", "rule"}:
             base += 0.6
@@ -396,10 +336,8 @@ def _dedupe_by_signature(memories: list[Memory], *, limit: int) -> list[Memory]:
 
 def _memory_score(query: str, memory: Memory) -> float:
     query_tokens = _tokens(query)
-    text_tokens = _tokens(" ".join([memory.content, " ".join(memory.tags), " ".join(memory.paths)]))
-    overlap = len(query_tokens & text_tokens) / max(len(query_tokens), 1)
+    overlap = _content_score(query, memory)
     path_match = 1.0 if any(token in " ".join(memory.paths).lower() for token in query_tokens) else 0.0
-    type_match = 1.0 if memory.type in {"rule", "workflow"} and query_tokens & {"test", "verify", "검증", "policy", "정책"} else 0.0
     status = STATUS_WEIGHT.get(memory.status, 0.0)
     recency = _recency_score(memory.updated_at)
     return (
@@ -408,9 +346,14 @@ def _memory_score(query: str, memory: Memory) -> float:
         + memory.importance * 0.15
         + memory.confidence * 0.15
         + path_match * 0.05
-        + type_match * 0.05
         + recency * 0.05
     )
+
+
+def _content_score(query: str, memory: Memory) -> float:
+    query_tokens = _tokens(query)
+    text_tokens = _tokens(" ".join([memory.content, " ".join(memory.tags), " ".join(memory.paths)]))
+    return len(query_tokens & text_tokens) / max(len(query_tokens), 1)
 
 
 def _recency_score(value: str) -> float:
@@ -428,24 +371,7 @@ def _recency_score(value: str) -> float:
 
 
 def _tokens(text: str) -> set[str]:
-    tokens = set(re.findall(r"[A-Za-z0-9_가-힣]+", text.lower()))
-    aliases = {
-        "리프레시": {"refresh", "리프레쉬"},
-        "리프레쉬": {"refresh", "리프레시"},
-        "refresh": {"리프레시", "리프레쉬"},
-        "토큰": {"token"},
-        "token": {"토큰"},
-        "ttl": {"만료", "시간"},
-        "만료": {"ttl", "expiry", "expires"},
-        "확인": {"confirm", "ask"},
-        "승인": {"approval", "approve"},
-        "변경": {"change", "modify"},
-        "수정": {"change", "edit", "modify"},
-    }
-    expanded = set(tokens)
-    for token in list(tokens):
-        expanded.update(aliases.get(token, set()))
-    return expanded
+    return set(re.findall(r"[A-Za-z0-9_가-힣]+", text.lower()))
 
 
 def _extract_paths(text: str) -> list[str]:
@@ -462,55 +388,7 @@ def _extract_paths(text: str) -> list[str]:
     return paths
 
 
-def _task_type(tokens: set[str]) -> str:
-    if tokens & TASK_TYPE_KEYWORDS["feature"]:
-        return "feature"
-    scores = {
-        task_type: len(tokens & keywords)
-        for task_type, keywords in TASK_TYPE_KEYWORDS.items()
-    }
-    best_type, best_score = max(scores.items(), key=lambda item: (item[1], -list(TASK_TYPE_KEYWORDS).index(item[0])))
-    return best_type if best_score else "general"
-
-
-def _domains(tokens: set[str], explicit_paths: list[str]) -> list[str]:
-    scored: list[tuple[int, str]] = []
-    path_text = " ".join(explicit_paths).lower()
-    for domain, keywords in DOMAIN_KEYWORDS.items():
-        score = len(tokens & keywords)
-        score += sum(1 for hint in DOMAIN_PATH_HINTS.get(domain, []) if hint.lower() in path_text)
-        if score:
-            scored.append((score, domain))
-    return [domain for _score, domain in sorted(scored, key=lambda item: (-item[0], item[1]))]
-
-
-def _likely_paths(explicit_paths: list[str], domains: list[str]) -> list[str]:
-    paths: list[str] = []
-    seen: set[str] = set()
-    for path in explicit_paths:
-        if path not in seen:
-            seen.add(path)
-            paths.append(path)
-    for domain in domains:
-        for hint in DOMAIN_PATH_HINTS.get(domain, []):
-            if hint not in seen:
-                seen.add(hint)
-                paths.append(hint)
-    return paths[:8]
-
-
-def _risk_level(tokens: set[str], domains: list[str], likely_paths: list[str]) -> str:
-    path_text = " ".join(likely_paths).lower()
-    if tokens & HIGH_RISK_TERMS or any(domain in {"auth", "security", "deployment"} for domain in domains):
-        return "high"
-    if tokens & MEDIUM_RISK_TERMS or any(domain in {"database", "backend", "retrieval"} for domain in domains):
-        return "medium"
-    if any(term in path_text for term in {"auth", "policy", "storage", "db", "deploy"}):
-        return "medium"
-    return "low"
-
-
-def _retrieval_queries(query: str, task_type: str, domains: list[str], likely_paths: list[str]) -> list[str]:
+def _retrieval_queries(query: str, explicit_paths: list[str]) -> list[str]:
     queries: list[str] = []
     seen: set[str] = set()
 
@@ -521,24 +399,55 @@ def _retrieval_queries(query: str, task_type: str, domains: list[str], likely_pa
             queries.append(normalized)
 
     add(query)
-    if domains:
-        add(" ".join([task_type, *domains]))
-    if likely_paths:
-        add(" ".join(likely_paths[:4]))
-    for domain in domains[:3]:
-        add(domain)
-    if task_type != "general":
-        add(task_type)
+    for path in explicit_paths:
+        add(path)
     return queries[:6]
 
 
-def _memory_terms(memory: Memory) -> set[str]:
-    return _tokens(" ".join([memory.content, " ".join(memory.tags), " ".join(memory.paths), memory.type]))
+def _metadata_terms(memory: Memory) -> set[str]:
+    return _tokens(
+        " ".join(
+            [
+                memory.type,
+                memory.status,
+                memory.caution_level,
+                " ".join(memory.tags),
+                " ".join(memory.paths),
+            ]
+        )
+    )
 
 
 def _signature(content: str) -> str:
     tokens = sorted(_tokens(content))
     return " ".join(tokens[:16])
+
+
+def _retrieval_diagnostics(
+    channels: dict[str, list[Memory]],
+    candidates: list[Memory],
+    retrieval_info: dict[str, object] | None = None,
+) -> dict[str, object]:
+    channel_ids = {
+        channel: [memory.id for memory in memories]
+        for channel, memories in channels.items()
+    }
+    contributions: dict[str, list[str]] = {}
+    for channel, ids in channel_ids.items():
+        for memory_id in ids:
+            contributions.setdefault(memory_id, []).append(channel)
+    vector_info = (retrieval_info or {}).get("vector")
+    vector_status = vector_info.get("status") if isinstance(vector_info, dict) else None
+    return {
+        "channels": {channel: len(ids) for channel, ids in channel_ids.items()},
+        "vector_enabled": bool(channel_ids.get("vector")),
+        "vector_status": vector_status or ("ok" if channel_ids.get("vector") else "unknown"),
+        "vector": vector_info or {},
+        "contributions": {
+            memory.id: contributions.get(memory.id, [])
+            for memory in candidates
+        },
+    }
 
 
 def render_prompt_context(pack: MemoryPack) -> str:

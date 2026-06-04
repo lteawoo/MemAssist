@@ -11,7 +11,9 @@ from typing import Any
 
 from .memory_artifacts import (
     delete_memory_artifact,
+    find_memory_artifact,
     load_memory_artifacts,
+    memory_content_hash,
     read_memory_artifact_by_id,
     sync_memory_artifact,
 )
@@ -73,6 +75,11 @@ class Store:
               caution_level TEXT NOT NULL,
               source_kind TEXT NOT NULL,
               source_ref TEXT,
+              source_ids_json TEXT NOT NULL DEFAULT '[]',
+              source_quote TEXT,
+              content_hash TEXT,
+              artifact_path TEXT,
+              indexed_at TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               last_used_at TEXT,
@@ -116,9 +123,24 @@ class Store:
               created_at TEXT NOT NULL,
               UNIQUE(source_id, target_id, relation)
             );
+
+            CREATE TABLE IF NOT EXISTS memory_embeddings (
+              memory_id TEXT NOT NULL,
+              content_hash TEXT NOT NULL,
+              profile_id TEXT NOT NULL DEFAULT 'legacy',
+              profile_fingerprint TEXT NOT NULL DEFAULT '',
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              quantization TEXT NOT NULL DEFAULT 'none',
+              dimension INTEGER NOT NULL,
+              embedding_json TEXT NOT NULL,
+              indexed_at TEXT NOT NULL,
+              PRIMARY KEY(memory_id, content_hash, profile_id, profile_fingerprint, provider, model, quantization, dimension)
+            );
             """
         )
         self._ensure_memory_lifecycle_columns()
+        self._ensure_embedding_cache_columns()
         try:
             self.conn.execute(
                 """
@@ -146,10 +168,37 @@ class Store:
             "retrieval_count": "INTEGER NOT NULL DEFAULT 0",
             "utility": "REAL NOT NULL DEFAULT 0.0",
             "half_life_days": "REAL NOT NULL DEFAULT 30.0",
+            "caution_level": "TEXT NOT NULL DEFAULT 'none'",
+            "source_kind": "TEXT NOT NULL DEFAULT 'manual'",
+            "source_ref": "TEXT",
+            "source_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+            "source_quote": "TEXT",
+            "content_hash": "TEXT",
+            "artifact_path": "TEXT",
+            "indexed_at": "TEXT",
         }
         for name, definition in defaults.items():
             if name not in columns:
-                self.conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
+                try:
+                    self.conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc):
+                        raise
+
+    def _ensure_embedding_cache_columns(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(memory_embeddings)").fetchall()}
+        defaults = {
+            "profile_id": "TEXT NOT NULL DEFAULT 'legacy'",
+            "profile_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "quantization": "TEXT NOT NULL DEFAULT 'none'",
+        }
+        for name, definition in defaults.items():
+            if name not in columns:
+                try:
+                    self.conn.execute(f"ALTER TABLE memory_embeddings ADD COLUMN {name} {definition}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc):
+                        raise
 
     def upsert_project(self, project: Project) -> None:
         ts = now_iso()
@@ -189,6 +238,7 @@ class Store:
         source_kind: str = "manual",
         source_ref: str | None = None,
         source_quote: str | None = None,
+        source_ids: list[str] | None = None,
         expires_at: str | None = None,
     ) -> str:
         if scope_type not in {"global", "project", "session"}:
@@ -231,9 +281,13 @@ class Store:
             last_used_at=None,
             expires_at=expires_at,
             superseded_by=None,
+            source_quote=source_quote,
+            source_ids=source_ids or [],
+            content_hash=memory_content_hash(content),
         )
         sync_memory_artifact(self.path.parent, memory, source_quote=source_quote)
         self._upsert_memory_index(memory)
+        self._refresh_embedding_cache(memory)
         self.conn.commit()
         return memory_id
 
@@ -393,6 +447,7 @@ class Store:
             updated = replace(memory, status=status, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
             self._upsert_memory_index(updated)
+            self._refresh_embedding_cache(updated)
             self.conn.commit()
 
     def update_paths(self, memory_id: str, paths: list[str]) -> None:
@@ -401,6 +456,7 @@ class Store:
             updated = replace(memory, paths=paths, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
             self._upsert_memory_index(updated)
+            self._refresh_embedding_cache(updated)
             self.conn.commit()
 
     def update_caution_level(self, memory_id: str, caution_level: str) -> None:
@@ -411,6 +467,7 @@ class Store:
             updated = replace(memory, caution_level=caution_level, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
             self._upsert_memory_index(updated)
+            self._refresh_embedding_cache(updated)
             self.conn.commit()
 
     def supersede(self, old_id: str, new_id: str) -> None:
@@ -419,6 +476,7 @@ class Store:
             updated = replace(memory, status="archived", superseded_by=new_id, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
             self._upsert_memory_index(updated)
+            self._refresh_embedding_cache(updated)
             self.conn.commit()
 
     def delete_memory(self, memory_id: str) -> bool:
@@ -575,19 +633,166 @@ class Store:
         )
         sync_memory_artifact(self.path.parent, updated)
         self._upsert_memory_index(updated)
+        self._refresh_embedding_cache(updated)
         self.conn.commit()
         return updated
 
-    def rebuild_memory_index_from_artifacts(self, *, prune_missing: bool = True) -> list[str]:
+    def rebuild_memory_index_from_artifacts(self, *, prune_missing: bool = True, embedding_profile_id: str | None = None) -> list[str]:
         indexed: list[str] = []
         for memory in load_memory_artifacts(self.path.parent):
             normalized = _with_required_timestamps(memory)
             self._upsert_memory_index(normalized)
+            self._refresh_embedding_cache(normalized, profile_id=embedding_profile_id)
             indexed.append(normalized.id)
         if prune_missing:
             self._prune_memory_index(set(indexed))
         self.conn.commit()
         return indexed
+
+    def upsert_memory_embedding(
+        self,
+        memory: Memory,
+        *,
+        profile: Any,
+        embedding: list[float],
+    ) -> None:
+        if not embedding:
+            return
+        content_hash = memory.content_hash or memory_content_hash(memory.content)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_embeddings (
+              memory_id, content_hash, profile_id, profile_fingerprint, provider, model,
+              quantization, dimension, embedding_json, indexed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory.id,
+                content_hash,
+                profile.id,
+                profile.fingerprint,
+                profile.provider,
+                profile.model,
+                profile.quantization,
+                len(embedding),
+                json.dumps(embedding),
+                now_iso(),
+            ),
+        )
+        self.conn.commit()
+
+    def memory_embedding_rows_for_profile(
+        self,
+        *,
+        project_id: str,
+        profile: Any,
+        dimension: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        rows = self.conn.execute(
+            """
+            SELECT e.*
+            FROM memory_embeddings e
+            JOIN memories m ON m.id = e.memory_id
+            WHERE e.profile_id = ?
+              AND e.profile_fingerprint = ?
+              AND e.provider = ?
+              AND e.model = ?
+              AND e.quantization = ?
+              AND e.dimension = ?
+              AND (m.scope_type = 'global' OR m.project_id = ?)
+              AND m.status = 'active'
+            """,
+            (profile.id, profile.fingerprint, profile.provider, profile.model, profile.quantization, dimension, project_id),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        stale_count = 0
+        for row in rows:
+            memory = self.get_memory(str(row["memory_id"]))
+            if not memory or memory.status != "active":
+                stale_count += 1
+                continue
+            if row["content_hash"] != (memory.content_hash or memory_content_hash(memory.content)):
+                stale_count += 1
+                continue
+            try:
+                embedding = json.loads(row["embedding_json"])
+            except json.JSONDecodeError:
+                stale_count += 1
+                continue
+            if not isinstance(embedding, list):
+                stale_count += 1
+                continue
+            results.append({"memory": memory, "embedding": [float(value) for value in embedding]})
+        return results, {"row_count": len(rows), "stale_count": stale_count}
+
+    def memory_embedding_rows(
+        self,
+        *,
+        project_id: str,
+        provider: str,
+        model: str,
+        dimension: int,
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT e.*
+            FROM memory_embeddings e
+            JOIN memories m ON m.id = e.memory_id
+            WHERE e.provider = ?
+              AND e.model = ?
+              AND e.dimension = ?
+              AND (m.scope_type = 'global' OR m.project_id = ?)
+              AND m.status = 'active'
+            """,
+            (provider, model, dimension, project_id),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            memory = self.get_memory(str(row["memory_id"]))
+            if not memory or memory.status != "active":
+                continue
+            if row["content_hash"] != (memory.content_hash or memory_content_hash(memory.content)):
+                continue
+            try:
+                embedding = json.loads(row["embedding_json"])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(embedding, list):
+                continue
+            results.append({"memory": memory, "embedding": [float(value) for value in embedding]})
+        return results
+
+    def cleanup_embedding_cache(self, *, profile_id: str | None = None) -> int:
+        if profile_id:
+            cursor = self.conn.execute("DELETE FROM memory_embeddings WHERE profile_id = ?", (profile_id,))
+        else:
+            cursor = self.conn.execute("DELETE FROM memory_embeddings")
+        self.conn.commit()
+        return int(cursor.rowcount or 0)
+
+    def embedding_cache_summary(self, *, profile_id: str | None = None) -> dict[str, Any]:
+        if profile_id:
+            rows = self.conn.execute(
+                "SELECT profile_id, embedding_json FROM memory_embeddings WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT profile_id, embedding_json FROM memory_embeddings").fetchall()
+        by_profile: dict[str, int] = {}
+        bytes_by_profile: dict[str, int] = {}
+        for row in rows:
+            key = str(row["profile_id"])
+            by_profile[key] = by_profile.get(key, 0) + 1
+            bytes_by_profile[key] = bytes_by_profile.get(key, 0) + len(str(row["embedding_json"]).encode("utf-8"))
+        return {
+            "row_count": len(rows),
+            "bytes": sum(bytes_by_profile.values()),
+            "profiles": {
+                key: {"row_count": by_profile[key], "bytes": bytes_by_profile.get(key, 0)}
+                for key in sorted(by_profile)
+            },
+        }
 
     def add_lifecycle_event(
         self,
@@ -674,16 +879,20 @@ class Store:
         )
 
     def _upsert_memory_index(self, memory: Memory) -> None:
+        artifact = find_memory_artifact(self.path.parent, memory.id)
+        content_hash = memory.content_hash or memory_content_hash(memory.content)
+        indexed_at = now_iso()
         self.conn.execute(
             """
             INSERT INTO memories (
               id, scope_type, project_id, session_id, type, content, reason,
               tags_json, paths_json, status, importance, confidence,
               strength, recurrence, retrieval_count, utility, half_life_days,
-              caution_level, source_kind, source_ref, created_at, updated_at,
+              caution_level, source_kind, source_ref, source_ids_json, source_quote,
+              content_hash, artifact_path, indexed_at, created_at, updated_at,
               last_used_at, expires_at, superseded_by
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               scope_type = excluded.scope_type,
               project_id = excluded.project_id,
@@ -704,6 +913,11 @@ class Store:
               caution_level = excluded.caution_level,
               source_kind = excluded.source_kind,
               source_ref = excluded.source_ref,
+              source_ids_json = excluded.source_ids_json,
+              source_quote = excluded.source_quote,
+              content_hash = excluded.content_hash,
+              artifact_path = excluded.artifact_path,
+              indexed_at = excluded.indexed_at,
               created_at = excluded.created_at,
               updated_at = excluded.updated_at,
               last_used_at = excluded.last_used_at,
@@ -731,6 +945,11 @@ class Store:
                 memory.caution_level,
                 memory.source_kind,
                 memory.source_ref,
+                json.dumps(memory.source_ids or []),
+                memory.source_quote,
+                content_hash,
+                str(artifact) if artifact else None,
+                indexed_at,
                 memory.created_at,
                 memory.updated_at,
                 memory.last_used_at,
@@ -758,12 +977,26 @@ class Store:
         self.conn.execute(f"DELETE FROM memory_links WHERE source_id IN ({placeholders})", missing)
         self.conn.execute(f"DELETE FROM memory_links WHERE target_id IN ({placeholders})", missing)
         self.conn.execute(f"DELETE FROM memory_fts WHERE memory_id IN ({placeholders})", missing)
+        self.conn.execute(f"DELETE FROM memory_embeddings WHERE memory_id IN ({placeholders})", missing)
         self.conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", missing)
 
     def _delete_memory_index(self, memory_id: str) -> None:
         self.conn.execute("DELETE FROM memory_links WHERE source_id = ? OR target_id = ?", (memory_id, memory_id))
         self.conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))
+        self.conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
         self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+
+    def _refresh_embedding_cache(self, memory: Memory, *, profile_id: str | None = None) -> None:
+        try:
+            from .embedding_profiles import get_embedding_profile
+            from .embeddings import ensure_memory_embedding
+        except ImportError:
+            return
+        try:
+            profile = get_embedding_profile(profile_id, mem_dir=self.path.parent)
+        except Exception:
+            return
+        ensure_memory_embedding(self, memory, profile=profile)
 
     def _with_index_telemetry(self, memory: Memory) -> Memory:
         row = self.conn.execute(
@@ -785,57 +1018,11 @@ class Store:
             last_used_at=row["last_used_at"],
         )
 
-    def _row_to_memory(self, row: sqlite3.Row) -> Memory:
-        return Memory(
-            id=row["id"],
-            scope_type=row["scope_type"],
-            project_id=row["project_id"],
-            session_id=row["session_id"],
-            type=row["type"],
-            content=row["content"],
-            reason=row["reason"],
-            tags=json.loads(row["tags_json"] or "[]"),
-            paths=json.loads(row["paths_json"] or "[]"),
-            status=row["status"],
-            importance=row["importance"],
-            confidence=row["confidence"],
-            strength=row["strength"],
-            recurrence=row["recurrence"],
-            retrieval_count=row["retrieval_count"],
-            utility=row["utility"],
-            half_life_days=row["half_life_days"],
-            caution_level=row["caution_level"],
-            source_kind=row["source_kind"],
-            source_ref=row["source_ref"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            last_used_at=row["last_used_at"],
-            expires_at=row["expires_at"],
-            superseded_by=row["superseded_by"],
-        )
-
-
 def _fts_query(query: str) -> str:
     tokens = re.findall(r"[A-Za-z0-9_가-힣]+", query.lower())
     if not tokens:
         return query
-    aliases = {
-        "리프레시": ["refresh", "리프레쉬"],
-        "리프레쉬": ["refresh", "리프레시"],
-        "refresh": ["리프레시", "리프레쉬"],
-        "토큰": ["token"],
-        "token": ["토큰"],
-        "ttl": ["만료", "시간"],
-        "만료": ["ttl", "expiry", "expires"],
-        "확인": ["confirm", "ask"],
-        "변경": ["change", "modify"],
-        "수정": ["change", "edit", "modify"],
-    }
-    expanded: list[str] = []
-    for token in tokens:
-        expanded.append(token)
-        expanded.extend(aliases.get(token, []))
-    deduped = list(dict.fromkeys(expanded))
+    deduped = list(dict.fromkeys(tokens))
     return " OR ".join(f'"{token}"' for token in deduped[:8])
 
 
@@ -849,9 +1036,7 @@ def _memory_index_text(
     status: str,
     caution_level: str,
 ) -> str:
-    section = "context"
-    if type == "workflow" or set(tags) & {"test", "tests", "verification", "verify", "ci"}:
-        section = "verifier"
+    section = "verifier" if type == "workflow" else "context"
     return " ".join(
         part
         for part in [

@@ -11,6 +11,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from memassist.cli import main
+from memassist.embedding_profiles import (
+    EmbeddingProfile,
+    EmbeddingProfileConfig,
+    embedding_profiles_path,
+    load_embedding_profile_config,
+    save_embedding_profile_config,
+)
+from memassist.embeddings import register_embedding_provider
 from memassist.extraction import extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from memassist.memory_judge import INTERPRETER_ACTIVE_ENV
@@ -18,8 +26,39 @@ from memassist.models import MEMORY_STATUSES, Memory
 from memassist.verification_config import default_verification_config_yaml, load_verification_config
 from memassist.project import detect_project, detect_project_for_init
 from memassist.retrieval import analyze_query_intent, build_memory_pack
+from memassist.source_ledger import load_source_records
 from memassist.storage import Store, now_iso
 from memassist.trace import extract_files
+
+
+class _TestEmbeddingProvider:
+    def __init__(self, profile: EmbeddingProfile) -> None:
+        self.profile = profile
+        self.dimension = profile.dimension or 8
+
+    def embed(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimension
+        for index, token in enumerate(text.lower().split()):
+            vector[index % self.dimension] += float(len(token) or 1)
+        norm = sum(value * value for value in vector) ** 0.5
+        return [round(value / norm, 8) for value in vector] if norm else vector
+
+
+register_embedding_provider("test", _TestEmbeddingProvider)
+
+
+def _write_test_embedding_profiles(mem_dir: Path, *, active: str = "test-local") -> None:
+    save_embedding_profile_config(
+        EmbeddingProfileConfig(
+            active=active,
+            profiles={
+                "none": EmbeddingProfile(id="none", provider="none", model="none", dimension=0, normalize=False),
+                "test-local": EmbeddingProfile(id="test-local", provider="test", model="test-local-v1", dimension=8),
+                "test-alt": EmbeddingProfile(id="test-alt", provider="test", model="test-alt-v1", dimension=8),
+            },
+        ),
+        mem_dir=mem_dir,
+    )
 
 
 @contextmanager
@@ -447,18 +486,23 @@ class MemassistTest(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_query_intent_analyzes_codex_task_deterministically(self) -> None:
+    def test_query_intent_preserves_query_and_extracts_only_explicit_paths(self) -> None:
         intent = analyze_query_intent(
             "Implement auth session fix in src/auth/session.py and run pytest verification"
         )
-        self.assertEqual(intent.task_type, "feature")
-        self.assertIn("auth", intent.domains)
-        self.assertIn("tests", intent.domains)
+        self.assertEqual(intent.task_type, "general")
+        self.assertEqual([], intent.domains)
         self.assertIn("src/auth/session.py", intent.likely_paths)
-        self.assertEqual(intent.risk_level, "high")
-        self.assertTrue(intent.needs_caution_context)
-        self.assertTrue(intent.needs_verifier)
-        self.assertIn("auth", " ".join(intent.retrieval_queries))
+        self.assertEqual(intent.risk_level, "low")
+        self.assertFalse(intent.needs_caution_context)
+        self.assertFalse(intent.needs_verifier)
+        self.assertEqual(
+            [
+                "Implement auth session fix in src/auth/session.py and run pytest verification",
+                "src/auth/session.py",
+            ],
+            intent.retrieval_queries,
+        )
 
     def test_memory_pack_uses_intent_channels_for_sections(self) -> None:
         with isolated_env():
@@ -498,7 +542,7 @@ class MemassistTest(unittest.TestCase):
                     query="Implement rank fusion policy in src/memassist/retrieval.py",
                     project_id=project.id,
                 )
-                self.assertEqual(pack.intent.task_type if pack.intent else None, "feature")
+                self.assertEqual(pack.intent.task_type if pack.intent else None, "general")
                 self.assertTrue(any("retrieval module" in memory.content for memory in pack.context))
                 self.assertTrue(any(memory.caution_level == "block" for memory in pack.context))
                 self.assertTrue(any(memory.type == "workflow" for memory in pack.verifier))
@@ -509,6 +553,7 @@ class MemassistTest(unittest.TestCase):
         with isolated_env():
             main(["init"])
             project = detect_project()
+            _write_test_embedding_profiles(project.root / ".memassist")
             with Store() as store:
                 store.upsert_project(project)
                 store.add_memory(
@@ -761,6 +806,28 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 events = store.trace_events("sess_inject")
             self.assertTrue(any(event["event_type"] == "memory_injected" for event in events))
+
+    def test_hook_uses_payload_cwd_project_home_not_shell_cwd_or_user_home(self) -> None:
+        with isolated_env() as (root, project_dir, home):
+            main(["init"])
+            other = root / "other"
+            other.mkdir()
+            os.chdir(other)
+            payload = {
+                "session_id": "sess_payload_project_home",
+                "cwd": str(project_dir),
+                "toolName": "shell",
+                "toolArgs": {"command": "pwd"},
+            }
+            with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
+
+            project_db = project_dir / ".memassist" / "memassist.db"
+            user_db = home / ".memassist" / "memassist.db"
+            with Store(project_db) as store:
+                events = store.trace_events("sess_payload_project_home")
+            self.assertTrue(any(event["event_type"] == "pre_tool_use" for event in events))
+            self.assertFalse(user_db.exists())
 
     def test_memory_links_related_memories_by_tags_and_content(self) -> None:
         with isolated_env():
@@ -1336,6 +1403,324 @@ class MemassistTest(unittest.TestCase):
             with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", stdout):
                 self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
             self.assertEqual(stdout.getvalue(), "")
+
+    def test_stop_hook_records_project_local_source_ledger_and_links_judged_memory(self) -> None:
+        fixture = {
+            "should_store": True,
+            "memory_content": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해.",
+            "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해.",
+            "memory_type": "preference",
+            "caution_level": "none",
+            "activation": "active",
+            "candidate_paths": ["src/auth/session.py"],
+            "meaning_preserved": True,
+            "contamination_risk": "low",
+            "reason": "Persistent user preference.",
+        }
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = json.dumps(fixture, ensure_ascii=False)
+            try:
+                payload = {
+                    "session_id": "sess_source_ledger",
+                    "cwd": str(project_dir),
+                    "prompt": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해.",
+                }
+                with patch("sys.stdin", StringIO(json.dumps(payload, ensure_ascii=False))), patch("sys.stdout", StringIO()):
+                    self.assertEqual(main(["hook", "stop"]), 0)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+            records = load_source_records(project_dir / ".memassist")
+            self.assertEqual(1, len(records))
+            self.assertEqual("sess_source_ledger", records[0].session_id)
+            self.assertIn("리프레시 토큰", records[0].text)
+
+            with Store() as store:
+                memories = store.list_memories(project_id=detect_project().id, include_global=False, status="active")
+            stored = [memory for memory in memories if "리프레시 토큰" in memory.content]
+            self.assertEqual(1, len(stored))
+            self.assertEqual([records[0].id], stored[0].source_ids)
+            self.assertEqual(fixture["source_quote"], stored[0].source_quote)
+
+    def test_export_import_preserves_source_evidence_fields(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="preference",
+                    content="Keep refresh token changes source-grounded.",
+                    tags=["auth"],
+                    status="active",
+                    source_ref="turn://source",
+                    source_quote="source quote for export",
+                    source_ids=["src_export"],
+                )
+            export_path = project_dir / "memories.json"
+            with patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["memory", "export", str(export_path), "--all"]), 0)
+            payload = json.loads(export_path.read_text(encoding="utf-8"))
+            exported = payload["memories"][0]
+            self.assertEqual("source quote for export", exported["source_quote"])
+            self.assertEqual(["src_export"], exported["source_ids"])
+            self.assertTrue(exported["content_hash"])
+
+            with Store() as store:
+                store.delete_memory(memory_id)
+            with patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["memory", "import", str(export_path), "--activate"]), 0)
+            with Store() as store:
+                imported = store.list_memories(project_id=project.id, include_global=False, status="active")
+            self.assertTrue(any(memory.source_quote == "source quote for export" for memory in imported))
+            self.assertTrue(any(memory.source_ids == ["src_export"] for memory in imported))
+
+    def test_rebuild_updates_content_hash_after_manual_markdown_edit(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Use lexical search first.",
+                    tags=["retrieval"],
+                    status="active",
+                )
+                before = store.get_memory(memory_id)
+            self.assertIsNotNone(before)
+            artifact = project_dir / ".memassist" / "memories" / "active" / f"{memory_id}.md"
+            artifact.write_text(
+                artifact.read_text(encoding="utf-8").replace("Use lexical search first.", "Use hybrid search first."),
+                encoding="utf-8",
+            )
+            with Store() as store:
+                store.rebuild_memory_index_from_artifacts()
+                after = store.get_memory(memory_id)
+            self.assertIsNotNone(after)
+            self.assertEqual("Use hybrid search first.", after.content)  # type: ignore[union-attr]
+            self.assertNotEqual(before.content_hash, after.content_hash)  # type: ignore[union-attr]
+
+    def test_profile_embedding_cache_is_project_local_and_invalidates_on_content_hash(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            _write_test_embedding_profiles(project.root / ".memassist")
+            with Store() as store:
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="lesson",
+                    content="Semantic retrieval should find session timeout memories.",
+                    tags=["retrieval", "session"],
+                    status="active",
+                )
+                memory = store.get_memory(memory_id)
+                self.assertIsNotNone(memory)
+                profile = load_embedding_profile_config(store.path.parent).active_profile
+                rows, stats = store.memory_embedding_rows_for_profile(
+                    project_id=project.id,
+                    profile=profile,
+                    dimension=8,
+                )
+                self.assertEqual(1, len(rows))
+                self.assertEqual(1, stats["row_count"])
+                store.conn.execute(
+                    "UPDATE memory_embeddings SET content_hash = ? WHERE memory_id = ?",
+                    ("stale", memory_id),
+                )
+                store.conn.commit()
+                stale_rows, stale_stats = store.memory_embedding_rows_for_profile(
+                    project_id=project.id,
+                    profile=profile,
+                    dimension=8,
+                )
+                self.assertEqual([], stale_rows)
+                self.assertEqual(1, stale_stats["stale_count"])
+                results = store.search_memories("session timeout", project_id=project.id)
+                self.assertTrue(any(item.id == memory_id for item in results))
+
+    def test_memory_pack_reports_hybrid_retrieval_diagnostics(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            _write_test_embedding_profiles(project.root / ".memassist")
+            with Store() as store:
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Run focused retrieval tests after hybrid search changes.",
+                    tags=["verification", "retrieval"],
+                    status="active",
+                )
+                pack = build_memory_pack(store, query="hybrid retrieval verification", project_id=project.id)
+            payload = pack.as_dict()
+            diagnostics = payload["diagnostics"]
+            self.assertIn("vector", diagnostics["channels"])
+            self.assertTrue(diagnostics["vector_enabled"])
+            self.assertEqual("ok", diagnostics["vector_status"])
+            self.assertEqual("test-local", diagnostics["vector"]["profile_id"])
+            self.assertIn("vector", diagnostics["contributions"][memory_id])
+
+    def test_init_creates_project_local_embedding_profiles_and_ignores_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            parent = root / "parent"
+            project = parent / "plain-project"
+            home.mkdir()
+            parent.mkdir()
+            project.mkdir()
+            (parent / ".memassist").mkdir()
+            _write_test_embedding_profiles(parent / ".memassist", active="test-alt")
+            old_cwd = Path.cwd()
+            old_home = os.environ.get("HOME")
+            old_memassist = os.environ.get("MEMASSIST_HOME")
+            os.environ["HOME"] = str(home)
+            os.environ.pop("MEMASSIST_HOME", None)
+            os.chdir(project)
+            try:
+                self.assertEqual(main(["init"]), 0)
+                local_config = load_embedding_profile_config(project / ".memassist")
+                parent_config = load_embedding_profile_config(parent / ".memassist")
+            finally:
+                os.chdir(old_cwd)
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                if old_memassist is None:
+                    os.environ.pop("MEMASSIST_HOME", None)
+                else:
+                    os.environ["MEMASSIST_HOME"] = old_memassist
+            self.assertEqual("local-default", local_config.active)
+            self.assertEqual("test-alt", parent_config.active)
+            self.assertTrue(embedding_profiles_path(project / ".memassist").exists())
+
+    def test_default_profile_reports_missing_dependency_without_breaking_retrieval(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Hybrid retrieval still uses lexical fallback when local vector dependency is unavailable.",
+                    tags=["retrieval"],
+                    status="active",
+                )
+                with patch.dict("memassist.embeddings._PROVIDER_FACTORIES", {}, clear=True):
+                    pack = build_memory_pack(store, query="lexical fallback vector dependency", project_id=project.id)
+            payload = pack.as_dict()
+            self.assertEqual("missing_dependency", payload["diagnostics"]["vector_status"])
+            self.assertTrue(payload["context"])
+
+    def test_none_profile_reports_disabled_vector_status(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["embedding", "activate", "none"]), 0)
+            with Store() as store:
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Vector disabled diagnostics keep lexical retrieval working.",
+                    tags=["retrieval"],
+                    status="active",
+                )
+                pack = build_memory_pack(store, query="vector disabled diagnostics", project_id=project.id)
+            payload = pack.as_dict()
+            self.assertEqual("disabled", payload["diagnostics"]["vector_status"])
+            self.assertTrue(payload["context"])
+
+    def test_embedding_cli_build_cleanup_and_compare_profiles(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            _write_test_embedding_profiles(project.root / ".memassist")
+            with Store() as store:
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Embedding profile comparison uses active vector diagnostics.",
+                    tags=["embedding", "retrieval"],
+                    status="active",
+                )
+            with patch("sys.stdout", StringIO()) as out:
+                self.assertEqual(main(["embedding", "profiles", "--json"]), 0)
+                self.assertIn("test-local", out.getvalue())
+            with patch("sys.stdout", StringIO()) as out:
+                self.assertEqual(main(["embedding", "build", "--profile", "test-local", "--json"]), 0)
+                payload = json.loads(out.getvalue())
+                self.assertEqual("ok", payload["status"])
+            with Store() as store:
+                self.assertEqual(1, store.embedding_cache_summary(profile_id="test-local")["row_count"])
+            case_file = project.root / "cases.json"
+            case_file.write_text(
+                json.dumps(
+                    {
+                        "cases": [
+                            {
+                                "query": "embedding profile comparison",
+                                "expect": ["profile comparison"],
+                                "forbid": ["hidden approval gate"],
+                                "seed": [],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("sys.stdout", StringIO()) as out:
+                self.assertEqual(main(["eval", "compare", "--case-file", str(case_file), "--profiles", "test-local", "--json"]), 0)
+                compare = json.loads(out.getvalue())
+                self.assertEqual("test-local", compare["profiles"][0]["profile_id"])
+            with patch("sys.stdout", StringIO()) as out:
+                self.assertEqual(main(["embedding", "cleanup", "--profile", "test-local", "--json"]), 0)
+                self.assertEqual(1, json.loads(out.getvalue())["removed"])
+
+    def test_embedding_profile_diagnostics_do_not_create_pretool_policy(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init", "--tools", "codex"]), 0)
+            project = detect_project()
+            _write_test_embedding_profiles(project.root / ".memassist")
+            with Store() as store:
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="directive",
+                    content="Ask before changing src/auth/session.py.",
+                    tags=["auth"],
+                    paths=["src/auth/session.py"],
+                    status="active",
+                )
+            payload = {
+                "session_id": "sess_embedding_profile_pretool",
+                "cwd": str(project_dir),
+                "toolName": "apply_patch",
+                "toolArgs": {"command": "*** Begin Patch\n*** Update File: src/auth/session.py\n@@\n-1\n+2\n*** End Patch"},
+            }
+            with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()) as out:
+                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
+                self.assertEqual("", out.getvalue())
+            config_text = (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8")
+            self.assertNotIn("src/auth/session.py", config_text)
+            with Store() as store:
+                events = store.trace_events("sess_embedding_profile_pretool")
+            self.assertEqual(1, len(events))
+            self.assertEqual("pre_tool_use", events[0]["event_type"])
 
     def test_trace_extracts_apply_patch_files(self) -> None:
         files = extract_files(
