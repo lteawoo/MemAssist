@@ -483,9 +483,6 @@ def _api_policy(query: dict[str, str]) -> dict[str, Any]:
         "path": str(path),
         "exists": path.exists(),
         "policy": {
-            "sensitive_paths": config.sensitive_paths,
-            "protected_paths": config.protected_paths,
-            "dangerous_commands": config.dangerous_commands,
             "verification_commands": config.verification_commands,
         },
         "raw": _redact_value(path.read_text(encoding="utf-8")) if path.exists() else "",

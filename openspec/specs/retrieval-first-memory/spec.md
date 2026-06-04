@@ -51,25 +51,23 @@ memassist SHALL inject relevant memories through the coding tool's prompt-contex
 - **THEN** memassist SHALL NOT decide whether the task is approved
 - **AND** the active coding agent SHALL be responsible for judging the current user instruction against the retrieved memory
 
-### Requirement: memassist SHALL NOT compile memories into autonomous policy
-memassist SHALL NOT mutate `policy.yaml`, `sensitive_paths`, `protected_paths`, dangerous command rules, or pre-tool approval gates from stored memories. Memory status changes SHALL affect retrieval eligibility only.
+### Requirement: memassist SHALL NOT enforce policy at the PreToolUse hook
+memassist SHALL NOT warn, block, or otherwise gate tool execution at the `PreToolUse` hook, whether from stored memories or from manual `policy.yaml` entries. memassist SHALL NOT mutate `policy.yaml` from stored memories. Memory status changes SHALL affect retrieval eligibility only. Retrieved memory is delivered as additional context so the active coding agent can judge the current instruction autonomously.
 
-#### Scenario: Memory activation does not mutate policy
+#### Scenario: Memory activation does not create enforcement
 - **GIVEN** a directive memory has path metadata for `src/auth/refresh-token-policy.ts`
 - **WHEN** the memory is activated
 - **THEN** memassist SHALL mark the memory active for retrieval
-- **AND** memassist SHALL NOT add the path to `sensitive_paths`
-- **AND** memassist SHALL NOT add the path to `protected_paths`
+- **AND** memassist SHALL NOT create any pre-tool warning or blocking behavior for that path
 
 #### Scenario: PreToolUse ignores memory-derived directives
 - **GIVEN** an active directive memory says `앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해`
-- **AND** project `policy.yaml` has no matching manual path policy
 - **WHEN** a `PreToolUse` hook receives a patch targeting `src/auth/refresh-token-policy.ts`
 - **THEN** memassist SHALL NOT warn or block because of that memory
 - **AND** memassist SHALL record the tool event as trace data
 
-#### Scenario: Explicit manual policy remains deterministic
+#### Scenario: PreToolUse does not enforce even manual policy entries
 - **GIVEN** project `policy.yaml` manually includes `protected_paths: ["src/auth/refresh-token-policy.ts"]`
 - **WHEN** a `PreToolUse` hook receives a patch targeting `src/auth/refresh-token-policy.ts`
-- **THEN** memassist SHALL return the manual policy decision
-- **AND** that decision SHALL NOT depend on retrieved memories
+- **THEN** memassist SHALL NOT return any warn or block decision
+- **AND** memassist SHALL record the tool event as trace data only

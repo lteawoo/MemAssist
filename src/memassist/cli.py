@@ -27,7 +27,6 @@ from .memory_eval import (
 )
 from .paths import db_path, memassist_home, project_memassist_home
 from .policy import (
-    PolicyEngine,
     default_policy_yaml,
     load_policy,
 )
@@ -54,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="initialize .memassist in this project")
     init.add_argument("--tools", help="also install tool integrations: codex, claude, opencode, or all")
-    init.add_argument("--mode", choices=["full", "context", "trace", "guard"], default="full")
+    init.add_argument("--mode", choices=["full", "context", "trace"], default="full")
     init.set_defaults(func=cmd_init)
 
     status = sub.add_parser("status", help="show project and storage status")
@@ -154,13 +153,6 @@ def build_parser() -> argparse.ArgumentParser:
     mem_import.add_argument("--json", action="store_true")
     mem_import.set_defaults(func=cmd_memory_import)
 
-    policy = sub.add_parser("policy", help="policy utilities")
-    policy_sub = policy.add_subparsers(required=True)
-    check = policy_sub.add_parser("check", help="check a tool call")
-    check.add_argument("--tool", required=True)
-    check.add_argument("--command")
-    check.add_argument("--path")
-    check.set_defaults(func=cmd_policy_check)
     lesson = sub.add_parser("lesson", help="create lessons from traced sessions")
     lesson_sub = lesson.add_subparsers(required=True)
     lesson_from = lesson_sub.add_parser("from-session", help="create a draft lesson from a session")
@@ -172,7 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     tools_sub = tools.add_subparsers(required=True)
     tools_install = tools_sub.add_parser("install", help="install tool integrations")
     tools_install.add_argument("tools", help="comma-separated tools: codex, claude, opencode, or all")
-    tools_install.add_argument("--mode", choices=["full", "context", "trace", "guard"], default="full")
+    tools_install.add_argument("--mode", choices=["full", "context", "trace"], default="full")
     tools_install.add_argument("--scope", choices=["project", "user"], default="project")
     tools_install.add_argument("--json", action="store_true")
     tools_install.set_defaults(func=cmd_tools_install)
@@ -183,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     tools_uninstall.set_defaults(func=cmd_tools_uninstall)
     tools_repair = tools_sub.add_parser("repair", help="reinstall tool integrations")
     tools_repair.add_argument("tools", help="comma-separated tools: codex, claude, opencode, or all")
-    tools_repair.add_argument("--mode", choices=["full", "context", "trace", "guard"], default="full")
+    tools_repair.add_argument("--mode", choices=["full", "context", "trace"], default="full")
     tools_repair.add_argument("--scope", choices=["project", "user"], default="project")
     tools_repair.add_argument("--json", action="store_true")
     tools_repair.set_defaults(func=cmd_tools_repair)
@@ -522,19 +514,6 @@ def cmd_memory_import(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_policy_check(args: argparse.Namespace) -> int:
-    project = detect_project()
-    engine = PolicyEngine(load_policy(project.root))
-    payload: dict[str, Any] = {}
-    if args.command:
-        payload["command"] = args.command
-    if args.path:
-        payload["path"] = args.path
-    decision = engine.check_pre_tool(tool=args.tool, args=payload)
-    _print_json(decision.as_dict())
-    return 1 if decision.action in {"deny", "block"} else 0
-
-
 def cmd_lesson_from_session(args: argparse.Namespace) -> int:
     project = detect_project()
     with _store() as store:
@@ -651,11 +630,6 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
                 )
             return 0
         if args.hook_event == "pre-tool-use":
-            policy = load_policy(project.root)
-            decision = PolicyEngine(policy).check_pre_tool(
-                tool=tool_name,
-                args=tool_args,
-            )
             record_tool_event(
                 store,
                 session_id=session_id,
@@ -663,11 +637,8 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
                 event_type="pre_tool_use",
                 tool_name=tool_name,
                 payload=tool_args,
-                policy_decision=decision.action,
+                policy_decision=None,
             )
-            output = _codex_pre_tool_use_output(decision.action, decision.reason)
-            if output:
-                print(_json_dumps(output, indent=None))
             return 0
         record_tool_event(
             store,
@@ -959,28 +930,6 @@ def _coerce_tool_args(payload: dict[str, Any]) -> dict[str, Any]:
             return {"command": raw_args}
     if isinstance(raw_args, dict):
         return raw_args
-    return {}
-
-
-def _codex_pre_tool_use_output(action: str, reason: str) -> dict[str, Any]:
-    if action == "deny":
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        }
-    if action == "block":
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": f"{reason}; blocked by autonomous memory policy.",
-            }
-        }
-    if action == "warn":
-        return {"systemMessage": f"memassist warning: {reason}"}
     return {}
 
 

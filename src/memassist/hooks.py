@@ -11,7 +11,6 @@ CODEX_MODE_EVENTS = {
     "full": ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"),
     "context": ("UserPromptSubmit",),
     "trace": ("PostToolUse", "Stop"),
-    "guard": ("PreToolUse",),
 }
 
 
@@ -24,7 +23,7 @@ CODEX_MEMASSIST_HOOKS = {
                     "type": "command",
                     "command": "python3 -m memassist hook pre-tool-use",
                     "timeout": 30,
-                    "statusMessage": "memassist policy check",
+                    "statusMessage": "memassist trace logging",
                 }
             ],
         }

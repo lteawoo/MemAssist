@@ -14,7 +14,7 @@ from memassist.cli import main
 from memassist.extraction import extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from memassist.memory_judge import INTERPRETER_ACTIVE_ENV
-from memassist.policy import PolicyEngine, default_policy_yaml, load_policy
+from memassist.policy import default_policy_yaml, load_policy
 from memassist.project import detect_project, detect_project_for_init
 from memassist.retrieval import analyze_query_intent, build_memory_pack
 from memassist.storage import Store
@@ -93,8 +93,7 @@ class MemassistTest(unittest.TestCase):
             policy_path = project / ".memassist" / "policy.yaml"
             self.assertTrue(policy_path.exists())
             policy_text = policy_path.read_text(encoding="utf-8")
-            self.assertIn("sensitive_paths: []", policy_text)
-            self.assertIn("dangerous_commands: []", policy_text)
+            self.assertIn("verification_commands: []", policy_text)
             self.assertNotIn(".env", policy_text)
             self.assertNotIn("rm -rf", policy_text)
             self.assertTrue((project / ".memassist" / "ignore").exists())
@@ -812,62 +811,6 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("Use pnpm", out.getvalue())
 
-    def test_policy_allows_sensitive_path_and_dangerous_command_without_project_policy(self) -> None:
-        with isolated_env() as (_root, project, _home):
-            (project / ".memassist").mkdir()
-            (project / ".memassist" / "policy.yaml").write_text(default_policy_yaml(), encoding="utf-8")
-            engine = PolicyEngine(load_policy(project))
-            delete = engine.check_pre_tool(tool="shell", args={"command": "rm -rf dist"})
-            self.assertEqual(delete.action, "allow")
-            recursive_delete = engine.check_pre_tool(tool="shell", args={"command": "rm -r dist"})
-            self.assertEqual(recursive_delete.action, "allow")
-            env_write = engine.check_pre_tool(tool="file_write", args={"path": ".env"})
-            self.assertEqual(env_write.action, "allow")
-
-    def test_policy_enforces_explicit_sensitive_path_and_dangerous_command(self) -> None:
-        with isolated_env() as (_root, project, _home):
-            (project / ".memassist").mkdir()
-            (project / ".memassist" / "policy.yaml").write_text(
-                default_policy_yaml()
-                + '\nsensitive_paths:\n  - ".env"\n'
-                + "\ndangerous_commands:\n"
-                + r'  - "\brm\s+-r[f]?\b"'
-                + "\n",
-                encoding="utf-8",
-            )
-            engine = PolicyEngine(load_policy(project))
-            deny = engine.check_pre_tool(tool="shell", args={"command": "rm -rf dist"})
-            self.assertEqual(deny.action, "block")
-            warn = engine.check_pre_tool(tool="file_write", args={"path": ".env"})
-            self.assertEqual(warn.action, "warn")
-
-    def test_policy_partial_file_does_not_restore_removed_defaults(self) -> None:
-        with isolated_env() as (_root, project, _home):
-            (project / ".memassist").mkdir()
-            (project / ".memassist" / "policy.yaml").write_text("protected_paths: []\n", encoding="utf-8")
-            engine = PolicyEngine(load_policy(project))
-            delete = engine.check_pre_tool(tool="shell", args={"command": "rm -rf dist"})
-            self.assertEqual(delete.action, "allow")
-            env_write = engine.check_pre_tool(tool="file_write", args={"path": ".env"})
-            self.assertEqual(env_write.action, "allow")
-
-    def test_policy_detects_protected_path_inside_apply_patch(self) -> None:
-        with isolated_env() as (_root, project, _home):
-            (project / ".memassist").mkdir()
-            (project / ".memassist" / "policy.yaml").write_text(
-                default_policy_yaml()
-                + '\nprotected_paths:\n  - "src/auth/refresh-token-policy.ts"\n',
-                encoding="utf-8",
-            )
-            engine = PolicyEngine(load_policy(project))
-            decision = engine.check_pre_tool(
-                tool="apply_patch",
-                args={
-                    "command": "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n@@\n-true\n+false\n*** End Patch\n"
-                },
-            )
-            self.assertEqual(decision.action, "block")
-
     def test_codex_hook_install_status_uninstall(self) -> None:
         with isolated_env() as (_root, project, _home):
             path = install_codex_hooks(project_root=project, memassist_home=project / ".memassist")
@@ -924,162 +867,6 @@ class MemassistTest(unittest.TestCase):
                 code = main(["hook", "pre-tool-use"])
             self.assertEqual(code, 0)
             self.assertEqual(stdout.getvalue(), "")
-
-    def test_hook_pre_tool_use_maps_block_to_deny(self) -> None:
-        with isolated_env() as (_root, project, _home):
-            main(["init"])
-            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
-                file.write('\nprotected_paths:\n  - "src/auth/refresh-token-policy.ts"\n')
-            payload = {
-                "session_id": "sess_block",
-                "cwd": str(project),
-                "tool_name": "apply_patch",
-                "tool_input": {
-                    "command": "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n@@\n-true\n+false\n*** End Patch\n"
-                },
-            }
-            stdin = StringIO(json.dumps(payload))
-            stdout = StringIO()
-            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
-                code = main(["hook", "pre-tool-use"])
-            self.assertEqual(code, 0)
-            specific = json.loads(stdout.getvalue())["hookSpecificOutput"]
-            self.assertEqual(specific["hookEventName"], "PreToolUse")
-            self.assertEqual(specific["permissionDecision"], "deny")
-            self.assertIn("blocked by autonomous memory policy", specific["permissionDecisionReason"])
-
-    def test_hook_user_approval_does_not_override_manual_protected_path(self) -> None:
-        with isolated_env() as (_root, project, _home):
-            main(["init"])
-            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
-                file.write('\nprotected_paths:\n  - "src/auth/refresh-token-policy.ts"\n')
-            approval_payload = {
-                "session_id": "sess_approved",
-                "cwd": str(project),
-                "prompt": "승인",
-            }
-            with patch("sys.stdin", StringIO(json.dumps(approval_payload))), patch("sys.stdout", StringIO()):
-                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
-
-            tool_payload = {
-                "session_id": "sess_approved",
-                "cwd": str(project),
-                "tool_name": "apply_patch",
-                "tool_input": {
-                    "command": "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n@@\n-30\n+15\n*** End Patch\n"
-                },
-            }
-            stdout = StringIO()
-            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", stdout):
-                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
-            specific = json.loads(stdout.getvalue())["hookSpecificOutput"]
-            self.assertEqual(specific["permissionDecision"], "deny")
-
-            store = Store()
-            try:
-                events = [dict(event) for event in store.trace_events("sess_approved")]
-            finally:
-                store.close()
-            event_types = [event["event_type"] for event in events]
-            self.assertNotIn("approval_granted", event_types)
-            self.assertNotIn("approval_consumed", event_types)
-            self.assertNotIn("directive_interpreted", event_types)
-            # Every prompt is now recorded as a pending source event (no keyword gate);
-            # the approval prompt is not judged here because no Stop hook fires this turn.
-            self.assertNotIn("memory_judged", event_types)
-            pre_tool_events = [event for event in events if event["event_type"] == "pre_tool_use"]
-            self.assertEqual(pre_tool_events[-1]["policy_decision"], "block")
-
-    def test_hook_user_approval_creates_no_single_use_grant(self) -> None:
-        with isolated_env() as (_root, project, _home):
-            main(["init"])
-            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
-                file.write('\nprotected_paths:\n  - "src/auth/refresh-token-policy.ts"\n')
-            approval_payload = {
-                "session_id": "sess_one_use",
-                "cwd": str(project),
-                "prompt": "approve",
-            }
-            with patch("sys.stdin", StringIO(json.dumps(approval_payload))), patch("sys.stdout", StringIO()):
-                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
-            tool_payload = {
-                "session_id": "sess_one_use",
-                "cwd": str(project),
-                "tool_name": "apply_patch",
-                "tool_input": {
-                    "command": "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n@@\n-30\n+15\n*** End Patch\n"
-                },
-            }
-            first_stdout = StringIO()
-            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", first_stdout):
-                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
-            first = json.loads(first_stdout.getvalue())["hookSpecificOutput"]
-            self.assertEqual(first["permissionDecision"], "deny")
-
-            second_stdout = StringIO()
-            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", second_stdout):
-                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
-            specific = json.loads(second_stdout.getvalue())["hookSpecificOutput"]
-            self.assertEqual(specific["permissionDecision"], "deny")
-            self.assertIn("blocked by autonomous memory policy", specific["permissionDecisionReason"])
-
-    def test_hook_user_approval_does_not_override_glob_protected_path_patch_target(self) -> None:
-        with isolated_env() as (_root, project, _home):
-            main(["init"])
-            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
-                file.write('\nprotected_paths:\n  - "src/auth/*.py"\n')
-            approval_payload = {
-                "session_id": "sess_glob_approval",
-                "cwd": str(project),
-                "prompt": "승인",
-            }
-            with patch("sys.stdin", StringIO(json.dumps(approval_payload))), patch("sys.stdout", StringIO()):
-                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
-            tool_payload = {
-                "session_id": "sess_glob_approval",
-                "cwd": str(project),
-                "tool_name": "apply_patch",
-                "tool_input": {
-                    "command": "*** Begin Patch\n*** Update File: src/auth/session.py\n@@\n-True\n+False\n*** End Patch\n"
-                },
-            }
-            stdout = StringIO()
-            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", stdout):
-                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
-            specific = json.loads(stdout.getvalue())["hookSpecificOutput"]
-            self.assertEqual(specific["permissionDecision"], "deny")
-
-            store = Store()
-            try:
-                events = [dict(event) for event in store.trace_events("sess_glob_approval")]
-            finally:
-                store.close()
-            self.assertNotIn("approval_consumed", [event["event_type"] for event in events])
-            pre_tool_events = [event for event in events if event["event_type"] == "pre_tool_use"]
-            self.assertEqual(pre_tool_events[-1]["policy_decision"], "block")
-
-    def test_hook_user_approval_does_not_cross_sessions(self) -> None:
-        with isolated_env() as (_root, project, _home):
-            main(["init"])
-            with open(project / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
-                file.write('\nsensitive_paths:\n  - ".env"\n')
-            approval_payload = {
-                "session_id": "sess_a",
-                "cwd": str(project),
-                "prompt": "proceed",
-            }
-            with patch("sys.stdin", StringIO(json.dumps(approval_payload))), patch("sys.stdout", StringIO()):
-                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
-            tool_payload = {
-                "session_id": "sess_b",
-                "cwd": str(project),
-                "tool_name": "write",
-                "tool_input": {"path": ".env"},
-            }
-            stdout = StringIO()
-            with patch("sys.stdin", StringIO(json.dumps(tool_payload))), patch("sys.stdout", stdout):
-                self.assertEqual(main(["hook", "pre-tool-use"]), 0)
-            self.assertEqual(json.loads(stdout.getvalue())["systemMessage"], "memassist warning: sensitive path: .env")
 
     def test_hook_user_prompt_submit_outputs_additional_context_schema(self) -> None:
         with isolated_env():
@@ -1165,46 +952,6 @@ class MemassistTest(unittest.TestCase):
                 self.assertIn("PASS", out.getvalue())
             finally:
                 store.close()
-
-    def test_verify_treats_block_as_policy_block(self) -> None:
-        with isolated_env() as (_root, project_dir, _home):
-            main(["init"])
-            with open(project_dir / ".memassist" / "policy.yaml", "a", encoding="utf-8") as file:
-                file.write('\nprotected_paths:\n  - "src/auth/refresh-token-policy.ts"\n')
-            project = detect_project()
-            with Store() as store:
-                store.upsert_project(project)
-                store.add_memory(
-                    scope_type="project",
-                    project_id=project.id,
-                    type="workflow",
-                    content="Use npm test after code edits.",
-                    tags=["verification", "test"],
-                )
-                store.add_trace_event(
-                    session_id="sess_block",
-                    project_id=project.id,
-                    event_type="pre_tool_use",
-                    tool_name="apply_patch",
-                    input_json={"command": "*** Update File: src/auth/refresh-token-policy.ts"},
-                    files=["src/auth/refresh-token-policy.ts"],
-                    policy_decision="block",
-                )
-                store.add_trace_event(
-                    session_id="sess_block",
-                    project_id=project.id,
-                    event_type="stop",
-                    input_json={"last_assistant_message": "Edit did not succeed."},
-                )
-
-            out = StringIO()
-            with patch("sys.stdout", out):
-                code = main(["verify", "--session", "sess_block", "--json"])
-            self.assertEqual(code, 0)
-            result = json.loads(out.getvalue())
-            self.assertTrue(result["passed"])
-            self.assertEqual(result["summary"]["denied_events"], 1)
-            self.assertTrue(any("denied by policy" in warning for warning in result["warnings"]))
 
     def test_session_json_outputs_unicode_without_ascii_escape(self) -> None:
         with isolated_env():
@@ -1589,21 +1336,6 @@ class MemassistTest(unittest.TestCase):
                 "src/auth/refresh-token-policy.ts",
                 (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
             )
-
-            policy_out = StringIO()
-            with patch("sys.stdout", policy_out):
-                code = main(
-                    [
-                        "policy",
-                        "check",
-                        "--tool",
-                        "apply_patch",
-                        "--command",
-                        "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n*** End Patch\n",
-                    ]
-                )
-            self.assertEqual(code, 0)
-            self.assertEqual(json.loads(policy_out.getvalue())["action"], "allow")
 
             rag_payload = {
                 "session_id": "sess_direct_policy_rag",
@@ -2265,20 +1997,6 @@ class MemassistTest(unittest.TestCase):
                 memory = store.get_memory(lesson_id)
                 self.assertEqual(memory.status, "draft")  # type: ignore[union-attr]
             self.assertNotIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "policy.yaml").read_text())
-            policy_out = StringIO()
-            with patch("sys.stdout", policy_out):
-                code = main(
-                    [
-                        "policy",
-                        "check",
-                        "--tool",
-                        "apply_patch",
-                        "--command",
-                        "*** Begin Patch\n*** Update File: src/auth/refresh-token-policy.ts\n*** End Patch\n",
-                    ]
-                )
-            self.assertEqual(code, 0)
-            self.assertEqual(json.loads(policy_out.getvalue())["action"], "allow")
 
             eval_out = StringIO()
             with patch("sys.stdout", eval_out):

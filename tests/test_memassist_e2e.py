@@ -145,7 +145,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
             with Store() as store:
                 events = store.trace_events("sess_e2e")
             self.assertTrue(any(event["event_type"] == "memory_judged" for event in events))
-            self.assertTrue(any(event["event_type"] == "pre_tool_use" and event["policy_decision"] == "allow" for event in events))
+            self.assertTrue(any(event["event_type"] == "pre_tool_use" for event in events))
 
     @unittest.skipUnless(os.environ.get("MEMASSIST_RUN_REAL_CODEX_E2E") == "1", "real Codex CLI E2E is opt-in")
     def test_real_codex_cli_mode_reports_hook_lifecycle(self) -> None:

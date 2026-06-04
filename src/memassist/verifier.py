@@ -47,23 +47,9 @@ def verify_session(
     if requires_tests and not summary.test_commands and not summary.denied_events:
         issues.append("Verification workflow is configured but no test command was recorded.")
 
-    protected_hits = [
-        file
-        for file in summary.files
-        if any(_matches(file, protected) for protected in policy.protected_paths)
-    ]
-    if protected_hits:
-        warnings.append("Protected path touched: " + ", ".join(sorted(set(protected_hits))))
-
     return VerificationResult(
         passed=not issues,
         issues=issues,
         warnings=warnings,
         summary=summary.as_dict(),
     )
-
-
-def _matches(path: str, pattern: str) -> bool:
-    if pattern.endswith("/**"):
-        return path.startswith(pattern[:-3])
-    return path == pattern

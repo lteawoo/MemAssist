@@ -56,10 +56,9 @@ memassist init --tools all
 
 | Mode | 동작 |
 | --- | --- |
-| `full` | 메모리 context 주입, memory-derived 정책 guard, trace 기록, lifecycle 처리를 모두 사용합니다. |
+| `full` | 메모리 context 주입, trace 기록, lifecycle 처리를 모두 사용합니다. |
 | `context` | 다음 prompt에 관련 메모리만 주입합니다. |
 | `trace` | 세션과 도구 사용 trace만 기록합니다. |
-| `guard` | 도구 실행 전 활성화된 프로젝트 정책 검사만 수행합니다. |
 
 ```bash
 memassist init --tools codex --mode full
@@ -141,7 +140,7 @@ sequenceDiagram
     M-->>M: isolated memory judge 실행 가능 시 판단
     M-->>A: 관련 memory context 반환
     A->>M: PreToolUse
-    M-->>A: 정책 판단 반환
+    M-->>M: 도구 사용 trace 저장
     A->>M: PostToolUse
     M-->>M: 도구 사용 trace 저장
     A->>M: Stop
@@ -149,7 +148,13 @@ sequenceDiagram
 ```
 
 이 구조 덕분에 Codex, Claude Code, OpenCode integration이 서로 달라도 내부의
-메모리 추출, 정책 판단, retrieval 로직은 같은 데이터 모델을 사용합니다.
+메모리 추출, retrieval 로직은 같은 데이터 모델을 사용합니다.
+
+PreToolUse hook은 trace 기록만 수행합니다. 사용자가 "리프레시 토큰 변경은 승인받고
+진행해" 같은 지시를 내리면, memassist는 이를 memory로 저장합니다. 다음에 관련 작업이
+요청될 때 저장된 memory가 context로 주입되고, **agent가 그 context를 읽고 스스로
+멈추거나 승인을 요청하는 자율 판단**으로 처리됩니다. memassist는 PreToolUse에서
+기계적으로 차단하거나 경고하지 않습니다.
 
 ## 메모리 라이프사이클
 
@@ -239,22 +244,13 @@ flowchart TD
     H --> I[Relevant memassist memory로 주입]
 ```
 
-기본 정책 파일은 `.memassist/policy.yaml`입니다. 새 프로젝트에는 활성화된 경고나
-차단 규칙을 넣지 않습니다. `memassist`는 `.env`, key 파일, shell 명령 같은 항목을
-보편 규칙으로 강제하지 않습니다. PreToolUse의 경고/차단은 사용자가 직접 작성한
-프로젝트 정책 파일에 한정됩니다. memory는 `policy.yaml`로 자동 컴파일되지 않습니다.
+기본 정책 파일은 `.memassist/policy.yaml`입니다. 이 파일은 `verification_commands`
+(테스트 실행 reminder)만 보관합니다. `memassist`는 PreToolUse에서 경고나 차단을
+수행하지 않습니다. 사용자 지시는 memory retrieval을 통해 agent context에 주입되며,
+집행은 agent의 자율 판단에 맡겨집니다.
 
 ```yaml
-sensitive_paths: []
-protected_paths: []
-dangerous_commands: []
 verification_commands: []
-```
-
-명시적으로 설정한 프로젝트 정책은 수동으로도 확인할 수 있습니다.
-
-```bash
-memassist policy check --tool apply_patch --path src/auth/session.py
 ```
 
 memory를 명시적으로 활성화해도 정책 파일은 변경되지 않습니다. 활성화는 retrieval 대상에
@@ -312,7 +308,7 @@ flowchart TD
 | --- | --- |
 | `lexical` | 요청 문장과 memory 본문이 직접 맞는지 검색합니다. |
 | `metadata` | tag, path, type, status 같은 구조화 정보를 사용합니다. |
-| `policy` | 보호, 주의, 차단, 보안 관련 memory를 우선 탐색합니다. |
+| `policy` | 규칙, 주의사항, 보안 관련 memory를 우선 탐색합니다. |
 | `verifier` | 테스트 명령, 검증 방식, 재현 절차를 찾습니다. |
 | `links_path` | 같은 파일, 같은 tag, 관련 memory link를 따라 확장합니다. |
 
@@ -336,7 +332,7 @@ flowchart LR
 | 섹션 | 역할 |
 | --- | --- |
 | `context` | 프로젝트 사실, 결정, 선호, 일반 lesson을 담습니다. |
-| `policy` | 조심해야 할 규칙, 주의 reminder, 차단 정책을 담습니다. |
+| `policy` | 조심해야 할 규칙, 주의 reminder를 담습니다. agent context로 주입되어 자율 판단에 활용됩니다. |
 | `verifier` | 실행해야 할 테스트, 검증 명령, 확인 절차를 담습니다. |
 
 직접 확인하려면 다음 명령을 사용합니다.
