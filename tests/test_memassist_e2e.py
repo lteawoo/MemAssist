@@ -172,6 +172,84 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                 "real Codex CLI command completed, but no memassist hook lifecycle events were captured",
             )
 
+    @unittest.skipUnless(os.environ.get("MEMASSIST_RUN_REAL_CODEX_E2E") == "1", "real Codex CLI E2E is opt-in")
+    def test_real_codex_mixed_prompt_stores_no_transient_response_text(self) -> None:
+        """Tasks 3.1/3.2: real Codex CLI E2E over a mixed durable+transient Korean
+        prompt. Evaluation metric: 0 one-shot response-format phrases in the stored
+        or retrieved durable memory for the target prompt set.
+        """
+        if not shutil.which("codex"):
+            self.skipTest("codex executable not found")
+        transient = "응답은 OK만 해"
+        mixed_prompt = "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해."
+        with temp_project() as (_root, project):
+            self.assertEqual(main(["init", "--tools", "codex", "--mode", "full"]), 0)
+            result = subprocess.run(
+                [
+                    "codex",
+                    "exec",
+                    "--cd",
+                    str(project),
+                    "--dangerously-bypass-hook-trust",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    mixed_prompt,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+            # Turn-end judging happens on Stop, which the real Codex session fires.
+            with Store() as store:
+                project_memories = store.list_memories(
+                    project_id=None, include_global=False, status=None
+                )
+                judged = [
+                    memory
+                    for memory in project_memories
+                    if memory.source_kind == "isolated_memory_judge"
+                ]
+
+            # The real judge must have stored a durable directive from the mixed prompt;
+            # an empty set means ingestion (task 3.1) did not happen.
+            self.assertTrue(
+                judged,
+                "real Codex judge stored no durable memory for the mixed directive prompt",
+            )
+            # Metric (task 3.2): 0 transient response-format phrases in stored content.
+            for memory in judged:
+                self.assertNotIn(
+                    transient,
+                    memory.content,
+                    "transient response-format text leaked into stored durable memory content",
+                )
+
+            # The transient phrase must not be retrievable as durable memory, and a
+            # relevant follow-up prompt must not inject it as context.
+            judged_project_id = judged[0].project_id
+            with Store() as store:
+                transient_hits = store.search_memories(transient, project_id=judged_project_id)
+            self.assertFalse(
+                any(memory.source_kind == "isolated_memory_judge" for memory in transient_hits),
+                "transient response-format text is retrievable as durable memory",
+            )
+
+            rag_payload = {
+                "session_id": "sess_real_mixed_e2e",
+                "cwd": str(project),
+                "prompt": "리프레시 토큰 15분으로 변경해줘",
+            }
+            rag_out = StringIO()
+            with patch("sys.stdin", StringIO(json.dumps(rag_payload))), patch("sys.stdout", rag_out):
+                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            self.assertNotIn(
+                transient,
+                rag_out.getvalue(),
+                "transient response-format text leaked into injected RAG context",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
