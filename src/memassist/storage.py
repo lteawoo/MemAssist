@@ -340,7 +340,7 @@ class Store:
         project_id: str | None,
         limit: int = 10,
     ) -> list[Memory]:
-        active_statuses = ("active", "auto_active", "long_term", "durable", "warn_policy", "block_policy", "pinned")
+        active_statuses = ("active", "auto_active", "long_term", "durable", "pinned")
         scope_clause = "(m.scope_type = 'global' OR m.project_id = ?)"
         params: list[Any] = [_fts_query(query), project_id, *active_statuses]
         try:
@@ -351,11 +351,9 @@ class Store:
                 JOIN memories m ON m.id = memory_fts.memory_id
                 WHERE memory_fts MATCH ?
                   AND {scope_clause}
-                  AND m.status IN (?, ?, ?, ?, ?, ?, ?)
+                  AND m.status IN (?, ?, ?, ?, ?)
                 ORDER BY
                   CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'block_policy' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'warn_policy' THEN 1 ELSE 0 END DESC,
                   CASE m.status WHEN 'durable' THEN 1 ELSE 0 END DESC,
                   CASE m.status WHEN 'long_term' THEN 1 ELSE 0 END DESC,
                   text_score ASC,
@@ -375,11 +373,9 @@ class Store:
                 FROM memories m
                 WHERE (m.content LIKE ? OR m.tags_json LIKE ?)
                   AND {scope_clause}
-                  AND m.status IN (?, ?, ?, ?, ?, ?, ?)
+                  AND m.status IN (?, ?, ?, ?, ?)
                 ORDER BY
                   CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'block_policy' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'warn_policy' THEN 1 ELSE 0 END DESC,
                   CASE m.status WHEN 'durable' THEN 1 ELSE 0 END DESC,
                   CASE m.status WHEN 'long_term' THEN 1 ELSE 0 END DESC,
                   m.strength DESC,
@@ -743,7 +739,23 @@ def _fts_query(query: str) -> str:
     tokens = re.findall(r"[A-Za-z0-9_가-힣]+", query.lower())
     if not tokens:
         return query
-    deduped = list(dict.fromkeys(tokens))
+    aliases = {
+        "리프레시": ["refresh", "리프레쉬"],
+        "리프레쉬": ["refresh", "리프레시"],
+        "refresh": ["리프레시", "리프레쉬"],
+        "토큰": ["token"],
+        "token": ["토큰"],
+        "ttl": ["만료", "시간"],
+        "만료": ["ttl", "expiry", "expires"],
+        "확인": ["confirm", "ask"],
+        "변경": ["change", "modify"],
+        "수정": ["change", "edit", "modify"],
+    }
+    expanded: list[str] = []
+    for token in tokens:
+        expanded.append(token)
+        expanded.extend(aliases.get(token, []))
+    deduped = list(dict.fromkeys(expanded))
     return " OR ".join(f'"{token}"' for token in deduped[:8])
 
 
@@ -758,9 +770,7 @@ def _memory_index_text(
     enforcement: str,
 ) -> str:
     section = "context"
-    if type == "rule" or enforcement in {"warn", "block"}:
-        section = "policy"
-    elif type == "workflow" or set(tags) & {"test", "tests", "verification", "verify", "ci"}:
+    if type == "workflow" or set(tags) & {"test", "tests", "verification", "verify", "ci"}:
         section = "verifier"
     return " ".join(
         part
@@ -772,16 +782,15 @@ def _memory_index_text(
             f"enforcement {enforcement}",
             "tags " + " ".join(tags) if tags else "",
             "paths " + " ".join(paths) if paths else "",
-            "reason " + reason if reason else "",
         ]
         if part
     )
 
 
 def _default_half_life_days(type: str, status: str, enforcement: str) -> float:
-    if status in {"pinned", "block_policy"} or enforcement == "block":
+    if status == "pinned":
         return 3650.0
-    if status in {"durable", "long_term", "warn_policy"}:
+    if status in {"durable", "long_term"}:
         return 180.0
     if type == "workflow":
         return 120.0

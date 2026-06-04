@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from memassist.hooks import _python_hook_command
+from memassist.paths import project_memassist_home
 from memassist.project import Project
 
 from .base import MODE_EVENTS, InstallResult, IntegrationStatus, ToolMode, lifecycle_capabilities
@@ -15,7 +16,10 @@ class OpenCodeIntegration:
     def install(self, project: Project, *, mode: ToolMode, scope: str) -> InstallResult:
         path = _plugin_path(project, scope)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_plugin_source(mode), encoding="utf-8")
+        path.write_text(
+            _plugin_source(mode, memassist_home=project_memassist_home(project.root) if scope == "project" else None),
+            encoding="utf-8",
+        )
         return InstallResult(
             tool=self.name,
             action="install",
@@ -60,10 +64,10 @@ def _plugin_path(project: Project, scope: str) -> Path:
     raise ValueError(f"invalid integration scope: {scope}")
 
 
-def _plugin_source(mode: ToolMode) -> str:
+def _plugin_source(mode: ToolMode, *, memassist_home: Path | None = None) -> str:
     events = set(MODE_EVENTS[mode])
     command_by_event = {
-        event: _python_hook_command(hook_event)
+        event: _python_hook_command(hook_event, memassist_home=memassist_home)
         for event, hook_event in {
             "UserPromptSubmit": "user-prompt-submit",
             "PreToolUse": "pre-tool-use",

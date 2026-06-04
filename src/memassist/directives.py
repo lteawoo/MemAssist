@@ -9,7 +9,6 @@ from typing import Any
 
 from .interpreter import DEFAULT_CONFIDENCE_THRESHOLD, DRAFT_CONFIDENCE_THRESHOLD, DirectiveCandidate, interpret_directive
 from .models import Memory
-from .policy import append_protected_path, append_sensitive_path
 from .project import Project
 from .storage import Store
 
@@ -82,7 +81,7 @@ def handle_direct_user_instruction(
             reason="Interpreter did not find a confident direct memory directive.",
         )
         return DirectiveResult("none", [], [], [], None)
-    content = candidate.original_prompt.strip() or candidate.normalized_prompt.strip()
+    content = candidate.normalized_prompt.strip() or candidate.original_prompt.strip()
     enforcement = candidate.memory_enforcement
 
     existing = store.find_memory(
@@ -94,17 +93,13 @@ def handle_direct_user_instruction(
             "draft",
             "auto_active",
             "active",
-            "warn_policy",
-            "block_policy",
             "pinned",
             "long_term",
             "durable",
         ),
     )
     if existing:
-        if enforcement == "none" and existing.status in {"active", "warn_policy", "block_policy", "pinned", "long_term", "durable"}:
-            return DirectiveResult("directive_already_recorded", [existing.id], [], [], None)
-        if enforcement != "none" and existing.status in {"warn_policy", "block_policy"}:
+        if enforcement == "none" and existing.status in {"active", "pinned", "long_term", "durable"}:
             return DirectiveResult("directive_already_recorded", [existing.id], [], [], None)
         if enforcement != "none" and existing.enforcement != enforcement:
             store.update_enforcement(existing.id, enforcement)
@@ -119,7 +114,7 @@ def handle_direct_user_instruction(
             candidate=candidate,
         )
         _record_directive_lifecycle(store, project_id=project_id, memory=existing, decision=decision)
-        message = "Direct memassist directive was recorded." if applied else "Direct memassist directive was recorded without a policy path."
+        message = "Direct memassist directive was remembered."
         return DirectiveResult("directive_recorded", [existing.id], [], policy_events, message)
 
     if candidate.confidence < DEFAULT_CONFIDENCE_THRESHOLD or enforcement == "none":
@@ -147,7 +142,7 @@ def handle_direct_user_instruction(
             candidate=memory.as_dict() if memory else candidate.as_dict(),
             decision="directive_candidate",
             risk="medium",
-            reason="Directive interpretation did not meet immediate policy compilation threshold.",
+            reason="Directive interpretation was stored for retrieval without policy compilation.",
         )
         return DirectiveResult("directive_recorded", [memory_id], [], [], "Direct memassist directive was remembered as a candidate.")
 
@@ -170,18 +165,6 @@ def handle_direct_user_instruction(
     memory = store.get_memory(memory_id)
     if not memory:
         return DirectiveResult("none", [], [], [], None)
-    if enforcement == "none":
-        store.add_lifecycle_event(
-            session_id=session_id,
-            project_id=project_id,
-            memory_id=memory_id,
-            candidate=memory.as_dict(),
-            decision="user_directive_active",
-            risk="low",
-            reason="User directly instructed memassist to remember this low-risk directive.",
-        )
-        return DirectiveResult("directive_recorded", [memory_id], [], [], "Direct memassist directive was remembered.")
-
     applied, policy_events, decision = _apply_directive_memory(
         store,
         project_root=project.root,
@@ -190,7 +173,7 @@ def handle_direct_user_instruction(
         candidate=candidate,
     )
     _record_directive_lifecycle(store, project_id=project_id, memory=memory, decision=decision)
-    message = "Direct memassist directive was recorded." if applied else "Direct memassist directive was recorded without a policy path."
+    message = "Direct memassist directive was remembered."
     return DirectiveResult("directive_recorded", [memory_id], [], policy_events, message)
 
 
@@ -202,20 +185,10 @@ def _apply_directive_memory(
     memory: Memory,
     candidate: DirectiveCandidate | None = None,
 ) -> tuple[bool, list[dict[str, object]], str]:
-    if memory.enforcement in {"warn", "block"}:
-        protected_path = _infer_protected_path(store, memory, project_root, candidate=candidate)
-        if protected_path:
-            changed = (
-                append_protected_path(project_root, protected_path)
-                if memory.enforcement == "block"
-                else append_sensitive_path(project_root, protected_path)
-            )
-            store.update_paths(memory.id, list(dict.fromkeys([*memory.paths, protected_path])))
-            policy_status = "block_policy" if memory.enforcement == "block" else "warn_policy"
-            store.update_status(memory.id, policy_status)
-            return True, [_policy_event(memory.enforcement, protected_path, changed)], f"directive_{policy_status}"
-        store.update_status(memory.id, "active")
-        return False, [], "directive_active_no_path"
+    if memory.enforcement in {"warn", "block"} and candidate:
+        inferred_path = _infer_protected_path(store, memory, project_root, candidate=candidate)
+        if inferred_path:
+            store.update_paths(memory.id, list(dict.fromkeys([*memory.paths, inferred_path])))
     store.update_status(memory.id, "active")
     return True, [], "directive_active"
 
@@ -233,8 +206,8 @@ def _record_directive_lifecycle(
         memory_id=memory.id,
         candidate=memory.as_dict(),
         decision=decision,
-        risk="high" if memory.enforcement != "none" else "medium",
-        reason="User directly supplied this memory directive.",
+        risk="medium",
+        reason="User directly supplied this memory directive for retrieval context.",
     )
 
 
@@ -253,15 +226,6 @@ def _record_interpreter_trace(
         input_json=result,
         files=[],
     )
-
-
-def _policy_event(enforcement: str, path: str, changed: bool) -> dict[str, object]:
-    return {
-        "path": path,
-        "action": enforcement,
-        "changed": changed,
-        "reason": f"Direct directive mapped {path} to {enforcement} policy.",
-    }
 
 
 def _infer_protected_path(

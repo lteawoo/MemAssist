@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
+from memassist.paths import project_memassist_home
 from memassist.project import Project
 
 from .base import InstallResult, IntegrationStatus, ToolMode, lifecycle_capabilities
@@ -12,7 +13,8 @@ class CodexIntegration:
     name = "codex"
 
     def install(self, project: Project, *, mode: ToolMode, scope: str) -> InstallResult:
-        path = install_codex_hooks(scope=scope, project_root=project.root, mode=mode)
+        local_home = project_memassist_home(project.root) if scope == "project" else None
+        path = install_codex_hooks(scope=scope, project_root=project.root, mode=mode, memassist_home=local_home)
         return InstallResult(
             tool=self.name,
             action="install",

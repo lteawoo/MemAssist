@@ -74,8 +74,6 @@ def process_session_lifecycle(
                 "draft",
                 "auto_active",
                 "active",
-                "warn_policy",
-                "block_policy",
                 "pinned",
                 "ephemeral",
                 "long_term",
@@ -222,8 +220,8 @@ def cleanup_memories(store: Store) -> CleanupResult:
          AND old.type = new.type
          AND lower(old.content) = lower(new.content)
          AND old.id != new.id
-        WHERE old.status IN ('active', 'auto_active', 'long_term', 'durable', 'warn_policy', 'block_policy')
-          AND new.status IN ('active', 'auto_active', 'long_term', 'durable', 'warn_policy', 'block_policy')
+        WHERE old.status IN ('active', 'auto_active', 'long_term', 'durable')
+          AND new.status IN ('active', 'auto_active', 'long_term', 'durable')
           AND old.updated_at < new.updated_at
         """
     ).fetchall()

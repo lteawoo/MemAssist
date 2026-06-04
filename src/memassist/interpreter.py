@@ -156,6 +156,9 @@ class CodexDirectiveInterpreter(ToolDirectiveInterpreter):
             "Fields: is_directive boolean, intent string, subject string, enforcement one of "
             "none/remember/warn/block, scope_terms string array, candidate_paths string array, "
             "confidence number 0..1, rationale string, normalized_prompt string. "
+            "Write normalized_prompt as only the durable future memory in the user's source language when possible. "
+            "Exclude one-shot current-turn response formatting or execution instructions unless the user explicitly "
+            "asks to remember that behavior for future turns. "
             "Do not include markdown. User prompt: "
             + json.dumps(prompt, ensure_ascii=False)
         )

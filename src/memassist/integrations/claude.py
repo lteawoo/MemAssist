@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from memassist.hooks import _is_memassist_group, _python_hook_command
+from memassist.paths import project_memassist_home
 from memassist.project import Project
 
 from .base import MODE_EVENTS, InstallResult, IntegrationStatus, ToolMode, lifecycle_capabilities
@@ -27,7 +28,7 @@ class ClaudeIntegration:
         for event in MODE_EVENTS[mode]:
             existing = hooks.setdefault(event, [])
             existing[:] = [group for group in existing if not _is_memassist_group(group)]
-            existing.append(_group(event))
+            existing.append(_group(event, memassist_home=project_memassist_home(project.root) if scope == "project" else None))
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         return InstallResult(
             tool=self.name,
@@ -89,13 +90,13 @@ def _read_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _group(event: str) -> dict[str, object]:
+def _group(event: str, *, memassist_home: Path | None = None) -> dict[str, object]:
     hook_event = CLAUDE_EVENT_TO_HOOK[event]
     group: dict[str, object] = {
         "hooks": [
             {
                 "type": "command",
-                "command": _python_hook_command(hook_event),
+                "command": _python_hook_command(hook_event, memassist_home=memassist_home),
                 "timeout": 30,
             }
         ]

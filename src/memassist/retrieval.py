@@ -9,11 +9,9 @@ from .models import Memory
 from .storage import Store
 
 
-ACTIVE_STATUSES = {"active", "auto_active", "long_term", "durable", "warn_policy", "block_policy", "pinned"}
+ACTIVE_STATUSES = {"active", "auto_active", "long_term", "durable", "pinned"}
 STATUS_WEIGHT = {
     "pinned": 1.0,
-    "block_policy": 0.98,
-    "warn_policy": 0.92,
     "durable": 0.90,
     "long_term": 0.85,
     "auto_active": 0.70,
@@ -22,7 +20,6 @@ STATUS_WEIGHT = {
 CHANNEL_WEIGHTS = {
     "lexical": 1.00,
     "metadata": 0.90,
-    "policy": 1.10,
     "verifier": 1.00,
     "links_path": 0.85,
 }
@@ -151,16 +148,14 @@ def build_memory_pack(
     scoped = _active_memories(store, project_id)
     channels = retrieve_channels(store, query=query, project_id=project_id, intent=intent, scoped=scoped)
     candidates = fuse_retrieval_channels(query, intent, channels)
-    policy = _section_memories(candidates, intent, section="policy", limit=5)
     verifier = _section_memories(candidates, intent, section="verifier", limit=5)
     context = _section_memories(
         candidates,
         intent,
         section="context",
         limit=context_limit,
-        excluded_ids={memory.id for memory in policy if memory.type not in {"lesson", "decision"}},
     )
-    return MemoryPack(context=context, policy=policy, verifier=verifier, intent=intent)
+    return MemoryPack(context=context, policy=[], verifier=verifier, intent=intent)
 
 
 def analyze_query_intent(query: str) -> QueryIntent:
@@ -200,13 +195,11 @@ def retrieve_channels(
     scoped = scoped or _active_memories(store, project_id)
     lexical = _lexical_channel(store, intent, project_id=project_id)
     metadata = _metadata_channel(query, intent, scoped)
-    policy = _policy_channel(query, intent, scoped)
     verifier = _verifier_channel(query, intent, scoped)
     links_path = _links_path_channel(store, query, intent, scoped, seeds=[*lexical[:5], *metadata[:5]])
     return {
         "lexical": lexical,
         "metadata": metadata,
-        "policy": policy,
         "verifier": verifier,
         "links_path": links_path,
     }
@@ -293,17 +286,6 @@ def _metadata_channel(query: str, intent: QueryIntent, memories: list[Memory]) -
     return sorted(relevant, key=lambda memory: _metadata_score(query, intent, memory), reverse=True)[:20]
 
 
-def _policy_channel(query: str, intent: QueryIntent, memories: list[Memory]) -> list[Memory]:
-    if not intent.needs_policy:
-        return []
-    policy_memories = [
-        memory
-        for memory in memories
-        if memory.type == "rule" or memory.enforcement in {"warn", "block"} or memory.status in {"warn_policy", "block_policy"}
-    ]
-    return sorted(policy_memories, key=lambda memory: _section_score(query, intent, memory, "policy"), reverse=True)[:12]
-
-
 def _verifier_channel(query: str, intent: QueryIntent, memories: list[Memory]) -> list[Memory]:
     if not intent.needs_verifier:
         return []
@@ -346,8 +328,6 @@ def _section_memories(
     excluded_ids: set[str] | None = None,
 ) -> list[Memory]:
     excluded_ids = excluded_ids or set()
-    if section == "policy" and not intent.needs_policy:
-        return []
     if section == "verifier" and not intent.needs_verifier:
         return []
     section_candidates = [
@@ -359,11 +339,9 @@ def _section_memories(
 
 
 def _belongs_to_section(memory: Memory, section: str) -> bool:
-    if section == "policy":
-        return memory.type == "rule" or memory.enforcement in {"warn", "block"} or memory.status in {"warn_policy", "block_policy"}
     if section == "verifier":
         return _is_verifier_memory(memory)
-    return memory.type != "rule" or memory.enforcement == "none" or memory.type in {"lesson", "decision", "open_thread"}
+    return True
 
 
 def _is_verifier_memory(memory: Memory) -> bool:
@@ -387,20 +365,13 @@ def _metadata_score(query: str, intent: QueryIntent, memory: Memory) -> float:
 
 def _section_score(query: str, intent: QueryIntent, memory: Memory, section: str) -> float:
     base = _intent_memory_score(query, intent, memory)
-    if section == "policy":
-        if memory.enforcement == "block":
-            base += 1.5
-        elif memory.enforcement == "warn":
-            base += 0.8
-        if memory.type == "rule":
-            base += 0.8
-    elif section == "verifier":
+    if section == "verifier":
         if memory.type == "workflow":
             base += 1.0
         if set(memory.tags) & {"verification", "test", "tests", "ci"}:
             base += 0.8
     else:
-        if memory.type in {"lesson", "decision", "fact", "open_thread"}:
+        if memory.type in {"directive", "lesson", "decision", "fact", "open_thread", "rule"}:
             base += 0.6
     return base
 
@@ -479,7 +450,24 @@ def _recency_score(value: str) -> float:
 
 
 def _tokens(text: str) -> set[str]:
-    return set(re.findall(r"[A-Za-z0-9_가-힣]+", text.lower()))
+    tokens = set(re.findall(r"[A-Za-z0-9_가-힣]+", text.lower()))
+    aliases = {
+        "리프레시": {"refresh", "리프레쉬"},
+        "리프레쉬": {"refresh", "리프레시"},
+        "refresh": {"리프레시", "리프레쉬"},
+        "토큰": {"token"},
+        "token": {"토큰"},
+        "ttl": {"만료", "시간"},
+        "만료": {"ttl", "expiry", "expires"},
+        "확인": {"confirm", "ask"},
+        "승인": {"approval", "approve"},
+        "변경": {"change", "modify"},
+        "수정": {"change", "edit", "modify"},
+    }
+    expanded = set(tokens)
+    for token in list(tokens):
+        expanded.update(aliases.get(token, set()))
+    return expanded
 
 
 def _extract_paths(text: str) -> list[str]:
@@ -581,10 +569,6 @@ def render_prompt_context(pack: MemoryPack) -> str:
         lines.append("Relevant memassist memory:")
         for memory in pack.context:
             lines.append(f"- [{memory.type}] {memory.content}")
-    if pack.policy:
-        lines.append("Policy reminders:")
-        for memory in pack.policy[:3]:
-            lines.append(f"- [{memory.enforcement}] {memory.content}")
     if pack.verifier:
         lines.append("Verification reminders:")
         for memory in pack.verifier[:3]:

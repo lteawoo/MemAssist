@@ -43,8 +43,6 @@ SECRET_VALUE_RE = re.compile(
 )
 GUI_STATUS_WEIGHTS = {
     "pinned": 1.0,
-    "block_policy": 0.98,
-    "warn_policy": 0.92,
     "durable": 0.90,
     "long_term": 0.85,
     "auto_active": 0.70,
@@ -411,8 +409,6 @@ def _api_memories(query: dict[str, str]) -> dict[str, Any]:
             {where}
             ORDER BY
               CASE status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-              CASE status WHEN 'block_policy' THEN 1 ELSE 0 END DESC,
-              CASE status WHEN 'warn_policy' THEN 1 ELSE 0 END DESC,
               CASE status WHEN 'durable' THEN 1 ELSE 0 END DESC,
               importance DESC,
               updated_at DESC

@@ -315,7 +315,7 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                 content="Blocked memory policy for locked files.",
                 tags=["policy"],
                 paths=["src/locked.py"],
-                status="block_policy",
+                status="active",
                 enforcement="block",
             )
             store.add_trace_event(

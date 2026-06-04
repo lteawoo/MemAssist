@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .approvals import apply_session_approval, grant_approval_from_prompt
 from .doctor import run_doctor
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
@@ -27,17 +26,13 @@ from .memory_eval import (
     evaluate_memory_quality,
     load_memory_quality_cases,
 )
-from .paths import db_path, memassist_home
+from .paths import db_path, memassist_home, project_memassist_home
 from .policy import (
     PolicyEngine,
-    append_protected_path,
-    append_sensitive_path,
     default_policy_yaml,
     load_policy,
-    remove_protected_path,
-    remove_sensitive_path,
 )
-from .project import detect_project
+from .project import detect_project, detect_project_for_init
 from .rag_eval import RagCase, RagExpectation, evaluate_rag, load_rag_cases
 from .retrieval import build_memory_pack, render_prompt_context
 from .retrieval_eval import RetrievalCase, evaluate_retrieval, load_cases
@@ -167,11 +162,6 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--command")
     check.add_argument("--path")
     check.set_defaults(func=cmd_policy_check)
-    promote = policy_sub.add_parser("promote", help="promote a memory into project policy")
-    promote.add_argument("memory_id")
-    promote.add_argument("--protected-path", required=True)
-    promote.set_defaults(func=cmd_policy_promote)
-
     lesson = sub.add_parser("lesson", help="create lessons from traced sessions")
     lesson_sub = lesson.add_subparsers(required=True)
     lesson_from = lesson_sub.add_parser("from-session", help="create a draft lesson from a session")
@@ -266,8 +256,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    project = detect_project()
-    mem_dir = project.root / ".memassist"
+    project = detect_project_for_init()
+    mem_dir = project_memassist_home(project.root)
     mem_dir.mkdir(exist_ok=True)
     policy_path = mem_dir / "policy.yaml"
     if not policy_path.exists():
@@ -275,7 +265,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     ignore_path = mem_dir / "ignore"
     if not ignore_path.exists():
         ignore_path.write_text("# Add paths memassist should not record.\n", encoding="utf-8")
-    with _store() as store:
+    with Store(mem_dir / "memassist.db") as store:
         store.upsert_project(project)
     print(f"Initialized memassist for {project.id}")
     print(f"Project config: {policy_path}")
@@ -430,23 +420,13 @@ def cmd_memory_supersede(args: argparse.Namespace) -> int:
 
 
 def cmd_memory_rollback(args: argparse.Namespace) -> int:
-    project = detect_project()
-    removed = False
     with _store() as store:
         memory = store.get_memory(args.id)
         if not memory:
             print(f"Memory not found: {args.id}")
             return 1
-        path = args.protected_path or (memory.paths[0] if memory.paths else None)
-        if path:
-            if memory.enforcement == "warn" or memory.status == "warn_policy":
-                removed = remove_sensitive_path(project.root, path)
-            else:
-                removed = remove_protected_path(project.root, path)
         store.update_status(args.id, "rejected")
     print(f"rolled back {args.id}")
-    if args.protected_path or removed:
-        print(("removed" if removed else "not present") + f" policy path: {args.protected_path or path}")
     return 0
 
 
@@ -476,24 +456,12 @@ def cmd_memory_drafts(args: argparse.Namespace) -> int:
 
 
 def cmd_memory_activate(args: argparse.Namespace) -> int:
-    project = detect_project()
     with _store() as store:
         memory = store.get_memory(args.id)
         if not memory:
             print(f"Memory not found: {args.id}")
             return 1
         store.update_status(args.id, "active")
-        if memory.enforcement in {"warn", "block"} and memory.paths:
-            path = memory.paths[0]
-            changed = (
-                append_protected_path(project.root, path)
-                if memory.enforcement == "block"
-                else append_sensitive_path(project.root, path)
-            )
-            store.update_status(args.id, "block_policy" if memory.enforcement == "block" else "warn_policy")
-            print(f"activated {args.id}")
-            print(("added" if changed else "already present") + f" policy path: {path}")
-            return 0
     print(f"activated {args.id}")
     return 0
 
@@ -566,22 +534,6 @@ def cmd_policy_check(args: argparse.Namespace) -> int:
     decision = engine.check_pre_tool(tool=args.tool, args=payload)
     _print_json(decision.as_dict())
     return 1 if decision.action in {"deny", "block"} else 0
-
-
-def cmd_policy_promote(args: argparse.Namespace) -> int:
-    project = detect_project()
-    with _store() as store:
-        memory = store.get_memory(args.memory_id)
-        if not memory:
-            print(f"Memory not found: {args.memory_id}")
-            return 1
-        changed = append_protected_path(project.root, args.protected_path)
-        paths = list(dict.fromkeys([*memory.paths, args.protected_path]))
-        store.update_paths(args.memory_id, paths)
-        store.update_enforcement(args.memory_id, "block")
-        store.update_status(args.memory_id, "block_policy")
-    print(("added" if changed else "already present") + f" protected path: {args.protected_path}")
-    return 0
 
 
 def cmd_lesson_from_session(args: argparse.Namespace) -> int:
@@ -669,28 +621,20 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
         store.upsert_project(project)
         if args.hook_event == "user-prompt-submit":
             query = str(payload.get("prompt") or payload.get("message") or payload.get("content") or "")
-            approval_grant = grant_approval_from_prompt(
+            source_event = None
+            source_event = observe_memory_intent(
                 store,
                 session_id=session_id,
                 project_id=project.id,
                 prompt=query,
-                policy=load_policy(project.root),
             )
-            source_event = None
-            if approval_grant is None:
-                source_event = observe_memory_intent(
+            if source_event and source_event.immediate:
+                process_memory_intent_event(
                     store,
+                    project=project,
                     session_id=session_id,
-                    project_id=project.id,
-                    prompt=query,
+                    source_event_id=source_event.event_id,
                 )
-                if source_event and source_event.immediate:
-                    process_memory_intent_event(
-                        store,
-                        project=project,
-                        session_id=session_id,
-                        source_event_id=source_event.event_id,
-                    )
             pack = build_memory_pack(store, query=query, project_id=project.id)
             _record_memory_injection(store, session_id=session_id, project_id=project.id, query=query, pack=pack)
             context = render_prompt_context(pack)
@@ -718,15 +662,6 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
             decision = PolicyEngine(policy).check_pre_tool(
                 tool=tool_name,
                 args=tool_args,
-            )
-            decision = apply_session_approval(
-                store,
-                session_id=session_id,
-                project_id=project.id,
-                policy=policy,
-                tool=tool_name,
-                args=tool_args,
-                decision=decision,
             )
             record_tool_event(
                 store,

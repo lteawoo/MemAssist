@@ -12,8 +12,10 @@
 
 > 같은 프로젝트 설명, 같은 테스트 명령, 같은 주의사항을 매번 다시 말하지 않게 한다.
 
-`memassist`는 로컬 우선 도구입니다. 기본 데이터는 `~/.memassist` 아래에 저장되고,
-프로젝트별 설정은 프로젝트 루트의 `.memassist/`에 저장됩니다.
+`memassist`는 로컬 우선 도구입니다. 프로젝트에서 `memassist init`을 실행하면
+프로젝트 루트의 `.memassist/` 하나에 정책, ignore 파일, SQLite DB, trace와 memory가
+함께 저장됩니다. `~/.memassist`는 아직 초기화하지 않은 경로나 명시적인 전역 사용을 위한
+fallback/global home입니다.
 
 > 현재 상태: 초기 로컬 도구입니다. CLI와 저장 구조는 사용할 수 있지만, 위험도가 높은
 > 프로젝트에서는 생성된 메모리와 정책 변경을 직접 확인한 뒤 신뢰하는 것이 좋습니다.
@@ -38,6 +40,9 @@ PYTHONPATH=src python3 -m memassist status
 memassist init
 memassist status
 ```
+
+git repository가 아닌 임시 폴더에서도 `memassist init`은 현재 폴더를 프로젝트로
+초기화합니다. 상위 폴더나 사용자 홈의 `.memassist`를 프로젝트로 오인하지 않습니다.
 
 AI 코딩 도구와 연결하려면 integration을 함께 설치합니다.
 
@@ -78,6 +83,8 @@ memassist doctor --json
 
 Codex는 hook 신뢰 설정이 필요합니다. Codex integration을 설치하거나 변경한 뒤에는
 Codex CLI에서 `/hooks`를 열고 프로젝트 `.codex` layer와 hook 정의를 신뢰해야 합니다.
+프로젝트 scope로 설치된 hook은 `MEMASSIST_HOME=<project>/.memassist`를 고정해서,
+hook 실행 중에도 같은 프로젝트 DB와 정책 파일을 사용합니다.
 
 ## 설치하면 무엇이 자동으로 되나요?
 
@@ -89,9 +96,9 @@ Codex CLI에서 `/hooks`를 열고 프로젝트 `.codex` layer와 hook 정의를
 - 낮은 위험의 workflow, preference, 검증 습관은 자동 활성화합니다.
 - 반복적으로 확인된 좋은 기억은 장기 메모리로 승격합니다.
 - 보안, 인증, 삭제, 보호 경로처럼 위험한 내용은 더 보수적으로 다룹니다.
-- 사용자가 일반 대화 속에서 직접 지시한 보호 규칙은 source event로 남긴 뒤, 분리된 memory judge가 후보로 판단합니다.
+- 사용자가 일반 대화 속에서 직접 남긴 지시는 source event로 남긴 뒤, 분리된 memory judge가 기억할 가치와 의미 보존 여부를 판단합니다.
 - `init` 때 연결한 도구가 지원하면 별도 judge 실행으로 다국어, 오탈자, 완곡 표현도 구조화된 memory 후보로 만들 수 있습니다.
-- 다음 요청에는 관련 기억을 `context`, `policy`, `verifier`로 나눠 주입합니다.
+- 다음 요청에는 관련 기억을 `Relevant memassist memory`와 검증 reminder로 주입합니다.
 
 중요한 원칙이 있습니다.
 
@@ -99,10 +106,9 @@ Codex CLI에서 `/hooks`를 열고 프로젝트 `.codex` layer와 hook 정의를
 
 예를 들어 “앞으로 refresh token 정책을 바꿀 때는 먼저 물어봐” 또는 “리프레쉬 토큰
 쪽은 담부터 고치기 전에 꼭 나한테 먼저 말해줘”처럼 사용자가 직접 말한 내용도
-`UserPromptSubmit` 단계에서 바로 차단 정책으로 컴파일하지 않습니다. 먼저 사용자 원문을
-source event로 저장하고, 분리된 judge가 의미 보존 여부와 정책 위험도를 판단해 후보로
-남깁니다. 실제 `warn` 또는 `block` 정책 파일 변경은 사용자가 해당 memory를 명시적으로
-활성화할 때만 이루어집니다.
+`UserPromptSubmit` 단계에서 차단 정책으로 컴파일하지 않습니다. 사용자 원문 언어를 보존해
+memory로 저장하고, 다음 관련 요청에서 RAG context로 찾아와 현재 agent가 판단하도록
+합니다.
 
 ## memassist의 작동 흐름
 
@@ -158,9 +164,7 @@ stateDiagram-v2
     observed --> ephemeral: 세션 증거로만 유용
     observed --> rejected: 신호가 약함
 
-    candidate --> active: 자동 기준 충족
-    candidate --> warn_policy: 주의 정책으로 승격
-    candidate --> block_policy: 차단 정책으로 승격
+    candidate --> active: 활성화
     auto_active --> long_term: 반복 관찰되어 강화
     active --> durable: 반복 사용되어 장기화
     long_term --> durable: 반복 사용되어 장기화
@@ -181,8 +185,6 @@ stateDiagram-v2
 | `auto_active` | 위험도가 낮아 자동으로 활성화된 기억입니다. |
 | `active` | 현재 유효한 활성 기억입니다. |
 | `durable` | 반복 관찰되거나 자주 쓰여 장기 기억으로 강화된 상태입니다. |
-| `warn_policy` | 작업을 막지 않고 주의 reminder로 주입되는 정책 기억입니다. |
-| `block_policy` | 명백히 위험하거나 사용자가 강하게 금지한 동작을 차단하는 정책 기억입니다. |
 | `ephemeral` | 장기 규칙이 아니라 세션 증거로만 보관되는 기억입니다. |
 | `rejected` | 자동 기준에 맞지 않아 사용하지 않는 기억입니다. |
 | `stale` / `expired` | 오래되었거나 만료되어 retrieval에서 멀어지는 기억입니다. |
@@ -197,23 +199,25 @@ memassist memory candidates --session latest --json
 memassist memory list --all
 ```
 
-## 정책화는 어떻게 이루어지나요?
+## RAG 주입은 어떻게 이루어지나요?
 
-정책은 일반 기억보다 강한 효과를 갖습니다. 예를 들어 사용자가 직접 남긴 기억이나
-명시적인 프로젝트 설정에 따라 특정 파일 수정을 주의 reminder로 노출하거나 차단할 수
-있습니다.
+`memassist`의 기본 역할은 정책 강제가 아니라 기억의 적재와 탐색입니다. 사용자가 평소처럼
+AI 코딩 도구에 요청하면 `UserPromptSubmit` hook에서 현재 프롬프트를 query로 삼아 관련
+memory를 찾고, 결과를 `additionalContext`로 주입합니다.
 
-그래서 `memassist`는 정책화를 세 단계로 나눕니다.
+기억 적재와 RAG 주입은 다음 흐름으로 동작합니다.
 
-- `UserPromptSubmit`은 사용자의 메모리 의도를 source event로 남기고, 기존 context retrieval은 그대로 수행합니다.
-- 분리된 memory judge가 사용자 source event만 보고 `should_store`, `memory_content`, `source_quote`, `enforcement`, `candidate_paths`, `policy_compile` 같은 구조화 결과를 만듭니다.
-- `warn` 또는 `block` 성격의 결과는 후보로 남고, 사용자가 `memassist memory activate <memory-id>`로 명시적으로 활성화할 때만 프로젝트 정책에 컴파일됩니다.
+- `UserPromptSubmit`은 사용자의 메모리 의도를 source event로 남기고, 관련 memory retrieval을 수행합니다.
+- 분리된 memory judge가 사용자 source event만 보고 `should_store`, `source_quote`, `memory_content`, `candidate_paths`, `meaning_preserved` 같은 구조화 결과를 만듭니다.
+- 저장되는 primary memory content는 `memory_content`입니다. judge는 가능한 한 사용자의 원문 언어로, 오래 유지될 기억만 분리해 씁니다.
+- 원문 전체는 `source_quote`로 lifecycle metadata에 보존합니다. 예를 들어 “앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.”라면 앞 문장만 retrieval 대상 memory가 되고, `응답은 OK만 해`는 현재 턴 지시로 남습니다.
+- 관련 memory는 `Relevant memassist memory` context로 주입됩니다. `memassist`는 이 기억을 자동 정책으로 컴파일하거나 tool 실행을 강제 차단하지 않습니다.
 
 judge는 `memassist init --tools ...`에서 설치한 도구를 backend로 사용할 수 있습니다. 예를
 들어 Codex integration을 설치한 프로젝트에서는 Codex adapter가 가능하면 별도 `codex exec`
 프로세스로 구조화된 judge JSON을 만듭니다. hook 재귀를 막기 위해 judge 실행에는 guard
-환경 변수를 설정합니다. adapter를 사용할 수 없거나 JSON이 유효하지 않으면 durable memory나
-정책을 쓰지 않고 trace diagnostic만 남깁니다.
+환경 변수를 설정합니다. adapter를 사용할 수 없거나 JSON이 유효하지 않으면 durable memory를
+쓰지 않고 trace diagnostic만 남깁니다.
 
 judge payload는 컨텍스트 오염을 줄이기 위해 제한됩니다. 포함되는 것은 사용자 source event,
 프로젝트 파일 힌트, 기존 memory conflict의 식별자와 상태 같은 최소 정보입니다. assistant
@@ -226,19 +230,16 @@ flowchart TD
     B --> C[isolated memory judge]
     C --> D{저장할 가치가 있는가?}
     D -->|아니오| E[trace diagnostic only]
-    D -->|예| F{정책 컴파일 성격인가?}
-    F -->|아니오, 낮은 위험| G[active 또는 auto_active memory]
-    F -->|예| H[candidate memory]
-    H --> I{사용자가 명시적으로 activate 했는가?}
-    I -->|예, warn| J[sensitive_paths 정책 추가]
-    I -->|예, block| K[protected_paths 정책 추가]
-    I -->|아니오| L[후보 유지]
+    D -->|예| F[source-language memory 저장]
+    F --> G[retrieval metadata 갱신]
+    G --> H[다음 UserPromptSubmit에서 관련 memory 탐색]
+    H --> I[Relevant memassist memory로 주입]
 ```
 
 기본 정책 파일은 `.memassist/policy.yaml`입니다. 새 프로젝트에는 활성화된 경고나
 차단 규칙을 넣지 않습니다. `memassist`는 `.env`, key 파일, shell 명령 같은 항목을
-보편 규칙으로 강제하지 않고, 사용자가 직접 기억시킨 정책이나 프로젝트가 명시적으로
-설정한 정책만 실행 전에 검사합니다.
+보편 규칙으로 강제하지 않습니다. PreToolUse의 경고/차단은 사용자가 직접 작성한
+프로젝트 정책 파일에 한정됩니다. memory는 `policy.yaml`로 자동 컴파일되지 않습니다.
 
 ```yaml
 sensitive_paths: []
@@ -247,26 +248,15 @@ dangerous_commands: []
 verification_commands: []
 ```
 
-명시적으로 설정되거나 memory에서 승격된 정책은 수동으로도 확인할 수 있습니다.
+명시적으로 설정한 프로젝트 정책은 수동으로도 확인할 수 있습니다.
 
 ```bash
 memassist policy check --tool apply_patch --path src/auth/session.py
 ```
 
-검토한 memory를 명시적으로 활성화하면 judge 결과에 담긴 enforcement와 path를 기준으로
-주의 또는 보호 경로 정책이 컴파일됩니다.
-
-```bash
-memassist memory activate <memory-id>
-```
-
-수동으로 특정 경로 정책을 추가하고 싶을 때는 promote 명령도 사용할 수 있습니다.
-
-```bash
-memassist policy promote <memory-id> --protected-path src/auth/session.py
-```
-
-judge가 만든 memory나 활성화한 정책 memory를 되돌리려면 rollback을 사용합니다.
+memory를 명시적으로 활성화해도 정책 파일은 변경되지 않습니다. 활성화는 retrieval 대상에
+포함할지를 바꾸는 memory lifecycle 동작입니다. judge가 만든 memory를 되돌리려면 rollback을
+사용합니다.
 
 ```bash
 memassist memory rollback <memory-id>
@@ -378,10 +368,8 @@ flowchart TD
     E -->|예| F[auto_active]
     E -->|아니오| G[ephemeral 또는 candidate]
     D -->|예| H{사용자의 명시 지시인가?}
-    H -->|예| I[isolated judge candidate]
-    I --> J{명시적으로 activate 되었는가?}
-    J -->|예| K[warn_policy 또는 block_policy]
-    J -->|아니오| L[candidate 유지]
+    H -->|예| I[source-language memory]
+    I --> J[retrieval metadata 포함]
     H -->|아니오| M[candidate 또는 reminder]
 ```
 
@@ -419,7 +407,7 @@ retrieval 평가는 다음 지표를 봅니다.
 - `mrr`: 첫 번째 정답이 얼마나 빨리 나오는지
 - `forbidden_recall_rate`: 나오면 안 되는 기억이 검색되는 비율
 
-memory 품질 평가는 잘못된 승격과 오래된 기억을 함께 봅니다.
+memory 품질 평가는 잘못된 장기화와 오래된 기억을 함께 봅니다.
 
 ```bash
 memassist eval memory \
@@ -509,11 +497,12 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 
 ## 저장 위치와 개인정보
 
-- 기본 데이터베이스는 `~/.memassist` 아래에 저장됩니다.
-- 프로젝트 설정은 프로젝트 루트의 `.memassist/`에 저장됩니다.
+- 프로젝트 초기화 후 기본 데이터베이스는 프로젝트 루트의 `.memassist/memassist.db`에 저장됩니다.
+- 프로젝트 정책과 ignore 파일도 같은 `.memassist/`에 저장됩니다.
 - memory와 trace는 기본적으로 로컬에 남습니다.
 - 민감 파일이나 생성물은 `.memassist/ignore`에 추가해 trace-derived memory 후보에서 제외할 수 있습니다.
 - 프로젝트 memory는 SQLite 데이터베이스를 공유하지 않고 export/import할 수 있습니다.
+- `~/.memassist`는 초기화되지 않은 경로나 명시적인 global/user home 용도로만 사용됩니다.
 
 ```bash
 memassist memory export
@@ -525,7 +514,7 @@ import된 memory는 기본적으로 draft입니다. 필요하면 `memassist memo
 ## 현재 한계
 
 - 이 프로젝트는 아직 초기 로컬 도구입니다.
-- 추론된 memory와 정책 후보는 고위험 프로젝트에서 반드시 검토해야 합니다.
+- 추론된 memory는 고위험 프로젝트에서 반드시 검토해야 합니다.
 - 현재 retrieval은 로컬 deterministic RAG에 가깝고, 외부 embedding 서비스나 네트워크 의존성은 없습니다.
 - Codex CLI 버전과 실행 모드에 따라 project lifecycle hook 동작이 다를 수 있습니다. 특히 `codex exec`는 interactive Codex CLI와 hook 실행 범위가 다를 수 있으므로, `memassist tools status --json`의 capability와 interactive CLI 기반 E2E를 함께 확인하는 것이 안전합니다.
 

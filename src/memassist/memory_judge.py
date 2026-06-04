@@ -17,10 +17,12 @@ from .project import Project
 from .storage import Store
 
 JUDGE_ACTIVE_ENV = "MEMASSIST_MEMORY_JUDGE_ACTIVE"
+JUDGE_DEBUG_ENV = "MEMASSIST_MEMORY_JUDGE_DEBUG"
 JUDGE_FIXTURE_ENV = "MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"
 JUDGE_TIMEOUT_ENV = "MEMASSIST_MEMORY_JUDGE_TIMEOUT"
 MAX_SOURCE_CHARS = 600
 MAX_HINTS = 8
+MAX_DEBUG_CHARS = 4000
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,6 @@ class MemoryJudgeCandidate:
     enforcement: str
     activation: str
     candidate_paths: list[str]
-    policy_compile: bool
     meaning_preserved: bool
     contamination_risk: str
     reason: str
@@ -52,7 +53,6 @@ class MemoryJudgeCandidate:
             "enforcement": self.enforcement,
             "activation": self.activation,
             "candidate_paths": self.candidate_paths,
-            "policy_compile": self.policy_compile,
             "meaning_preserved": self.meaning_preserved,
             "contamination_risk": self.contamination_risk,
             "reason": self.reason,
@@ -254,21 +254,36 @@ class CodexMemoryJudge:
         env = os.environ.copy()
         env[JUDGE_ACTIVE_ENV] = "1"
         env[INTERPRETER_ACTIVE_ENV] = "1"
-        timeout = float(os.environ.get(JUDGE_TIMEOUT_ENV, "8"))
+        timeout = float(os.environ.get(JUDGE_TIMEOUT_ENV, "30"))
         instruction = (
             "You are an isolated memory judge. Return only one compact JSON object with fields: "
             "should_store boolean, memory_content string, source_quote string, memory_type one of "
             "fact/preference/rule/decision/lesson/workflow/open_thread/directive, enforcement one of "
             "none/warn/block, activation one of candidate/active/auto_active/rejected, "
-            "candidate_paths string array, policy_compile boolean, meaning_preserved boolean, "
+            "candidate_paths string array, meaning_preserved boolean, "
             "contamination_risk one of low/medium/high, reason string. "
             "Use only source_event and project_hints. Do not infer from assistant responses or retrieved memory. "
+            "Write memory_content as only the durable future memory in the user's source language when possible. "
+            "Do not include one-shot current-turn instructions, output formatting requests, or commands like "
+            "'respond only OK' in memory_content unless the user explicitly asks to remember that response format "
+            "for future turns. Preserve the full original wording separately in source_quote. "
             "Judge payload: "
             + json.dumps(payload, ensure_ascii=False)
         )
+        command = [
+            "codex",
+            "exec",
+            "--json",
+            "--cd",
+            str(project.root),
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            instruction,
+        ]
         try:
             result = subprocess.run(
-                ["codex", "exec", "--cd", str(project.root), instruction],
+                command,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -276,11 +291,39 @@ class CodexMemoryJudge:
                 env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return MemoryJudgeResult(None, self.name, [f"memory judge failed: {exc}"], payload)
+            diagnostics = [f"memory judge failed: {exc}"]
+            if isinstance(exc, subprocess.TimeoutExpired):
+                diagnostics.extend(_judge_process_diagnostics(None, exc.stdout, exc.stderr))
+            _write_judge_debug(
+                project,
+                {
+                    "adapter": self.name,
+                    "command": _debug_command(command),
+                    "error": str(exc),
+                    "diagnostics": diagnostics,
+                    "payload": payload,
+                },
+            )
+            return MemoryJudgeResult(None, self.name, diagnostics, payload)
+        _write_judge_debug(
+            project,
+            {
+                "adapter": self.name,
+                "command": _debug_command(command),
+                "returncode": result.returncode,
+                "stdout": _snippet(result.stdout),
+                "stderr": _snippet(result.stderr),
+                "payload": payload,
+            },
+        )
         try:
             candidate = _candidate_from_output(result.stdout or result.stderr)
         except ValueError as exc:
-            return MemoryJudgeResult(None, self.name, [f"invalid judge output: {exc}"], payload)
+            diagnostics = [
+                f"invalid judge output: {exc}",
+                *_judge_process_diagnostics(result.returncode, result.stdout, result.stderr),
+            ]
+            return MemoryJudgeResult(None, self.name, diagnostics, payload)
         return MemoryJudgeResult(candidate, self.name, [], payload)
 
 
@@ -300,16 +343,18 @@ def store_judge_result(
     memory_type = candidate.memory_type if candidate.memory_type in MEMORY_TYPES else "preference"
     enforcement = candidate.enforcement if candidate.enforcement in ENFORCEMENTS else "none"
     normalized_paths = _normalize_project_files(candidate.candidate_paths, project.root)
-    policy_like = enforcement in {"warn", "block"} or candidate.policy_compile
-    status = "candidate" if policy_like else _activation_status(candidate.activation)
-    content = candidate.memory_content.strip()[:500]
+    policy_like = enforcement in {"warn", "block"}
+    status = _activation_status(candidate.activation)
+    if status == "candidate" and policy_like:
+        status = "active"
+    content = (candidate.memory_content.strip() or candidate.source_quote.strip())[:500]
     if not content:
         return None
     existing = store.find_memory(
         project_id=project.id,
         content=content,
         type=memory_type,
-        statuses=("candidate", "draft", "auto_active", "active", "long_term", "durable", "warn_policy", "block_policy"),
+        statuses=("candidate", "draft", "auto_active", "active", "long_term", "durable"),
     )
     if existing:
         return existing.id
@@ -319,7 +364,10 @@ def store_judge_result(
         session_id=session_id,
         type=memory_type,
         content=content,
-        reason=f"Isolated memory judge: {candidate.reason} Source quote: {candidate.source_quote}",
+        reason=(
+            f"Isolated memory judge: {candidate.reason} "
+            f"Normalized memory: {candidate.memory_content}."
+        ),
         tags=_judge_tags(candidate),
         paths=normalized_paths,
         status=status,
@@ -341,7 +389,7 @@ def store_judge_result(
             "payload": result.payload,
         },
         decision="isolated_judge_memory_stored",
-        risk="high" if policy_like else "low",
+        risk="medium" if policy_like else "low",
         reason=memory.reason if memory else candidate.reason,
     )
     return memory_id
@@ -386,7 +434,6 @@ def _record_judge_result(
 def _candidate_from_output(output: str) -> MemoryJudgeCandidate:
     raw = _extract_json_object(output)
     should_store = _required_bool(raw, "should_store")
-    policy_compile = _required_bool(raw, "policy_compile")
     meaning_preserved = _required_bool(raw, "meaning_preserved")
     memory_type = _required_str(raw, "memory_type")
     if memory_type not in MEMORY_TYPES:
@@ -408,7 +455,6 @@ def _candidate_from_output(output: str) -> MemoryJudgeCandidate:
         enforcement=enforcement,
         activation=activation,
         candidate_paths=_string_list(raw.get("candidate_paths")),
-        policy_compile=policy_compile,
         meaning_preserved=meaning_preserved,
         contamination_risk=contamination_risk,
         reason=_required_str(raw, "reason"),
@@ -420,6 +466,22 @@ def _extract_json_object(output: str) -> dict[str, object]:
     if not text:
         raise ValueError("empty output")
     candidates = [text]
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            if "should_store" in event:
+                return event
+            item = event.get("item")
+            if isinstance(item, dict):
+                item_text = item.get("text")
+                if isinstance(item_text, str):
+                    candidates.append(item_text)
+            event_text = event.get("text")
+            if isinstance(event_text, str):
+                candidates.append(event_text)
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if match:
         candidates.append(match.group(0))
@@ -431,6 +493,55 @@ def _extract_json_object(output: str) -> dict[str, object]:
         if isinstance(value, dict):
             return value
     raise ValueError("no JSON object found")
+
+
+def _judge_process_diagnostics(returncode: int | None, stdout: object, stderr: object) -> list[str]:
+    diagnostics: list[str] = []
+    if returncode is not None:
+        diagnostics.append(f"judge returncode: {returncode}")
+    stdout_text = _coerce_output(stdout)
+    stderr_text = _coerce_output(stderr)
+    if stdout_text:
+        diagnostics.append(f"judge stdout: {_snippet(stdout_text)}")
+    if stderr_text:
+        diagnostics.append(f"judge stderr: {_snippet(stderr_text)}")
+    if not stdout_text and not stderr_text:
+        diagnostics.append("judge produced no stdout or stderr")
+    return diagnostics
+
+
+def _write_judge_debug(project: Project, record: dict[str, object]) -> None:
+    debug = os.environ.get(JUDGE_DEBUG_ENV, "")
+    if not debug:
+        return
+    path = Path(debug).expanduser() if debug not in {"1", "true", "yes"} else project.root / ".memassist" / "judge-debug.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError:
+        return
+
+
+def _debug_command(command: list[str]) -> list[str]:
+    if len(command) <= 2:
+        return command
+    return [*command[:-1], "<judge-instruction>"]
+
+
+def _snippet(value: object, *, limit: int = MAX_DEBUG_CHARS) -> str:
+    text = _coerce_output(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... <truncated {len(text) - limit} chars>"
+
+
+def _coerce_output(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _looks_like_memory_intent(content: str) -> bool:
@@ -528,6 +639,7 @@ def _judge_tags(candidate: MemoryJudgeCandidate) -> list[str]:
     tags = ["isolated_judge", candidate.memory_type]
     if candidate.enforcement != "none":
         tags.append(candidate.enforcement)
+    tags.extend(_instruction_tags(candidate.source_quote))
     tags.extend(_instruction_tags(candidate.memory_content))
     return list(dict.fromkeys(tags))
 

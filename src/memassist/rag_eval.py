@@ -237,7 +237,7 @@ def _default_type(section: str) -> str:
 
 def _default_status(section: str) -> str:
     if section == "policy":
-        return "block_policy"
+        return "active"
     if section == "verifier":
         return "durable"
     return "active"

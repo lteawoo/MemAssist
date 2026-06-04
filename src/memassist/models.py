@@ -23,8 +23,6 @@ MEMORY_STATUSES = {
     "long_term",
     "durable",
     "active",
-    "warn_policy",
-    "block_policy",
     "pinned",
     "ephemeral",
     "decaying",

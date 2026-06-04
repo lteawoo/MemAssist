@@ -22,11 +22,14 @@ def temp_project():
         home = root / "home"
         project = root / "project"
         project.mkdir()
+        home.mkdir()
         old_cwd = Path.cwd()
         old_home = os.environ.get("MEMASSIST_HOME")
+        old_user_home = os.environ.get("HOME")
         old_codex = os.environ.get("CODEX_HOME")
         old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
-        os.environ["MEMASSIST_HOME"] = str(home)
+        os.environ.pop("MEMASSIST_HOME", None)
+        os.environ["HOME"] = str(home)
         os.environ["CODEX_HOME"] = str(root / "codex-home")
         os.chdir(project)
         try:
@@ -34,6 +37,7 @@ def temp_project():
         finally:
             os.chdir(old_cwd)
             _restore_env("MEMASSIST_HOME", old_home)
+            _restore_env("HOME", old_user_home)
             _restore_env("CODEX_HOME", old_codex)
             _restore_env("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", old_fixture)
 
@@ -46,7 +50,7 @@ def _restore_env(key: str, value: str | None) -> None:
 
 
 class MemassistTempProjectE2ETest(unittest.TestCase):
-    def test_init_to_judged_candidate_activation_and_pretool_block(self) -> None:
+    def test_init_to_judged_memory_retrieval_without_pretool_block(self) -> None:
         with temp_project() as (_root, project):
             target = project / "src" / "auth" / "refresh-token-policy.ts"
             target.parent.mkdir(parents=True)
@@ -61,7 +65,6 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                     "enforcement": "block",
                     "activation": "active",
                     "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "policy_compile": True,
                     "meaning_preserved": True,
                     "contamination_risk": "low",
                     "reason": "User explicitly forbids changing this area without asking.",
@@ -75,7 +78,10 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
             }
             with patch("sys.stdin", StringIO(json.dumps(prompt_payload))), patch("sys.stdout", StringIO()) as stdout:
                 self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
-            self.assertEqual(stdout.getvalue(), "")
+            first_context = json.loads(stdout.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("Relevant memassist memory:", first_context)
+            self.assertIn("Do not change refresh token policy without asking first.", first_context)
+            self.assertNotIn("Policy reminders", first_context)
 
             with Store() as store:
                 project_memories = store.list_memories(project_id=None, include_global=False, status=None)
@@ -85,7 +91,8 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                     if memory.source_kind == "isolated_memory_judge"
                 ]
             self.assertEqual(len(judged), 1)
-            self.assertEqual(judged[0]["status"], "candidate")
+            self.assertEqual(judged[0]["status"], "active")
+            self.assertEqual(judged[0]["content"], "Do not change refresh token policy without asking first.")
 
             pretool_payload = {
                 "session_id": "sess_e2e",
@@ -114,13 +121,26 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
             pretool_out = StringIO()
             with patch("sys.stdin", StringIO(json.dumps(pretool_payload))), patch("sys.stdout", pretool_out):
                 self.assertEqual(main(["hook", "pre-tool-use"]), 0)
-            decision = json.loads(pretool_out.getvalue())
-            self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertEqual(pretool_out.getvalue(), "")
+
+            rag_payload = {
+                "session_id": "sess_e2e",
+                "cwd": str(project),
+                "prompt": "리프레시 토큰 15분으로 변경해줘",
+            }
+            rag_out = StringIO()
+            with patch("sys.stdin", StringIO(json.dumps(rag_payload))), patch("sys.stdout", rag_out):
+                self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+            injected = json.loads(rag_out.getvalue())
+            context = injected["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("Relevant memassist memory:", context)
+            self.assertIn("Do not change refresh token policy without asking first.", context)
+            self.assertNotIn("Policy reminders", context)
 
             with Store() as store:
                 events = store.trace_events("sess_e2e")
             self.assertTrue(any(event["event_type"] == "memory_judged" for event in events))
-            self.assertTrue(any(event["event_type"] == "pre_tool_use" and event["policy_decision"] == "block" for event in events))
+            self.assertTrue(any(event["event_type"] == "pre_tool_use" and event["policy_decision"] == "allow" for event in events))
 
     @unittest.skipUnless(os.environ.get("MEMASSIST_RUN_REAL_CODEX_E2E") == "1", "real Codex CLI E2E is opt-in")
     def test_real_codex_cli_mode_reports_hook_lifecycle(self) -> None:

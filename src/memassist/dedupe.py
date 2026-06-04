@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from .models import Memory
 
 
-ACTIVE_STRONG_STATUSES = {"active", "auto_active", "long_term", "durable", "warn_policy", "block_policy", "pinned"}
+ACTIVE_STRONG_STATUSES = {"active", "auto_active", "long_term", "durable", "pinned"}
 INACTIVE_STATUSES = {"candidate", "draft", "stale"}
 PROTECTIVE_TERMS = {
     "확인",
@@ -78,8 +78,6 @@ def find_semantic_duplicate(
 def should_suppress_candidate(candidate_status: str, duplicate: Memory) -> bool:
     if candidate_status in INACTIVE_STATUSES and duplicate.status in ACTIVE_STRONG_STATUSES:
         return True
-    if candidate_status == "candidate" and duplicate.status in {"warn_policy", "block_policy"}:
-        return True
     return False
 
 
@@ -98,8 +96,6 @@ def _is_stronger(memory_status: str, candidate_status: str) -> bool:
         "auto_active": 2,
         "long_term": 3,
         "durable": 4,
-        "warn_policy": 4,
-        "block_policy": 4,
         "pinned": 5,
     }
     return rank.get(memory_status, 0) > rank.get(candidate_status, 0)

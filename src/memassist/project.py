@@ -5,7 +5,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .paths import memassist_home
+from .paths import memassist_home, user_memassist_home
 
 
 @dataclass(frozen=True)
@@ -17,7 +17,7 @@ class Project:
 
 def detect_project(start: Path | None = None) -> Project:
     start = (start or Path.cwd()).resolve()
-    root = _walk_for_root(start)
+    root = _walk_for_root(start, ignore_configured_home=False)
     remote = _git_remote(root)
     if remote:
         project_id = _normalize_remote(remote)
@@ -27,13 +27,39 @@ def detect_project(start: Path | None = None) -> Project:
     return Project(id=project_id, root=root, git_remote=remote)
 
 
-def _walk_for_root(start: Path) -> Path:
+def detect_project_for_init(start: Path | None = None) -> Project:
+    start = (start or Path.cwd()).resolve()
+    root = _walk_for_init_root(start)
+    remote = _git_remote(root)
+    if remote:
+        project_id = _normalize_remote(remote)
+    else:
+        digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+        project_id = f"local:{digest}"
+    return Project(id=project_id, root=root, git_remote=remote)
+
+
+def _walk_for_init_root(start: Path) -> Path:
+    if (start / ".memassist").exists():
+        return start
     current = start
-    global_memassist_home = memassist_home().resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        if current.parent == current:
+            return start
+        current = current.parent
+
+
+def _walk_for_root(start: Path, *, ignore_configured_home: bool) -> Path:
+    current = start
+    ignored_memassist_homes = {user_memassist_home().resolve()}
+    if ignore_configured_home:
+        ignored_memassist_homes.add(memassist_home().resolve())
     while True:
         project_memassist = current / ".memassist"
         if (current / ".git").exists() or (
-            project_memassist.exists() and project_memassist.resolve() != global_memassist_home
+            project_memassist.exists() and project_memassist.resolve() not in ignored_memassist_homes
         ):
             return current
         if current.parent == current:

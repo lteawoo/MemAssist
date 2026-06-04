@@ -75,6 +75,7 @@ def install_codex_hooks(
     project_root: Path | None = None,
     home: Path | None = None,
     mode: str = "full",
+    memassist_home: Path | None = None,
 ) -> Path:
     path = _hooks_path(scope=scope, project_root=project_root, home=home)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,7 +87,7 @@ def install_codex_hooks(
     else:
         data = {"hooks": {}}
     hooks = data.setdefault("hooks", {})
-    for event, groups in _codex_memassist_hooks(mode=mode).items():
+    for event, groups in _codex_memassist_hooks(mode=mode, memassist_home=memassist_home).items():
         existing = hooks.setdefault(event, [])
         existing[:] = [group for group in existing if not _is_memassist_group(group)]
         existing.extend(groups)
@@ -131,7 +132,7 @@ def _hooks_path(*, scope: str, project_root: Path | None, home: Path | None) -> 
     raise ValueError(f"invalid hook scope: {scope}")
 
 
-def _codex_memassist_hooks(*, mode: str = "full") -> dict[str, list[dict[str, object]]]:
+def _codex_memassist_hooks(*, mode: str = "full", memassist_home: Path | None = None) -> dict[str, list[dict[str, object]]]:
     if mode not in CODEX_MODE_EVENTS:
         raise ValueError(f"invalid hook mode: {mode}")
     hooks = json.loads(json.dumps(CODEX_MEMASSIST_HOOKS))
@@ -140,18 +141,18 @@ def _codex_memassist_hooks(*, mode: str = "full") -> dict[str, list[dict[str, ob
         for group in groups:
             for hook in group.get("hooks", []):
                 hook_event = str(hook["command"]).rsplit(" ", 1)[-1]
-                hook["command"] = _python_hook_command(hook_event)
+                hook["command"] = _python_hook_command(hook_event, memassist_home=memassist_home)
     return hooks
 
 
-def _python_hook_command(hook_event: str) -> str:
+def _python_hook_command(hook_event: str, *, memassist_home: Path | None = None) -> str:
     env: list[str] = []
     source_root = Path(__file__).resolve().parents[1]
     if (source_root / "memassist").exists():
         env.append(f"PYTHONPATH={shlex.quote(str(source_root))}:$PYTHONPATH")
-    memassist_home = os.environ.get("MEMASSIST_HOME")
-    if memassist_home:
-        env.append(f"MEMASSIST_HOME={shlex.quote(memassist_home)}")
+    home = str(memassist_home) if memassist_home else os.environ.get("MEMASSIST_HOME")
+    if home:
+        env.append(f"MEMASSIST_HOME={shlex.quote(home)}")
     prefix = " ".join(env)
     command = f"python3 -m memassist hook {hook_event}"
     return f"{prefix} {command}" if prefix else command
