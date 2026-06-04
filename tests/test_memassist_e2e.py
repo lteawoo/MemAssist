@@ -19,7 +19,10 @@ from memassist.storage import Store
 
 @contextmanager
 def temp_project():
-    with tempfile.TemporaryDirectory() as tmp:
+    # ignore_cleanup_errors: on Windows a just-finished tool subprocess (e.g. the
+    # real claude/codex judge) can briefly hold the project dir, making rmdir raise
+    # PermissionError during teardown. That must not mask the test's own result.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         home = root / "home"
         project = root / "project"
