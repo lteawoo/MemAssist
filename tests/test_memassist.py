@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -68,6 +69,22 @@ def _stop_for(payload: dict) -> int:
     return _fire_hook("stop", {"session_id": payload.get("session_id"), "cwd": payload.get("cwd")})
 
 
+def _collect_hook_commands(obj: object) -> list[str]:
+    """Recursively collect every hook `command` string from a parsed hooks.json,
+    regardless of the surrounding wrapper structure."""
+    commands: list[str] = []
+    if isinstance(obj, dict):
+        command = obj.get("command")
+        if isinstance(command, str):
+            commands.append(command)
+        for value in obj.values():
+            commands.extend(_collect_hook_commands(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            commands.extend(_collect_hook_commands(item))
+    return commands
+
+
 class MemassistTest(unittest.TestCase):
     def test_init_creates_project_policy(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -117,7 +134,7 @@ class MemassistTest(unittest.TestCase):
                     os.environ["CODEX_HOME"] = old_codex
 
     def test_init_uses_cwd_when_parent_memassist_exists_with_external_home(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             parent = root / "parent"
             project = parent / "plain-project"
@@ -142,8 +159,20 @@ class MemassistTest(unittest.TestCase):
                 self.assertTrue((project / ".memassist" / "memassist.db").exists())
                 self.assertTrue((project / ".codex" / "hooks.json").exists())
                 self.assertFalse((parent / ".codex" / "hooks.json").exists())
-                hook_text = (project / ".codex" / "hooks.json").read_text(encoding="utf-8")
-                self.assertIn(f"MEMASSIST_HOME={(project / '.memassist').resolve()}", hook_text)
+                hooks_data = json.loads(
+                    (project / ".codex" / "hooks.json").read_text(encoding="utf-8")
+                )
+                # The home value is shell-quoted in the hook command (shlex.quote),
+                # which differs per-OS for paths containing backslashes. Parse the
+                # JSON and compare against the same quoting so this holds on any OS.
+                commands = _collect_hook_commands(hooks_data)
+                expected_home = (
+                    f"MEMASSIST_HOME={shlex.quote(str((project / '.memassist').resolve()))}"
+                )
+                self.assertTrue(
+                    any(expected_home in command for command in commands),
+                    f"{expected_home!r} not found in {commands!r}",
+                )
             finally:
                 os.chdir(old_cwd)
                 if old_home is None:
