@@ -2094,7 +2094,11 @@ class MemassistTest(unittest.TestCase):
                 with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
                     code = main(["hook", "user-prompt-submit"])
                 self.assertEqual(code, 0)
-                _stop_for(payload)
+                # Invalid fixture output triggers retry logic; drive enough stops to reach
+                # MAX_JUDGE_ATTEMPTS so the give-up terminal memory_judged event is recorded.
+                from memassist.memory_judge import MAX_JUDGE_ATTEMPTS
+                for _ in range(MAX_JUDGE_ATTEMPTS):
+                    _stop_for(payload)
             finally:
                 if old_fixture is None:
                     os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
@@ -2449,6 +2453,143 @@ class MemassistTest(unittest.TestCase):
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
                 self.assertEqual([memory.id for memory in memories if memory.status == "candidate"], [])
                 self.assertEqual(store.get_memory(memory_id).status, "active")  # type: ignore[union-attr]
+
+    def test_judge_failure_is_retried_not_dropped(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = "{}"
+            try:
+                payload = {
+                    "session_id": "sess_retry_not_dropped",
+                    "cwd": str(project_dir),
+                    "prompt": "isolated_memory_judge retry test",
+                }
+                with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+                    self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                _stop_for(payload)
+                project = detect_project()
+                with Store() as store:
+                    events = [dict(event) for event in store.trace_events("sess_retry_not_dropped")]
+                    memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                event_types = [event["event_type"] for event in events]
+                self.assertIn("memory_judge_failed", event_types)
+                self.assertNotIn("memory_judged", event_types)
+                self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
+                # Second stop retries the failed source, not skips it.
+                _stop_for(payload)
+                with Store() as store:
+                    events2 = [dict(event) for event in store.trace_events("sess_retry_not_dropped")]
+                failed_events = [e for e in events2 if e["event_type"] == "memory_judge_failed"]
+                self.assertEqual(len(failed_events), 2)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+    def test_judge_failure_gives_up_after_max_attempts(self) -> None:
+        from memassist.memory_judge import MAX_JUDGE_ATTEMPTS
+
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = "{}"
+            try:
+                payload = {
+                    "session_id": "sess_give_up",
+                    "cwd": str(project_dir),
+                    "prompt": "isolated_memory_judge give up test",
+                }
+                with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+                    self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                for _ in range(MAX_JUDGE_ATTEMPTS):
+                    _stop_for(payload)
+                project = detect_project()
+                with Store() as store:
+                    events = [dict(event) for event in store.trace_events("sess_give_up")]
+                    memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                event_types = [event["event_type"] for event in events]
+                self.assertIn("memory_judged", event_types)
+                self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
+                # One more stop: source is already processed (give-up is terminal), no new failures.
+                failed_before = sum(1 for e in events if e["event_type"] == "memory_judge_failed")
+                _stop_for(payload)
+                with Store() as store:
+                    events3 = [dict(event) for event in store.trace_events("sess_give_up")]
+                failed_after = sum(1 for e in events3 if e["event_type"] == "memory_judge_failed")
+                self.assertEqual(failed_before, failed_after)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+    def test_genuine_skip_is_terminal_not_retried(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init", "--tools", "codex"])
+            fixture = json.dumps(
+                {
+                    "should_store": False,
+                    "memory_content": "n/a",
+                    "source_quote": "isolated skip terminal test",
+                    "memory_type": "fact",
+                    "enforcement": "none",
+                    "activation": "rejected",
+                    "candidate_paths": [],
+                    "meaning_preserved": True,
+                    "contamination_risk": "low",
+                    "reason": "One-off task; nothing durable.",
+                }
+            )
+            old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
+            try:
+                payload = {
+                    "session_id": "sess_skip_terminal",
+                    "cwd": str(project_dir),
+                    "prompt": "isolated skip terminal test",
+                }
+                with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()):
+                    self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
+                _stop_for(payload)
+                project = detect_project()
+                with Store() as store:
+                    events = [dict(event) for event in store.trace_events("sess_skip_terminal")]
+                    memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                judged = [e for e in events if e["event_type"] == "memory_judged"]
+                failed = [e for e in events if e["event_type"] == "memory_judge_failed"]
+                self.assertEqual(len(judged), 1)
+                self.assertEqual(len(failed), 0)
+                self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
+                # Second stop: source already processed; no new failed events.
+                _stop_for(payload)
+                with Store() as store:
+                    events2 = [dict(event) for event in store.trace_events("sess_skip_terminal")]
+                failed2 = [e for e in events2 if e["event_type"] == "memory_judge_failed"]
+                self.assertEqual(len(failed2), 0)
+            finally:
+                if old_fixture is None:
+                    os.environ.pop("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE", None)
+                else:
+                    os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
+
+    def test_judge_subprocess_env_is_de_nested(self) -> None:
+        from memassist.memory_judge import (
+            INTERPRETER_ACTIVE_ENV,
+            JUDGE_ACTIVE_ENV,
+            _judge_subprocess_env,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "abc", "CLAUDE_CODE_ENTRYPOINT": "cli"},
+        ):
+            result = _judge_subprocess_env()
+        self.assertNotIn("CLAUDECODE", result)
+        self.assertFalse(any(key.startswith("CLAUDE_CODE_") for key in result))
+        self.assertEqual(result.get(JUDGE_ACTIVE_ENV), "1")
+        self.assertEqual(result.get(INTERPRETER_ACTIVE_ENV), "1")
 
     def test_cleanup_supersedes_existing_directive_paraphrase_candidate(self) -> None:
         with isolated_env():

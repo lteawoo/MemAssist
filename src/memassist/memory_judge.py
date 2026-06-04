@@ -28,6 +28,7 @@ JUDGE_TIMEOUT_ENV = "MEMASSIST_MEMORY_JUDGE_TIMEOUT"
 MAX_SOURCE_CHARS = 600
 MAX_HINTS = 8
 MAX_DEBUG_CHARS = 4000
+MAX_JUDGE_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -134,23 +135,29 @@ def process_memory_intent_event(
     payload = build_judge_payload(store, project=project, source_event=source_event)
     judge = select_memory_judge(project)
     result = judge.judge(payload, project=project)
+    if result.candidate is None and result.adapter_name != "unavailable":
+        prior_failures = _failed_attempt_count(store, session_id=session_id, source_event_id=source_event_id)
+        if prior_failures + 1 >= MAX_JUDGE_ATTEMPTS:
+            judgment_event_id = _record_judge_result(
+                store, session_id=session_id, project_id=project.id,
+                source_event_id=source_event_id, result=result, gave_up=True,
+            )
+            return StoredJudgment(event_id=judgment_event_id, memory_id=None, decision="judge_failed_gave_up")
+        failure_event_id = _record_judge_failure(
+            store, session_id=session_id, project_id=project.id,
+            source_event_id=source_event_id, result=result,
+        )
+        return StoredJudgment(event_id=failure_event_id, memory_id=None, decision="judge_failed_retry")
     judgment_event_id = _record_judge_result(
-        store,
-        session_id=session_id,
-        project_id=project.id,
-        source_event_id=source_event_id,
-        result=result,
+        store, session_id=session_id, project_id=project.id,
+        source_event_id=source_event_id, result=result,
     )
     memory_id = store_judge_result(
-        store,
-        project=project,
-        session_id=session_id,
-        source_event_id=source_event_id,
-        result=result,
+        store, project=project, session_id=session_id,
+        source_event_id=source_event_id, result=result,
     )
     return StoredJudgment(
-        event_id=judgment_event_id,
-        memory_id=memory_id,
+        event_id=judgment_event_id, memory_id=memory_id,
         decision="stored" if memory_id else "not_stored",
     )
 
@@ -301,6 +308,19 @@ def _build_judge_instruction(payload: dict[str, object]) -> str:
     )
 
 
+def _judge_subprocess_env() -> dict[str, str]:
+    """Environment for the judge subprocess: de-nested from the host Claude Code
+    session (strip CLAUDECODE / CLAUDE_CODE_* so a nested `claude -p` runs as a clean
+    top-level invocation) plus the recursion-guard vars."""
+    env = os.environ.copy()
+    for key in list(env):
+        if key == "CLAUDECODE" or key.startswith("CLAUDE_CODE_"):
+            env.pop(key, None)
+    env[JUDGE_ACTIVE_ENV] = "1"
+    env[INTERPRETER_ACTIVE_ENV] = "1"
+    return env
+
+
 class _SubprocessMemoryJudge:
     """Run the isolated judge in a separate tool process.
 
@@ -323,10 +343,8 @@ class _SubprocessMemoryJudge:
     def judge(self, payload: dict[str, object], *, project: Project) -> MemoryJudgeResult:
         if not shutil.which(self.executable):
             return MemoryJudgeResult(None, self.name, [f"{self.executable} executable not found"], payload)
-        env = os.environ.copy()
-        env[JUDGE_ACTIVE_ENV] = "1"
-        env[INTERPRETER_ACTIVE_ENV] = "1"
-        timeout = float(os.environ.get(JUDGE_TIMEOUT_ENV, "30"))
+        env = _judge_subprocess_env()
+        timeout = float(os.environ.get(JUDGE_TIMEOUT_ENV, "60"))
         instruction = _build_judge_instruction(payload)
         command = self._command(instruction, project)
         try:
@@ -505,22 +523,58 @@ def _record_judge_result(
     project_id: str,
     source_event_id: str,
     result: MemoryJudgeResult,
+    gave_up: bool = False,
 ) -> str:
     files: list[str] = []
     if result.candidate:
         files = list(result.candidate.candidate_paths)
+    input_json: dict[str, object] = {
+        "source_event_id": source_event_id,
+        **result.as_dict(),
+    }
+    if gave_up:
+        input_json["gave_up"] = True
     return store.add_trace_event(
         session_id=session_id,
         project_id=project_id,
         event_type="memory_judged",
         tool_name="memassist",
+        input_json=input_json,
+        policy_decision="store" if result.candidate and result.candidate.should_store else "skip",
+        files=files,
+    )
+
+
+def _record_judge_failure(
+    store: Store,
+    *,
+    session_id: str,
+    project_id: str,
+    source_event_id: str,
+    result: MemoryJudgeResult,
+) -> str:
+    return store.add_trace_event(
+        session_id=session_id,
+        project_id=project_id,
+        event_type="memory_judge_failed",
+        tool_name="memassist",
         input_json={
             "source_event_id": source_event_id,
             **result.as_dict(),
         },
-        policy_decision="store" if result.candidate and result.candidate.should_store else "skip",
-        files=files,
+        policy_decision="retry",
+        files=[],
     )
+
+
+def _failed_attempt_count(store: Store, *, session_id: str, source_event_id: str) -> int:
+    count = 0
+    for event in store.trace_events(session_id, limit=200):
+        if event["event_type"] != "memory_judge_failed":
+            continue
+        if _event_input(dict(event)).get("source_event_id") == source_event_id:
+            count += 1
+    return count
 
 
 def _candidate_from_output(output: str) -> MemoryJudgeCandidate:
