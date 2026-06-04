@@ -14,7 +14,7 @@ class CandidateDecision:
     status: str
     risk: str
     memory_kind: str
-    enforcement: str
+    caution_level: str
     reason: str
     scores: dict[str, float] | None = None
     total_score: float | None = None
@@ -26,7 +26,7 @@ class CandidateDecision:
             "status": self.status,
             "risk": self.risk,
             "memory_kind": self.memory_kind,
-            "enforcement": self.enforcement,
+            "caution_level": self.caution_level,
             "reason": self.reason,
             "scores": self.scores or {},
             "total_score": self.total_score,
@@ -79,7 +79,7 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
             status="archived",
             risk="low",
             memory_kind=memory_kind,
-            enforcement="none",
+            caution_level="none",
             reason="Candidate confidence or importance is below automatic memory threshold.",
         )
 
@@ -90,7 +90,7 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
             status="active",
             risk="low",
             memory_kind="procedural",
-            enforcement="none",
+            caution_level="none",
             reason="Verification workflow was observed in the trace and is safe to remember automatically.",
         )
 
@@ -101,7 +101,7 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
             status="archived",
             risk="low",
             memory_kind="episodic",
-            enforcement="none",
+            caution_level="none",
             reason="Touched-file facts are session evidence, not active project memory.",
         )
 
@@ -112,10 +112,10 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
             status="candidate",
             risk="high" if high_risk or protective else "medium",
             memory_kind=memory_kind,
-            enforcement="none",
+            caution_level="none",
             reason=(
                 "Potentially strong or risky inferred memory is kept inactive; "
-                "autonomous policy escalation only comes from direct user directives."
+                "only direct user directives can create caution-level metadata."
             ),
         )
 
@@ -126,7 +126,7 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
             status="active",
             risk="low",
             memory_kind=memory_kind,
-            enforcement="none",
+            caution_level="none",
             reason="Explicit low-risk preference or decision can be remembered automatically.",
         )
 
@@ -136,7 +136,7 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
         status="candidate",
         risk="medium",
         memory_kind=memory_kind,
-        enforcement="none",
+        caution_level="none",
         reason="Candidate may be useful but lacks enough confidence for automatic activation.",
     )
 

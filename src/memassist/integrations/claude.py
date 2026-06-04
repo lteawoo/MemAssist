@@ -72,7 +72,7 @@ class ClaudeIntegration:
             path,
             events,
             "installed" if events else "not installed",
-            lifecycle_capabilities(events, llm_directive_interpretation=bool(events)),
+            lifecycle_capabilities(events, isolated_memory_judgment=bool(events)),
         )
 
 

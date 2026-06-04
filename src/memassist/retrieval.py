@@ -92,7 +92,7 @@ MEDIUM_RISK_TERMS = {
     "rank",
 }
 VERIFIER_TERMS = {"test", "tests", "verify", "verification", "ci", "coverage", "run", "assert", "failing"}
-POLICY_TERMS = {"policy", "rule", "block", "warn", "permission", "security", "secret", "auth", "protect"}
+CAUTION_TERMS = {"policy", "rule", "block", "warn", "permission", "security", "secret", "auth", "protect"}
 
 
 @dataclass(frozen=True)
@@ -101,7 +101,7 @@ class QueryIntent:
     domains: list[str]
     likely_paths: list[str]
     risk_level: str
-    needs_policy: bool
+    needs_caution_context: bool
     needs_verifier: bool
     retrieval_queries: list[str]
 
@@ -111,7 +111,7 @@ class QueryIntent:
             "domains": self.domains,
             "likely_paths": self.likely_paths,
             "risk_level": self.risk_level,
-            "needs_policy": self.needs_policy,
+            "needs_caution_context": self.needs_caution_context,
             "needs_verifier": self.needs_verifier,
             "retrieval_queries": self.retrieval_queries,
         }
@@ -120,14 +120,12 @@ class QueryIntent:
 @dataclass(frozen=True)
 class MemoryPack:
     context: list[Memory]
-    policy: list[Memory]
     verifier: list[Memory]
     intent: QueryIntent | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
             "context": [memory.as_dict() for memory in self.context],
-            "policy": [memory.as_dict() for memory in self.policy],
             "verifier": [memory.as_dict() for memory in self.verifier],
             "intent": self.intent.as_dict() if self.intent else None,
         }
@@ -151,7 +149,7 @@ def build_memory_pack(
         section="context",
         limit=context_limit,
     )
-    return MemoryPack(context=context, policy=[], verifier=verifier, intent=intent)
+    return MemoryPack(context=context, verifier=verifier, intent=intent)
 
 
 def analyze_query_intent(query: str) -> QueryIntent:
@@ -161,7 +159,7 @@ def analyze_query_intent(query: str) -> QueryIntent:
     domains = _domains(tokens, explicit_paths)
     likely_paths = _likely_paths(explicit_paths, domains)
     risk_level = _risk_level(tokens, domains, likely_paths)
-    needs_policy = risk_level in {"medium", "high"} or bool(tokens & POLICY_TERMS) or any(domain in {"auth", "security"} for domain in domains)
+    needs_caution_context = risk_level in {"medium", "high"} or bool(tokens & CAUTION_TERMS) or any(domain in {"auth", "security"} for domain in domains)
     needs_verifier = (
         task_type in {"bugfix", "feature", "refactor", "test", "debug"}
         or bool(tokens & VERIFIER_TERMS)
@@ -173,7 +171,7 @@ def analyze_query_intent(query: str) -> QueryIntent:
         domains=domains,
         likely_paths=likely_paths,
         risk_level=risk_level,
-        needs_policy=needs_policy,
+        needs_caution_context=needs_caution_context,
         needs_verifier=needs_verifier,
         retrieval_queries=retrieval_queries,
     )
@@ -338,7 +336,7 @@ def _metadata_score(query: str, intent: QueryIntent, memory: Memory) -> float:
     type_score = 0.0
     if intent.task_type == "test" and _is_verifier_memory(memory):
         type_score += 1.0
-    if intent.needs_policy and (memory.type == "rule" or memory.enforcement != "none"):
+    if intent.needs_caution_context and (memory.type == "rule" or memory.caution_level != "none"):
         type_score += 1.0
     return domain_score + tag_score + path_score + query_overlap + type_score
 

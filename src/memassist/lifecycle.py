@@ -89,7 +89,7 @@ def process_session_lifecycle(
             candidate_type=candidate.type,
             candidate_tags=candidate.tags,
             candidate_status=decision.status,
-            candidate_enforcement=decision.enforcement,
+            candidate_caution_level=decision.caution_level,
             existing_memories=existing,
         )
         if semantic_duplicate and should_suppress_candidate(decision.status, semantic_duplicate.memory):
@@ -186,7 +186,7 @@ def cleanup_memories(store: Store) -> CleanupResult:
             candidate_type=candidate.type,
             candidate_tags=candidate.tags,
             candidate_status=candidate.status,
-            candidate_enforcement=candidate.enforcement,
+            candidate_caution_level=candidate.caution_level,
             existing_memories=existing,
         )
         if duplicate and should_suppress_candidate(candidate.status, duplicate.memory):
@@ -214,7 +214,7 @@ def _store_decision(
         status=decision.status,
         importance=candidate.importance,
         confidence=candidate.confidence,
-        enforcement=decision.enforcement,
+        caution_level=decision.caution_level,
         source_kind="lifecycle",
         source_ref=session_id,
     )

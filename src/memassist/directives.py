@@ -35,7 +35,7 @@ def _normalize_project_files(files: list[str], project_root: Path) -> list[str]:
     return normalized
 
 
-def _directive_enforcement(content: str) -> str:
+def _directive_caution_level(content: str) -> str:
     lowered = content.lower()
     block_terms = {
         "do not",
@@ -66,9 +66,9 @@ def _directive_enforcement(content: str) -> str:
 def _instruction_tags(content: str) -> list[str]:
     lowered = content.lower()
     tags = ["directive", "explicit", "user_prompt"]
-    enforcement = _directive_enforcement(content)
-    if enforcement != "none":
-        tags.append(enforcement)
+    caution_level = _directive_caution_level(content)
+    if caution_level != "none":
+        tags.append(caution_level)
     if any(term in lowered for term in {"auth", "인증", "token", "토큰", "refresh", "리프레시"}):
         tags.append("auth")
     if any(term in lowered for term in {"token", "토큰"}):

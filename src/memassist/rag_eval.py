@@ -7,12 +7,12 @@ from typing import Any
 import uuid
 
 from .eval_seed import remove_seed_memories_by_source
-from .models import ENFORCEMENTS, MEMORY_STATUSES
+from .models import CAUTION_LEVELS, MEMORY_STATUSES
 from .retrieval import MemoryPack, build_memory_pack
 from .storage import Store
 
 
-SECTIONS = ("context", "policy", "verifier")
+SECTIONS = ("context", "verifier")
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,8 @@ class RagExpectation:
         if isinstance(value, str):
             return cls(term=value, section="*")
         if isinstance(value, dict):
-            return cls(term=str(value.get("term", "")), section=str(value.get("section", "*")))
+            section = str(value.get("section", "*"))
+            return cls(term=str(value.get("term", "")), section=section if section == "*" else _normalized_section(section))
         return cls(term="", section="*")
 
 
@@ -39,13 +40,15 @@ class RagSeedMemory:
     status: str
     importance: float
     confidence: float
-    enforcement: str
+    caution_level: str
+    source_quote: str | None = None
+    source_ref: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "RagSeedMemory":
-        section = str(value.get("section", "context"))
+        section = _normalized_section(str(value.get("section", "context")))
         status = str(value.get("status") or _default_status(section))
-        enforcement = str(value.get("enforcement") or _default_enforcement(section))
+        caution_level = str(value.get("caution_level") or _default_caution_level(section))
         return cls(
             type=str(value.get("type") or _default_type(section)),
             content=str(value.get("content", "")),
@@ -55,7 +58,9 @@ class RagSeedMemory:
             status=status if status in MEMORY_STATUSES else "archived",
             importance=float(value.get("importance", 0.8)),
             confidence=float(value.get("confidence", 0.85)),
-            enforcement=enforcement if enforcement in ENFORCEMENTS else "none",
+            caution_level=caution_level if caution_level in CAUTION_LEVELS else "none",
+            source_quote=value.get("source_quote") if isinstance(value.get("source_quote"), str) else None,
+            source_ref=value.get("source_ref") if isinstance(value.get("source_ref"), str) else None,
         )
 
 
@@ -98,6 +103,7 @@ class RagEvalResult:
             "case_count": self.case_count,
             "section_accuracy": self.section_accuracy,
             "context_relevance": self.context_relevance,
+            "context_gate_leak_rate": self.policy_leak_rate,
             "policy_leak_rate": self.policy_leak_rate,
             "verifier_recall": self.verifier_recall,
             "pass_rate": self.pass_rate,
@@ -140,7 +146,7 @@ def evaluate_rag(store: Store, *, project_id: str, cases: list[RagCase]) -> RagE
                 if retrieved_count
                 else (1.0 if not expected_count else 0.0)
             )
-            policy_leak = any(hit["section"] == "policy" for hit in forbidden_hits)
+            policy_leak = False
             case_passed = section_accuracy == 1.0 and not forbidden_hits
         finally:
             _remove_seed_memories(store, seed_ids)
@@ -231,23 +237,23 @@ def _string_list(value: object) -> list[str]:
 
 
 def _default_type(section: str) -> str:
-    if section == "policy":
-        return "rule"
     if section == "verifier":
         return "workflow"
     return "lesson"
 
 
 def _default_status(section: str) -> str:
-    if section == "policy":
-        return "active"
     if section == "verifier":
         return "active"
     return "active"
 
 
-def _default_enforcement(section: str) -> str:
-    return "block" if section == "policy" else "none"
+def _default_caution_level(section: str) -> str:
+    return "none"
+
+
+def _normalized_section(section: str) -> str:
+    return "verifier" if section == "verifier" else "context"
 
 
 def _insert_seed_memories(store: Store, *, project_id: str, seed: list[RagSeedMemory]) -> list[str]:
@@ -266,9 +272,10 @@ def _insert_seed_memories(store: Store, *, project_id: str, seed: list[RagSeedMe
             status=memory.status,
             importance=memory.importance,
             confidence=memory.confidence,
-            enforcement=memory.enforcement,
+            caution_level=memory.caution_level,
             source_kind="rag_eval_seed",
-            source_ref=f"rag_eval:{uuid.uuid4().hex[:12]}",
+            source_ref=memory.source_ref or f"rag_eval:{uuid.uuid4().hex[:12]}",
+            source_quote=memory.source_quote,
         )
         ids.append(memory_id)
     return ids

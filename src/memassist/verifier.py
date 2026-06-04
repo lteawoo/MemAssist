@@ -5,7 +5,7 @@ from sqlite3 import Row
 from typing import Any
 
 from .models import Memory
-from .policy import PolicyConfig
+from .verification_config import VerificationConfig
 from .session import summarize_session
 
 
@@ -29,21 +29,21 @@ def verify_session(
     events: list[Row],
     *,
     memories: list[Memory],
-    policy: PolicyConfig,
+    verification_config: VerificationConfig,
 ) -> VerificationResult:
     summary = summarize_session(events)
     issues: list[str] = []
     warnings: list[str] = []
 
     if summary.denied_events:
-        warnings.append(f"{summary.denied_events} tool call(s) were denied by policy.")
+        warnings.append(f"{summary.denied_events} tool call(s) were denied by the host tool.")
 
     verifier_memories = [
         memory
         for memory in memories
         if memory.type == "workflow" or "verification" in memory.tags or "test" in memory.tags
     ]
-    requires_tests = bool(verifier_memories or policy.verification_commands)
+    requires_tests = bool(verifier_memories or verification_config.verification_commands)
     if requires_tests and not summary.test_commands and not summary.denied_events:
         issues.append("Verification workflow is configured but no test command was recorded.")
 

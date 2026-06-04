@@ -27,9 +27,9 @@ from .memory_eval import (
 )
 from .memory_artifacts import ensure_memory_artifact_dirs
 from .paths import db_path, memassist_home, project_memassist_home
-from .policy import (
-    default_policy_yaml,
-    load_policy,
+from .verification_config import (
+    default_verification_config_yaml,
+    load_verification_config,
 )
 from .project import detect_project, detect_project_for_init
 from .rag_eval import RagCase, RagExpectation, evaluate_rag, load_rag_cases
@@ -81,7 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
     mem_add.add_argument("--path", action="append", default=[])
     mem_add.add_argument("--importance", type=float, default=0.5)
     mem_add.add_argument("--confidence", type=float, default=0.8)
-    mem_add.add_argument("--enforcement", choices=["none", "warn", "block"], default="none")
+    mem_add.add_argument(
+        "--caution-level",
+        dest="caution_level",
+        choices=["none", "warn", "block"],
+        default="none",
+        help="retrieval/display caution metadata; never blocks tools",
+    )
     mem_add.set_defaults(func=cmd_memory_add)
 
     mem_list = memory_sub.add_parser("list", help="list memories")
@@ -190,7 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     session.add_argument("--json", action="store_true")
     session.set_defaults(func=cmd_session)
 
-    verify = sub.add_parser("verify", help="verify a traced session against memory and policy")
+    verify = sub.add_parser("verify", help="verify a traced session against memory and verification reminders")
     verify.add_argument("--session", default="latest")
     verify.add_argument("--json", action="store_true")
     verify.set_defaults(func=cmd_verify)
@@ -240,16 +246,16 @@ def cmd_init(args: argparse.Namespace) -> int:
     mem_dir = project_memassist_home(project.root)
     mem_dir.mkdir(exist_ok=True)
     ensure_memory_artifact_dirs(mem_dir)
-    policy_path = mem_dir / "policy.yaml"
-    if not policy_path.exists():
-        policy_path.write_text(default_policy_yaml(), encoding="utf-8")
+    config_path = mem_dir / "verification.yaml"
+    if not config_path.exists():
+        config_path.write_text(default_verification_config_yaml(), encoding="utf-8")
     ignore_path = mem_dir / "ignore"
     if not ignore_path.exists():
         ignore_path.write_text("# Add paths memassist should not record.\n", encoding="utf-8")
     with Store(mem_dir / "memassist.db") as store:
         store.upsert_project(project)
     print(f"Initialized memassist for {project.id}")
-    print(f"Project config: {policy_path}")
+    print(f"Project config: {config_path}")
     tools = _tools_or_error(args.tools)
     if tools is None:
         return 2
@@ -310,7 +316,7 @@ def cmd_memory_add(args: argparse.Namespace) -> int:
             paths=args.path,
             importance=args.importance,
             confidence=args.confidence,
-            enforcement=args.enforcement,
+            caution_level=args.caution_level,
         )
         store.link_related_memories(memory_id, project_id=project_id)
     print(memory_id)
@@ -599,7 +605,7 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
                 event_type="pre_tool_use",
                 tool_name=tool_name,
                 payload=tool_args,
-                policy_decision=None,
+                tool_decision=None,
             )
             return 0
         record_tool_event(
@@ -630,7 +636,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
         _print_json(rows)
     else:
         for event in rows:
-            print(f"{event['created_at']} {event['event_type']} {event.get('tool_name') or '-'} {event.get('policy_decision') or ''}")
+            print(f"{event['created_at']} {event['event_type']} {event.get('tool_name') or '-'} {event.get('tool_decision') or ''}")
     return 0
 
 
@@ -665,7 +671,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         result = verify_session(
             store.trace_events(session_id),
             memories=memories,
-            policy=load_policy(project.root),
+            verification_config=load_verification_config(project.root),
         )
     if args.json:
         _print_json(result.as_dict())
@@ -688,7 +694,7 @@ def cmd_eval_run(args: argparse.Namespace) -> int:
         result = run_eval(
             store.trace_events(session_id),
             memories=store.list_memories(project_id=project.id, include_global=True),
-            policy=load_policy(project.root),
+            verification_config=load_verification_config(project.root),
         )
     if args.json:
         _print_json(result.as_dict())
@@ -757,7 +763,7 @@ def cmd_eval_memory(args: argparse.Namespace) -> int:
         print(f"memory_recall: {result.memory_recall:.3f}")
         print(f"memory_precision: {result.memory_precision:.3f}")
         print(f"wrong_promotion_rate: {result.wrong_promotion_rate:.3f}")
-        print(f"wrong_policy_rate: {result.wrong_policy_rate:.3f}")
+        print(f"wrong_context_promotion_rate: {result.wrong_policy_rate:.3f}")
         print(f"stale_memory_rate: {result.stale_memory_rate:.3f}")
     return 0 if result.passed else 1
 
@@ -786,7 +792,7 @@ def cmd_eval_rag(args: argparse.Namespace) -> int:
         print("PASS" if result.passed else "FAIL")
         print(f"section_accuracy: {result.section_accuracy:.3f}")
         print(f"context_relevance: {result.context_relevance:.3f}")
-        print(f"policy_leak_rate: {result.policy_leak_rate:.3f}")
+        print(f"context_gate_leak_rate: {result.policy_leak_rate:.3f}")
         print(f"verifier_recall: {result.verifier_recall:.3f}")
         print(f"pass_rate: {result.pass_rate:.3f}")
         print(f"score: {result.score:.3f}")
@@ -808,7 +814,7 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
             eval_result = run_eval(
                 events,
                 memories=store.list_memories(project_id=project.id, include_global=True),
-                policy=load_policy(project.root),
+                verification_config=load_verification_config(project.root),
             )
         cleanup_result = lifecycle_result.cleanup if lifecycle_result else cleanup_memories(store)
     payload = {
@@ -858,7 +864,6 @@ def _record_memory_injection(
 ) -> None:
     sections = {
         "context": [memory.id for memory in pack.context],
-        "policy": [memory.id for memory in pack.policy],
         "verifier": [memory.id for memory in pack.verifier],
     }
     memory_ids = list(dict.fromkeys(memory_id for ids in sections.values() for memory_id in ids))

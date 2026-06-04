@@ -14,7 +14,7 @@ def record_tool_event(
     event_type: str,
     tool_name: str | None,
     payload: dict[str, Any],
-    policy_decision: str | None = None,
+    tool_decision: str | None = None,
 ) -> str:
     files = extract_files(payload)
     output_summary = summarize_output(payload)
@@ -25,7 +25,7 @@ def record_tool_event(
         tool_name=tool_name,
         input_json=payload,
         output_summary=output_summary,
-        policy_decision=policy_decision,
+        tool_decision=tool_decision,
         files=files,
     )
 

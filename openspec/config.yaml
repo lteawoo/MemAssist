@@ -2,7 +2,7 @@ schema: spec-driven
 
 context: |
   ai-codeassist is a memory assistant. Its enforcement behavior must follow
-  explicit project/user memory, not universal safety defaults. The product
-  should preserve project autonomy and avoid blocking or warning on actions
-  unless the project has remembered that policy.
-
+  AGENTS.md as the project principle SSOT. Stored memory is context for the
+  active coding agent, not an automatic policy engine. The product should
+  preserve project autonomy and avoid compiling remembered context into hidden
+  approval gates, tool blocks, or permission decisions.

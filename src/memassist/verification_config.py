@@ -4,13 +4,13 @@ import json
 from pathlib import Path
 
 
-def default_policy_yaml() -> str:
-    return """# memassist project policy
+def default_verification_config_yaml() -> str:
+    return """# memassist project verification config
 verification_commands: []
 """
 
 
-class PolicyConfig:
+class VerificationConfig:
     def __init__(
         self,
         *,
@@ -19,13 +19,13 @@ class PolicyConfig:
         self.verification_commands = list(verification_commands or [])
 
 
-def load_policy(project_root: Path) -> PolicyConfig:
-    path = project_root / ".memassist" / "policy.yaml"
+def load_verification_config(project_root: Path) -> VerificationConfig:
+    path = project_root / ".memassist" / "verification.yaml"
     if not path.exists():
-        return PolicyConfig()
+        return VerificationConfig()
     text = path.read_text(encoding="utf-8")
     data = _parse_minimal_yaml(text)
-    return PolicyConfig(
+    return VerificationConfig(
         verification_commands=data.get("verification_commands") or [],
     )
 

@@ -52,7 +52,7 @@ class OpenCodeIntegration:
             path,
             events,
             "installed" if "memassist" in text else "not installed",
-            lifecycle_capabilities(events, llm_directive_interpretation=False),
+            lifecycle_capabilities(events, isolated_memory_judgment=False),
         )
 
 
@@ -112,9 +112,7 @@ def _plugin_source(mode: ToolMode, *, memassist_home: Path | None = None) -> str
         lines.extend(
             [
                 "  hooks[\"tool.execute.before\"] = async (input, output) => {",
-                "    const response = runMemassist(\"PreToolUse\", { cwd: directory, toolName: input?.tool, toolArgs: output?.args || input?.args || {} })",
-                "    const decision = response?.hookSpecificOutput?.permissionDecision",
-                "    if (decision === \"deny\") throw new Error(response.hookSpecificOutput.permissionDecisionReason || \"memassist denied this tool call\")",
+                "    runMemassist(\"PreToolUse\", { cwd: directory, toolName: input?.tool, toolArgs: output?.args || input?.args || {} })",
                 "  }",
             ]
         )

@@ -158,7 +158,7 @@ PreToolUse hook은 trace 기록만 수행합니다. 사용자가 "리프레시 �
 ## 메모리 라이프사이클
 
 `memassist`는 모든 관찰을 곧바로 활성 기억으로 만들지 않습니다. Stop 시점의 isolated
-judge가 저장 후보를 만들고, deterministic policy가 `candidate`, `active`, `archived`
+judge가 저장 후보를 만들고, deterministic lifecycle rules가 `candidate`, `active`, `archived`
 중 하나로 정합니다. 상태의 권위는 `.memassist/memories/{active,candidates,archived}` 아래의 Markdown 파일 위치입니다.
 
 ```mermaid
@@ -232,10 +232,10 @@ flowchart TD
     K --> L[Relevant memassist memory로 주입]
 ```
 
-기본 정책 파일은 `.memassist/policy.yaml`입니다. 이 파일은 `verification_commands`
-(테스트 실행 reminder)만 보관합니다. `memassist`는 PreToolUse에서 경고나 차단을
-수행하지 않습니다. 사용자 지시는 memory retrieval을 통해 agent context에 주입되며,
-집행은 agent의 자율 판단에 맡겨집니다.
+기본 검증 설정 파일은 호환성을 위해 `.memassist/verification.yaml` 이름을 유지합니다.
+이 파일은 `verification_commands`(테스트 실행 reminder)만 보관합니다. `memassist`는
+PreToolUse에서 경고나 차단을 수행하지 않습니다. 사용자 지시는 memory retrieval을 통해
+agent context에 주입되며, 집행은 agent의 자율 판단에 맡겨집니다.
 
 ```yaml
 verification_commands: []
@@ -269,14 +269,15 @@ memassist doctor --json
 - 관련 경로: 요청에 등장한 파일 경로 또는 도메인 기반 경로 힌트
 - 필요한 섹션: 일반 context, 정책 reminder, 검증 reminder
 
-그 다음 여러 검색 채널을 동시에 사용합니다.
+그 다음 여러 검색 채널을 동시에 사용합니다. 규칙이나 주의사항처럼 보이는 memory도
+별도 정책 섹션으로 승격하지 않고 일반 context 후보로 다룹니다.
 
 ```mermaid
 flowchart TD
     A[사용자 요청] --> B[의도 분석]
     B --> C[lexical 검색]
     B --> D[metadata 검색]
-    B --> E[policy 검색]
+    B --> E[directive/context 검색]
     B --> F[verifier 검색]
     B --> G[path/link 검색]
     C --> H[rank fusion]
@@ -285,7 +286,7 @@ flowchart TD
     F --> H
     G --> H
     H --> I[중복 제거와 재정렬]
-    I --> J[context / policy / verifier memory pack]
+    I --> J[context / verifier memory pack]
     J --> K[AI 코딩 도구 prompt context]
 ```
 
@@ -295,7 +296,7 @@ flowchart TD
 | --- | --- |
 | `lexical` | 요청 문장과 memory 본문이 직접 맞는지 검색합니다. |
 | `metadata` | tag, path, type, status 같은 구조화 정보를 사용합니다. |
-| `policy` | 규칙, 주의사항, 보안 관련 memory를 우선 탐색합니다. |
+| `directive/context` | 규칙이나 주의사항처럼 보이는 memory도 agent 판단용 context로 탐색합니다. |
 | `verifier` | 테스트 명령, 검증 방식, 재현 절차를 찾습니다. |
 | `links_path` | 같은 파일, 같은 tag, 관련 memory link를 따라 확장합니다. |
 
@@ -307,19 +308,19 @@ flowchart TD
 flowchart LR
     A[lexical 순위] --> E[RRF 점수]
     B[metadata 순위] --> E
-    C[policy 순위] --> E
+    C[directive/context 순위] --> E
     D[verifier 순위] --> E
     F[path/link 순위] --> E
     E --> G[최종 순위]
     G --> H[섹션별 memory pack]
 ```
 
-최종 memory pack은 하나의 긴 목록이 아니라 세 섹션으로 나뉩니다.
+최종 주입 context는 하나의 긴 목록이 아니라 역할별로 정리됩니다. 현재 agent 판단용
+memory는 `context`, 검증 관련 memory는 `verifier` reminder로 주입됩니다.
 
 | 섹션 | 역할 |
 | --- | --- |
 | `context` | 프로젝트 사실, 결정, 선호, 일반 lesson을 담습니다. |
-| `policy` | 조심해야 할 규칙, 주의 reminder를 담습니다. agent context로 주입되어 자율 판단에 활용됩니다. |
 | `verifier` | 실행해야 할 테스트, 검증 명령, 확인 절차를 담습니다. |
 
 직접 확인하려면 다음 명령을 사용합니다.
@@ -403,10 +404,10 @@ memassist eval memory \
 - `memory_recall`
 - `memory_precision`
 - `wrong_promotion_rate`
-- `wrong_policy_rate`
+- `wrong_context_promotion_rate` (이전 JSON 호환 키: `wrong_policy_rate`)
 - `stale_memory_rate`
 
-RAG 평가는 `context`, `policy`, `verifier` 섹션까지 확인합니다.
+RAG 평가는 `context`, `verifier` 섹션과 금지 조건을 확인합니다.
 
 ```bash
 memassist eval rag --case-file evals/rag/basic.json --json
@@ -416,7 +417,7 @@ RAG 평가 지표는 다음과 같습니다.
 
 - `section_accuracy`: 기대한 memory가 맞는 섹션에 들어갔는지
 - `context_relevance`: context 섹션이 충분히 관련 있는지
-- `policy_leak_rate`: policy memory가 엉뚱한 섹션으로 새지 않는지
+- `context_gate_leak_rate` (이전 JSON 호환 키: `policy_leak_rate`): gate-like memory가 기대하지 않은 섹션으로 새지 않는지
 - `verifier_recall`: 검증 명령이나 테스트 workflow를 잘 찾는지
 - `pass_rate`: case별 기대 조건과 금지 조건을 만족하는지
 - `score`: 위 지표를 합친 종합 점수
@@ -502,5 +503,5 @@ import된 memory는 기본적으로 candidate입니다. 필요하면 `memassist 
 
 ## 추가 참고
 
-한국어 기준 문서는 이 README에서 관리합니다. [README.ko.md](README.ko.md)는 같은
-문서 기준을 가리키는 짧은 안내 파일입니다.
+프로젝트 원칙의 SSOT는 [AGENTS.md](AGENTS.md)입니다. 이 README는 사용자용 설명 문서이고,
+[README.ko.md](README.ko.md)는 같은 사용자 문서를 가리키는 짧은 안내 파일입니다.

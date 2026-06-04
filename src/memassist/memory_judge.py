@@ -11,7 +11,7 @@ from typing import Any, Protocol
 
 from .directives import _instruction_tags, _normalize_project_files
 from .integrations import status_tools
-from .models import ENFORCEMENTS, MEMORY_TYPES
+from .models import CAUTION_LEVELS, MEMORY_TYPES
 from .project import Project
 from .storage import Store
 
@@ -43,7 +43,7 @@ class MemoryJudgeCandidate:
     memory_content: str
     source_quote: str
     memory_type: str
-    enforcement: str
+    caution_level: str
     activation: str
     candidate_paths: list[str]
     meaning_preserved: bool
@@ -56,7 +56,7 @@ class MemoryJudgeCandidate:
             "memory_content": self.memory_content,
             "source_quote": self.source_quote,
             "memory_type": self.memory_type,
-            "enforcement": self.enforcement,
+            "caution_level": self.caution_level,
             "activation": self.activation,
             "candidate_paths": self.candidate_paths,
             "meaning_preserved": self.meaning_preserved,
@@ -341,7 +341,7 @@ def _build_judge_instruction(payload: dict[str, object]) -> str:
     return (
         "You are an isolated memory judge. Return only one compact JSON object with fields: "
         "should_store boolean, memory_content string, source_quote string, memory_type one of "
-        "fact/preference/rule/decision/lesson/workflow/open_thread/directive, enforcement one of "
+        "fact/preference/rule/decision/lesson/workflow/open_thread/directive, caution_level one of "
         "none/warn/block, activation one of candidate/active/rejected, "
         "candidate_paths string array, meaning_preserved boolean, "
         "contamination_risk one of low/medium/high, reason string. "
@@ -500,9 +500,9 @@ def store_judge_result(
     if candidate.contamination_risk == "high":
         return None
     memory_type = candidate.memory_type if candidate.memory_type in MEMORY_TYPES else "preference"
-    enforcement = candidate.enforcement if candidate.enforcement in ENFORCEMENTS else "none"
+    caution_level = candidate.caution_level if candidate.caution_level in CAUTION_LEVELS else "none"
     normalized_paths = _normalize_project_files(candidate.candidate_paths, project.root)
-    policy_like = enforcement in {"warn", "block"}
+    gate_like = caution_level in {"warn", "block"}
     status = _activation_status(candidate)
     content = (candidate.memory_content.strip() or candidate.source_quote.strip())[:500]
     if not content:
@@ -533,7 +533,7 @@ def store_judge_result(
         status=status,
         importance=0.85 if status == "active" else 0.65,
         confidence=0.85 if candidate.contamination_risk == "low" else 0.7,
-        enforcement=enforcement,
+        caution_level=caution_level,
         source_kind="isolated_memory_judge",
         source_ref=source_ref,
         source_quote=candidate.source_quote,
@@ -551,7 +551,7 @@ def store_judge_result(
             "payload": result.payload,
         },
         decision="isolated_judge_memory_stored",
-        risk="medium" if policy_like else "low",
+        risk="medium" if gate_like else "low",
         reason=memory.reason if memory else candidate.reason,
     )
     return memory_id
@@ -592,7 +592,7 @@ def _record_judge_result(
         event_type="memory_judged",
         tool_name="memassist",
         input_json=input_json,
-        policy_decision="store" if result.candidate and result.candidate.should_store else "skip",
+        tool_decision="store" if result.candidate and result.candidate.should_store else "skip",
         files=files,
     )
 
@@ -614,7 +614,7 @@ def _record_judge_failure(
             "source_event_id": source_event_id,
             **result.as_dict(),
         },
-        policy_decision="retry",
+        tool_decision="retry",
         files=[],
     )
 
@@ -636,9 +636,9 @@ def _candidate_from_output(output: str) -> MemoryJudgeCandidate:
     memory_type = _required_str(raw, "memory_type")
     if memory_type not in MEMORY_TYPES:
         raise ValueError(f"invalid memory_type: {memory_type}")
-    enforcement = _required_str(raw, "enforcement")
-    if enforcement not in ENFORCEMENTS:
-        raise ValueError(f"invalid enforcement: {enforcement}")
+    caution_level = _required_str(raw, "caution_level")
+    if caution_level not in CAUTION_LEVELS:
+        raise ValueError(f"invalid caution_level: {caution_level}")
     activation = _required_str(raw, "activation")
     if activation not in {"candidate", "active", "rejected"}:
         raise ValueError(f"invalid activation: {activation}")
@@ -650,7 +650,7 @@ def _candidate_from_output(output: str) -> MemoryJudgeCandidate:
         memory_content=_required_str(raw, "memory_content"),
         source_quote=_required_str(raw, "source_quote"),
         memory_type=memory_type,
-        enforcement=enforcement,
+        caution_level=caution_level,
         activation=activation,
         candidate_paths=_string_list(raw.get("candidate_paths")),
         meaning_preserved=meaning_preserved,
@@ -919,7 +919,7 @@ def _memory_conflicts(store: Store, *, project_id: str, content: str) -> list[di
                     "id": memory.id,
                     "type": memory.type,
                     "status": memory.status,
-                    "enforcement": memory.enforcement,
+                    "caution_level": memory.caution_level,
                 }
             )
     return conflicts
@@ -928,15 +928,25 @@ def _memory_conflicts(store: Store, *, project_id: str, content: str) -> list[di
 def _activation_status(candidate: MemoryJudgeCandidate) -> str:
     if candidate.activation == "rejected":
         return "archived"
-    if candidate.activation == "active" and candidate.contamination_risk == "low":
+    if _low_risk_auto_active(candidate):
         return "active"
     return "candidate"
 
 
+def _low_risk_auto_active(candidate: MemoryJudgeCandidate) -> bool:
+    if candidate.contamination_risk != "low":
+        return False
+    if candidate.caution_level != "none":
+        return False
+    if candidate.memory_type not in {"preference", "decision", "fact", "workflow"}:
+        return False
+    return candidate.activation == "active"
+
+
 def _judge_tags(candidate: MemoryJudgeCandidate) -> list[str]:
     tags = ["isolated_judge", candidate.memory_type]
-    if candidate.enforcement != "none":
-        tags.append(candidate.enforcement)
+    if candidate.caution_level != "none":
+        tags.append(candidate.caution_level)
     tags.extend(_instruction_tags(candidate.source_quote))
     tags.extend(_instruction_tags(candidate.memory_content))
     return list(dict.fromkeys(tags))

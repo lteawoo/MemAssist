@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "memassist"
 version = "0.1.0"
-description = "Memory, trace, and policy helper for AI coding agents"
+description = "Project-local memory RAG and trace helper for AI coding agents"
 requires-python = ">=3.10"
 dependencies = []
 
@@ -14,4 +14,3 @@ memassist = "memassist.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

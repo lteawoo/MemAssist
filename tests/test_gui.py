@@ -195,7 +195,13 @@ class GuiReadOnlyApiTest(unittest.TestCase):
             client = GuiApiClient(self.gui)
             try:
                 payloads: dict[str, Any] = {}
-                for endpoint in ("/api/summary", "/api/projects", "/api/memories", "/api/policy", "/api/tools"):
+                for endpoint in (
+                    "/api/summary",
+                    "/api/projects",
+                    "/api/memories",
+                    "/api/verification-config",
+                    "/api/tools",
+                ):
                     status, _headers, payload = client.get_json(endpoint)
                     self.assertEqual(status, 200, endpoint)
                     self.assertIsInstance(payload, (dict, list), endpoint)
@@ -206,7 +212,7 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                     or _contains_text(payloads["/api/projects"], project.id)
                 )
                 self.assertTrue(_contains_text(payloads["/api/memories"], "Keep GUI API read only."))
-                self.assertTrue(_contains_text(payloads["/api/policy"], "src/locked.py"))
+                self.assertTrue(_contains_text(payloads["/api/verification-config"], "verification_commands"))
                 for tool in ("codex", "claude", "opencode"):
                     self.assertTrue(_contains_text(payloads["/api/tools"], tool), tool)
                 self.assertTrue(_has_summary_signal(payloads["/api/summary"]))
@@ -219,7 +225,13 @@ class GuiReadOnlyApiTest(unittest.TestCase):
             self._assert_no_destructive_route_metadata()
             client = GuiApiClient(self.gui)
             try:
-                for endpoint in ("/api/summary", "/api/projects", "/api/memories", "/api/policy", "/api/tools"):
+                for endpoint in (
+                    "/api/summary",
+                    "/api/projects",
+                    "/api/memories",
+                    "/api/verification-config",
+                    "/api/tools",
+                ):
                     for method in ("POST", "PUT", "PATCH", "DELETE"):
                         status, _headers, _body = client.request(method, endpoint)
                         self.assertIn(status, {404, 405, 501}, f"{method} {endpoint}")
@@ -239,6 +251,7 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                 for memory in memories:
                     metrics = memory.get("metrics") or {}
                     evidence = metrics.get("evidence") or {}
+                    self.assertIn("caution_level", memory)
                     self.assertIsInstance(metrics.get("priority"), int)
                     self.assertGreaterEqual(metrics["priority"], 0)
                     self.assertLessEqual(metrics["priority"], 100)
@@ -318,6 +331,9 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                     status, _headers, payload = client.get_json(endpoint)
                     self.assertEqual(status, 200, endpoint)
                     self.assertIsInstance(payload, (dict, list), endpoint)
+                _status, _headers, traces = client.get_json("/api/traces")
+                trace = (traces.get("traces") or [])[0]
+                self.assertIn("tool_decision", trace)
             finally:
                 client.close()
 
@@ -347,6 +363,8 @@ class GuiReadOnlyApiTest(unittest.TestCase):
             "utility",
             "uses",
             "recurrence",
+            "cautionLevel",
+            "toolDecision",
             "priorityTooltip",
             "relevanceTooltip",
         }
@@ -357,9 +375,9 @@ class GuiReadOnlyApiTest(unittest.TestCase):
 
     def _seed_project(self) -> Any:
         self.assertEqual(main(["init", "--tools", "codex"]), 0)
-        policy_path = Path.cwd() / ".memassist" / "policy.yaml"
-        with policy_path.open("a", encoding="utf-8") as file:
-            file.write('\nprotected_paths:\n  - "src/locked.py"\n')
+        config_path = Path.cwd() / ".memassist" / "verification.yaml"
+        with config_path.open("a", encoding="utf-8") as file:
+            file.write('\nverification_commands:\n  - "pytest tests/test_gui.py"\n')
         project = detect_project()
         with Store() as store:
             store.upsert_project(project)
@@ -380,7 +398,7 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                 tags=["policy"],
                 paths=["src/locked.py"],
                 status="active",
-                enforcement="block",
+                caution_level="block",
             )
             store.add_trace_event(
                 session_id="sess_gui_readonly",

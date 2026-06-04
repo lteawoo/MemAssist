@@ -6,13 +6,12 @@ from typing import Literal, Protocol
 
 from memassist.project import Project
 
-ToolMode = Literal["full", "context", "trace", "guard"]
+ToolMode = Literal["full", "context", "trace"]
 
 MODE_EVENTS: dict[ToolMode, tuple[str, ...]] = {
     "full": ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"),
     "context": ("UserPromptSubmit",),
     "trace": ("PostToolUse", "Stop"),
-    "guard": ("PreToolUse",),
 }
 
 
@@ -67,12 +66,13 @@ class ToolIntegration(Protocol):
         ...
 
 
-def lifecycle_capabilities(events: tuple[str, ...], *, llm_directive_interpretation: bool = False) -> dict[str, bool]:
+def lifecycle_capabilities(events: tuple[str, ...], *, isolated_memory_judgment: bool = False) -> dict[str, bool]:
     event_set = set(events)
     return {
         "prompt_memory_injection": "UserPromptSubmit" in event_set,
-        "pre_tool_policy_enforcement": "PreToolUse" in event_set,
+        "pre_tool_trace_capture": "PreToolUse" in event_set,
+        "pre_tool_trace_only": "PreToolUse" in event_set,
         "post_tool_trace_extraction": "PostToolUse" in event_set,
         "stop_lifecycle_memory_extraction": "Stop" in event_set,
-        "llm_directive_interpretation": llm_directive_interpretation,
+        "isolated_memory_judgment": isolated_memory_judgment,
     }

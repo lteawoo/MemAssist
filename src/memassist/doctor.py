@@ -46,7 +46,7 @@ class DoctorReport:
 def run_doctor(project: Project) -> DoctorReport:
     root = project.root
     checks: list[DoctorCheck] = [
-        _path_check("project_config", root / ".memassist" / "policy.yaml", "run `memassist init`"),
+        _path_check("project_config", root / ".memassist" / "verification.yaml", "run `memassist init`"),
         _path_check("project_ignore", root / ".memassist" / "ignore", "run `memassist init`"),
     ]
 

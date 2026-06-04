@@ -59,11 +59,11 @@ def extract_candidates(events: list[Row]) -> list[MemoryCandidate]:
         candidates.append(
             MemoryCandidate(
                 type="lesson",
-                content="A policy-denied tool call occurred; review whether a persistent rule or workflow update is needed.",
-                tags=["policy", "lesson"],
+                content="A host-denied tool call occurred; review whether a persistent rule or workflow update is needed.",
+                tags=["tool_decision", "lesson"],
                 importance=0.8,
                 confidence=0.6,
-                reason="Policy denial was recorded in the session trace.",
+                reason="Host tool denial was recorded in the session trace.",
             )
         )
     return candidates

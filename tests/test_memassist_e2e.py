@@ -67,7 +67,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                     "memory_content": "Do not change refresh token policy without asking first.",
                     "source_quote": "리프레쉬 토큰 정책은 담부터 묻지 않고 고치지마",
                     "memory_type": "directive",
-                    "enforcement": "block",
+                    "caution_level": "block",
                     "activation": "active",
                     "candidate_paths": ["src/auth/refresh-token-policy.ts"],
                     "meaning_preserved": True,
@@ -107,7 +107,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                     if memory.source_kind == "isolated_memory_judge"
                 ]
             self.assertEqual(len(judged), 1)
-            self.assertEqual(judged[0]["status"], "active")
+            self.assertEqual(judged[0]["status"], "candidate")
             self.assertEqual(judged[0]["content"], "Do not change refresh token policy without asking first.")
 
             pretool_payload = {

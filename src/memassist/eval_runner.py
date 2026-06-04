@@ -5,7 +5,7 @@ from typing import Any
 
 from .extraction import extract_candidates
 from .models import Memory
-from .policy import PolicyConfig
+from .verification_config import VerificationConfig
 from .verifier import verify_session
 
 
@@ -23,12 +23,20 @@ class EvalResult:
         }
 
 
-def run_eval(events: list[Any], *, memories: list[Memory], policy: PolicyConfig) -> EvalResult:
-    verification = verify_session(events, memories=memories, policy=policy)
+def run_eval(
+    events: list[Any],
+    *,
+    memories: list[Memory],
+    verification_config: VerificationConfig,
+) -> EvalResult:
+    verification = verify_session(
+        events,
+        memories=memories,
+        verification_config=verification_config,
+    )
     candidates = extract_candidates(events)
     return EvalResult(
         passed=verification.passed,
         verification=verification.as_dict(),
         candidate_count=len(candidates),
     )
-

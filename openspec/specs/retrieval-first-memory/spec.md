@@ -52,9 +52,9 @@ memassist SHALL inject relevant memories through the coding tool's prompt-contex
 - **AND** the active coding agent SHALL be responsible for judging the current user instruction against the retrieved memory
 
 ### Requirement: memassist SHALL NOT enforce policy at the PreToolUse hook
-memassist SHALL NOT warn, block, or otherwise gate tool execution at the `PreToolUse` hook, whether from stored memories or from manual `policy.yaml` entries. memassist SHALL NOT mutate `policy.yaml` from stored memories. Memory status changes SHALL affect retrieval eligibility only. Retrieved memory is delivered as additional context so the active coding agent can judge the current instruction autonomously.
+memassist SHALL NOT warn, block, or otherwise gate tool execution at the `PreToolUse` hook, whether from stored memories or from manual `verification.yaml` entries. memassist SHALL NOT mutate `verification.yaml` from stored memories. Memory status changes SHALL affect retrieval eligibility only. Retrieved memory is delivered as additional context so the active coding agent can judge the current instruction autonomously.
 
-#### Scenario: Memory activation does not create enforcement
+#### Scenario: Memory activation does not create caution_level
 - **GIVEN** a directive memory has path metadata for `src/auth/refresh-token-policy.ts`
 - **WHEN** the memory is activated
 - **THEN** memassist SHALL mark the memory active for retrieval
@@ -67,7 +67,7 @@ memassist SHALL NOT warn, block, or otherwise gate tool execution at the `PreToo
 - **AND** memassist SHALL record the tool event as trace data
 
 #### Scenario: PreToolUse does not enforce even manual policy entries
-- **GIVEN** project `policy.yaml` manually includes `protected_paths: ["src/auth/refresh-token-policy.ts"]`
+- **GIVEN** project `verification.yaml` manually includes `protected_paths: ["src/auth/refresh-token-policy.ts"]`
 - **WHEN** a `PreToolUse` hook receives a patch targeting `src/auth/refresh-token-policy.ts`
 - **THEN** memassist SHALL NOT return any warn or block decision
 - **AND** memassist SHALL record the tool event as trace data only

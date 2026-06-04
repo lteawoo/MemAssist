@@ -8,13 +8,17 @@
           "type": "lesson",
           "content": "Session timeout fixes should update the session timeout behavior only.",
           "tags": ["auth", "session", "timeout"],
-          "paths": ["src/auth/session.py"]
+          "paths": ["src/auth/session.py"],
+          "source_quote": "Session timeout fixes should update the session timeout behavior only.",
+          "source_ref": "evals/rag/basic.json#case-1-context"
         },
         {
           "section": "verifier",
           "type": "workflow",
           "content": "Run npm test -- auth session after session timeout changes.",
-          "tags": ["verification", "test", "auth", "session"]
+          "tags": ["verification", "test", "auth", "session"],
+          "source_quote": "Run npm test -- auth session after session timeout changes.",
+          "source_ref": "evals/rag/basic.json#case-1-verifier"
         }
       ],
       "expect": [
@@ -29,16 +33,18 @@
       "query": "edit refresh token policy",
       "seed": [
         {
-          "section": "policy",
+          "section": "context",
           "type": "rule",
-          "content": "Refresh token policy edits are blocked by autonomous memory policy.",
-          "tags": ["auth", "security", "refresh", "token", "policy"],
+          "content": "Ask before editing refresh token behavior; this is agent context, not a tool block.",
+          "tags": ["auth", "security", "refresh", "token", "directive"],
           "paths": ["src/auth/refresh-token-policy.ts"],
-          "enforcement": "block"
+          "caution_level": "none",
+          "source_quote": "Ask before editing refresh token behavior.",
+          "source_ref": "evals/rag/basic.json#case-2-context"
         }
       ],
       "expect": [
-        { "term": "refresh token", "section": "policy" }
+        { "term": "refresh token", "section": "context" }
       ],
       "forbid": [
         { "term": "temporary branch", "section": "*" }

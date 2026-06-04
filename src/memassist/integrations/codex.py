@@ -42,5 +42,5 @@ class CodexIntegration:
             path=Path(str(raw["path"])),
             events=events,
             detail="installed" if raw["installed"] else "not installed",
-            capabilities=lifecycle_capabilities(events, llm_directive_interpretation=bool(raw["installed"])),
+            capabilities=lifecycle_capabilities(events, isolated_memory_judgment=bool(raw["installed"])),
         )

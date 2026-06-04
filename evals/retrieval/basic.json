@@ -9,15 +9,19 @@
           "type": "workflow",
           "content": "Run npm test -- auth session after session timeout changes.",
           "tags": ["verification", "test", "auth", "session", "timeout"],
-          "status": "long_term",
-          "importance": 0.8
+          "status": "active",
+          "importance": 0.8,
+          "source_quote": "Run npm test -- auth session after session timeout changes.",
+          "source_ref": "evals/retrieval/basic.json#case-1-workflow"
         },
         {
           "type": "preference",
-          "content": "Keep refresh token policy changes as an internal blocked memory policy.",
+          "content": "Refresh token change reminders stay as agent context, not host tool control.",
           "tags": ["auth", "token"],
           "status": "candidate",
-          "importance": 0.9
+          "importance": 0.9,
+          "source_quote": "Refresh token change reminders stay as agent context, not host tool control.",
+          "source_ref": "evals/retrieval/basic.json#case-1-candidate"
         }
       ],
       "limit": 5

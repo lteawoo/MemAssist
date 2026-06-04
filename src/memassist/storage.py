@@ -15,7 +15,7 @@ from .memory_artifacts import (
     read_memory_artifact_by_id,
     sync_memory_artifact,
 )
-from .models import ENFORCEMENTS, MEMORY_STATUSES, MEMORY_TYPES, Memory
+from .models import CAUTION_LEVELS, MEMORY_STATUSES, MEMORY_TYPES, Memory
 from .paths import db_path
 from .project import Project
 
@@ -70,7 +70,7 @@ class Store:
               retrieval_count INTEGER NOT NULL DEFAULT 0,
               utility REAL NOT NULL DEFAULT 0.0,
               half_life_days REAL NOT NULL DEFAULT 30.0,
-              enforcement TEXT NOT NULL,
+              caution_level TEXT NOT NULL,
               source_kind TEXT NOT NULL,
               source_ref TEXT,
               created_at TEXT NOT NULL,
@@ -88,7 +88,7 @@ class Store:
               tool_name TEXT,
               input_json TEXT,
               output_summary TEXT,
-              policy_decision TEXT,
+              tool_decision TEXT,
               files_json TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
@@ -185,7 +185,7 @@ class Store:
         retrieval_count: int = 0,
         utility: float = 0.0,
         half_life_days: float | None = None,
-        enforcement: str = "none",
+        caution_level: str = "none",
         source_kind: str = "manual",
         source_ref: str | None = None,
         source_quote: str | None = None,
@@ -197,14 +197,14 @@ class Store:
             raise ValueError(f"invalid memory type: {type}")
         if status not in MEMORY_STATUSES:
             raise ValueError(f"invalid memory status: {status}")
-        if enforcement not in ENFORCEMENTS:
-            raise ValueError(f"invalid enforcement: {enforcement}")
+        if caution_level not in CAUTION_LEVELS:
+            raise ValueError(f"invalid caution_level: {caution_level}")
         memory_id = f"mem_{uuid.uuid4().hex[:12]}"
         ts = now_iso()
         tags = tags or []
         paths = paths or []
         strength = _clamp(strength if strength is not None else (importance + confidence) / 2)
-        half_life_days = half_life_days if half_life_days is not None else _default_half_life_days(type, status, enforcement)
+        half_life_days = half_life_days if half_life_days is not None else _default_half_life_days(type, status, caution_level)
         memory = Memory(
             id=memory_id,
             scope_type=scope_type,
@@ -223,7 +223,7 @@ class Store:
             retrieval_count=retrieval_count,
             utility=utility,
             half_life_days=half_life_days,
-            enforcement=enforcement,
+            caution_level=caution_level,
             source_kind=source_kind,
             source_ref=source_ref,
             created_at=ts,
@@ -403,12 +403,12 @@ class Store:
             self._upsert_memory_index(updated)
             self.conn.commit()
 
-    def update_enforcement(self, memory_id: str, enforcement: str) -> None:
-        if enforcement not in ENFORCEMENTS:
-            raise ValueError(f"invalid enforcement: {enforcement}")
+    def update_caution_level(self, memory_id: str, caution_level: str) -> None:
+        if caution_level not in CAUTION_LEVELS:
+            raise ValueError(f"invalid caution_level: {caution_level}")
         memory = self.get_memory(memory_id)
         if memory:
-            updated = replace(memory, enforcement=enforcement, updated_at=now_iso())
+            updated = replace(memory, caution_level=caution_level, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
             self._upsert_memory_index(updated)
             self.conn.commit()
@@ -450,7 +450,7 @@ class Store:
         tool_name: str | None = None,
         input_json: dict[str, Any] | None = None,
         output_summary: str | None = None,
-        policy_decision: str | None = None,
+        tool_decision: str | None = None,
         files: list[str] | None = None,
     ) -> str:
         event_id = f"evt_{uuid.uuid4().hex[:12]}"
@@ -458,7 +458,7 @@ class Store:
             """
             INSERT INTO trace_events (
               id, session_id, project_id, event_type, tool_name, input_json,
-              output_summary, policy_decision, files_json, created_at
+              output_summary, tool_decision, files_json, created_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -470,7 +470,7 @@ class Store:
                 tool_name,
                 json.dumps(input_json or {}),
                 output_summary,
-                policy_decision,
+                tool_decision,
                 json.dumps(files or []),
                 now_iso(),
             ),
@@ -655,7 +655,7 @@ class Store:
         reason: str | None,
         paths: list[str],
         status: str,
-        enforcement: str,
+        caution_level: str,
     ) -> None:
         index_text = _memory_index_text(
             content=content,
@@ -664,9 +664,9 @@ class Store:
             tags=tags,
             paths=paths,
             status=status,
-            enforcement=enforcement,
+            caution_level=caution_level,
         )
-        tag_text = " ".join([*tags, *paths, type, status, enforcement])
+        tag_text = " ".join([*tags, *paths, type, status, caution_level])
         self.conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))
         self.conn.execute(
             "INSERT INTO memory_fts (memory_id, content, tags) VALUES (?, ?, ?)",
@@ -680,7 +680,7 @@ class Store:
               id, scope_type, project_id, session_id, type, content, reason,
               tags_json, paths_json, status, importance, confidence,
               strength, recurrence, retrieval_count, utility, half_life_days,
-              enforcement, source_kind, source_ref, created_at, updated_at,
+              caution_level, source_kind, source_ref, created_at, updated_at,
               last_used_at, expires_at, superseded_by
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -701,7 +701,7 @@ class Store:
               retrieval_count = excluded.retrieval_count,
               utility = excluded.utility,
               half_life_days = excluded.half_life_days,
-              enforcement = excluded.enforcement,
+              caution_level = excluded.caution_level,
               source_kind = excluded.source_kind,
               source_ref = excluded.source_ref,
               created_at = excluded.created_at,
@@ -728,7 +728,7 @@ class Store:
                 memory.retrieval_count,
                 memory.utility,
                 memory.half_life_days,
-                memory.enforcement,
+                memory.caution_level,
                 memory.source_kind,
                 memory.source_ref,
                 memory.created_at,
@@ -746,7 +746,7 @@ class Store:
             reason=memory.reason,
             paths=memory.paths,
             status=memory.status,
-            enforcement=memory.enforcement,
+            caution_level=memory.caution_level,
         )
 
     def _prune_memory_index(self, artifact_ids: set[str]) -> None:
@@ -804,7 +804,7 @@ class Store:
             retrieval_count=row["retrieval_count"],
             utility=row["utility"],
             half_life_days=row["half_life_days"],
-            enforcement=row["enforcement"],
+            caution_level=row["caution_level"],
             source_kind=row["source_kind"],
             source_ref=row["source_ref"],
             created_at=row["created_at"],
@@ -847,7 +847,7 @@ def _memory_index_text(
     tags: list[str],
     paths: list[str],
     status: str,
-    enforcement: str,
+    caution_level: str,
 ) -> str:
     section = "context"
     if type == "workflow" or set(tags) & {"test", "tests", "verification", "verify", "ci"}:
@@ -859,7 +859,7 @@ def _memory_index_text(
             f"type {type}",
             f"section {section}",
             f"status {status}",
-            f"enforcement {enforcement}",
+            f"caution_level {caution_level}",
             "tags " + " ".join(tags) if tags else "",
             "paths " + " ".join(paths) if paths else "",
         ]
@@ -867,7 +867,7 @@ def _memory_index_text(
     )
 
 
-def _default_half_life_days(type: str, status: str, enforcement: str) -> float:
+def _default_half_life_days(type: str, status: str, caution_level: str) -> float:
     if type == "workflow":
         return 120.0
     if type in {"decision", "preference", "rule", "directive"}:

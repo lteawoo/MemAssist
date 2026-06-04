@@ -1,7 +1,7 @@
 {
   "cases": [
     {
-      "name": "verification workflow is remembered without policy noise",
+      "name": "verification workflow is remembered without gate noise",
       "query": "session timeout npm verification",
       "expect": ["npm test"],
       "forbid": ["refresh token"],
@@ -10,41 +10,49 @@
           "type": "workflow",
           "content": "Run npm test -- auth session after session timeout changes.",
           "tags": ["verification", "test", "auth", "session", "timeout"],
-          "status": "long_term",
-          "importance": 0.8
+          "status": "active",
+          "importance": 0.8,
+          "source_quote": "Run npm test -- auth session after session timeout changes.",
+          "source_ref": "evals/memory_quality/basic.json#case-1-workflow"
         },
         {
           "type": "preference",
-          "content": "Keep refresh token policy changes as an internal blocked memory policy.",
+          "content": "Refresh token change reminders stay as agent context, not host tool control.",
           "tags": ["auth", "token"],
           "status": "candidate",
-          "importance": 0.9
+          "importance": 0.9,
+          "source_quote": "Refresh token change reminders stay as agent context, not host tool control.",
+          "source_ref": "evals/memory_quality/basic.json#case-1-candidate"
         }
       ],
       "limit": 5
     },
     {
-      "name": "policy memory is retrieved only when relevant",
+      "name": "directive-like memory is retrieved only when relevant",
       "query": "refresh token protected path",
       "expect": ["refresh token"],
       "forbid": ["temporary branch"],
-      "expect_statuses": ["block_policy", "warn_policy", "durable", "long_term", "active", "auto_active", "pinned"],
+      "expect_statuses": ["active"],
       "seed": [
         {
           "type": "rule",
-          "content": "Refresh token policy edits are blocked by autonomous memory policy.",
-          "tags": ["auth", "security", "refresh", "token", "policy"],
+          "content": "Ask before editing refresh token behavior; this is agent context, not a tool block.",
+          "tags": ["auth", "security", "refresh", "token", "directive"],
           "paths": ["src/auth/refresh-token-policy.ts"],
-          "status": "block_policy",
-          "enforcement": "block",
-          "importance": 0.9
+          "status": "active",
+          "caution_level": "none",
+          "importance": 0.9,
+          "source_quote": "Ask before editing refresh token behavior.",
+          "source_ref": "evals/memory_quality/basic.json#case-2-directive"
         },
         {
           "type": "workflow",
           "content": "Delete temporary branch after release cleanup.",
           "tags": ["git", "cleanup"],
           "status": "candidate",
-          "importance": 0.4
+          "importance": 0.4,
+          "source_quote": "Delete temporary branch after release cleanup.",
+          "source_ref": "evals/memory_quality/basic.json#case-2-candidate"
         }
       ],
       "limit": 5

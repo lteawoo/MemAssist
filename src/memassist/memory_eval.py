@@ -61,6 +61,7 @@ class MemoryQualityEvalResult:
             "case_count": self.case_count,
             "memory_recall": self.memory_recall,
             "memory_precision": self.memory_precision,
+            "wrong_context_promotion_rate": self.wrong_policy_rate,
             "wrong_promotion_rate": self.wrong_promotion_rate,
             "wrong_policy_rate": self.wrong_policy_rate,
             "stale_memory_rate": self.stale_memory_rate,

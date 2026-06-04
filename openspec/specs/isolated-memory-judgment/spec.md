@@ -1,7 +1,7 @@
 # isolated-memory-judgment Specification
 
 ## Purpose
-Define how memassist evaluates prompt-derived persistent memories with an isolated judge, preserves user meaning, avoids contaminated context, and stages policy-like memories until explicit activation.
+Define how memassist evaluates prompt-derived persistent memories with an isolated judge, preserves user meaning, avoids contaminated context, and keeps directive-like memories as retrieval context rather than policy.
 ## Requirements
 ### Requirement: memassist SHALL judge prompt-derived persistent memories in isolation
 
@@ -36,7 +36,7 @@ Users SHALL NOT need to know about memory commands or explicitly request memory 
 
 ### Requirement: memassist SHALL stage policy-like memory separately from policy compilation
 
-When the isolated judge identifies a directive that affects approval, warning, blocking, sensitive paths, or protected paths, memassist SHALL store it as source-language memory with retrieval metadata. memassist SHALL NOT compile judged memories into project policy during `UserPromptSubmit`, activation, lifecycle processing, or any automatic memory workflow.
+When the isolated judge identifies a directive that affects approval, warning, blocking, sensitive paths, or protected paths, memassist SHALL store it as source-language memory with retrieval metadata. memassist SHALL NOT compile judged memories into project verification config during `UserPromptSubmit`, activation, lifecycle processing, or any automatic memory workflow.
 
 #### Scenario: Approval-before-edit directive becomes retrievable memory
 
@@ -52,7 +52,7 @@ When the isolated judge identifies a directive that affects approval, warning, b
 
 #### Scenario: Judge output cannot create policy status
 
-- **WHEN** the isolated judge returns enforcement-like metadata such as `warn` or `block`
+- **WHEN** the isolated judge returns caution_level-like metadata such as `warn` or `block`
 - **THEN** memassist SHALL use that metadata only for retrieval and display context
 - **AND** memassist SHALL NOT store the memory with `warn_policy` or `block_policy` status
 
@@ -96,15 +96,15 @@ Every stored prompt-derived memory SHALL include source evidence that allows the
 - **AND** the stored record SHALL include the source quote when available
 - **AND** the stored record SHALL include the source reference when available
 
-### Requirement: memassist SHALL keep session approval separate from persistent memory judgment
+### Requirement: memassist SHALL keep one-off approval replies out of persistent memory judgment
 
-Explicit approval prompts SHALL continue to create short-lived session approval grants and SHALL NOT create persistent memory candidates through the isolated judge.
+One-off approval replies SHALL NOT create persistent memory candidates through the isolated judge. memassist SHALL NOT convert them into hidden approval gates, tool permissions, or durable policy state.
 
-#### Scenario: Approval prompt creates grant only
+#### Scenario: Approval prompt creates no persistent memory
 
 - **WHEN** a user prompt says `승인`
-- **THEN** memassist SHALL create a session-scoped approval grant when applicable
-- **AND** memassist SHALL NOT create a persistent memory candidate from that approval prompt
+- **THEN** memassist SHALL NOT create a persistent memory candidate from that approval prompt
+- **AND** memassist SHALL NOT create or update a hidden approval gate or tool permission decision from that prompt
 
 ### Requirement: memassist SHALL select the isolated judge backend from initialized tools
 

@@ -11,7 +11,7 @@ def lesson_from_session(events: list[Row], feedback: str | None = None) -> str:
     if feedback:
         pieces.append(feedback.strip())
     if summary.denied_events:
-        pieces.append(f"{summary.denied_events} policy-denied action(s) occurred.")
+        pieces.append(f"{summary.denied_events} host-denied action(s) occurred.")
     if summary.files:
         pieces.append("Review future changes touching: " + ", ".join(summary.files[:5]))
     if summary.test_commands:

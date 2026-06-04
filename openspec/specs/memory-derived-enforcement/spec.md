@@ -33,24 +33,24 @@ or equivalent mechanical policy logic. 사용자 지시는 memory로 저장되�
 
 ### Requirement: verification_commands SHALL be preserved as retrieval reminders
 
-`policy.yaml`의 `verification_commands` SHALL be treated as retrieval reminders,
-not allow/warn/block enforcement data. `load_policy`는 이 필드를 읽어 verifier 섹션
+`verification.yaml`의 `verification_commands` SHALL be treated as retrieval reminders,
+not allow/warn/block caution_level data. `load_verification_config`는 이 필드를 읽어 verifier 섹션
 retrieval과 verify/eval에서 사용한다.
 
 #### Scenario: verification_commands 보존
 
-- **GIVEN** `policy.yaml`에 `verification_commands`가 설정되어 있다
-- **WHEN** `load_policy`가 호출된다
+- **GIVEN** `verification.yaml`에 `verification_commands`가 설정되어 있다
+- **WHEN** `load_verification_config`가 호출된다
 - **THEN** `verification_commands`는 로드된다
 - **AND** 이 데이터는 `verifier` memory 섹션 retrieval과 verify/eval에서 사용된다
 
-### Requirement: generated policy files SHALL NOT include enforcement keys
+### Requirement: generated verification config files SHALL NOT include caution_level keys
 
-새로 생성되는 `policy.yaml` SHALL NOT include `sensitive_paths`, `protected_paths`,
+새로 생성되는 `verification.yaml` SHALL NOT include `sensitive_paths`, `protected_paths`,
 or `dangerous_commands` keys.
 
-#### Scenario: 기본 policy 파일 형식
+#### Scenario: 기본 verification config 파일 형식
 
 - **WHEN** `memassist init`이 실행된다
-- **THEN** 생성된 `policy.yaml`은 `verification_commands: []`만 포함한다
+- **THEN** 생성된 `verification.yaml`은 `verification_commands: []`만 포함한다
 - **AND** `sensitive_paths`, `protected_paths`, `dangerous_commands`는 포함하지 않는다

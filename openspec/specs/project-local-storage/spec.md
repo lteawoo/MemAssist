@@ -13,14 +13,14 @@ When `memassist init` runs in a directory without `.git` or an existing project 
 - **WHEN** the user runs `memassist init`
 - **THEN** memassist SHALL create `/work/plain-project/.memassist`
 - **AND** memassist SHALL store the project root as `/work/plain-project`
-- **AND** memassist SHALL NOT write project policy or hooks into the parent directory
+- **AND** memassist SHALL NOT write project verification config or hooks into the parent directory
 
 ### Requirement: memassist SHALL use project `.memassist` as the default project home
 For project-scoped initialization, memassist SHALL use `<project>/.memassist` as the default home for project memory data, policy, ignore files, and hook-pinned runtime state.
 
 #### Scenario: Project DB is created under project `.memassist`
 - **WHEN** a user runs `memassist init` in a project directory
-- **THEN** memassist SHALL create `<project>/.memassist/policy.yaml`
+- **THEN** memassist SHALL create `<project>/.memassist/verification.yaml`
 - **AND** memassist SHALL create or use `<project>/.memassist/memassist.db` for project memory storage
 
 #### Scenario: Project hook pins local memory home

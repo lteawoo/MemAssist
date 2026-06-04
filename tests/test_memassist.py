@@ -15,7 +15,7 @@ from memassist.extraction import extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from memassist.memory_judge import INTERPRETER_ACTIVE_ENV
 from memassist.models import MEMORY_STATUSES, Memory
-from memassist.policy import default_policy_yaml, load_policy
+from memassist.verification_config import default_verification_config_yaml, load_verification_config
 from memassist.project import detect_project, detect_project_for_init
 from memassist.retrieval import analyze_query_intent, build_memory_pack
 from memassist.storage import Store, now_iso
@@ -99,12 +99,12 @@ class MemassistTest(unittest.TestCase):
         with isolated_env() as (_root, project, _home):
             code = main(["init"])
             self.assertEqual(code, 0)
-            policy_path = project / ".memassist" / "policy.yaml"
-            self.assertTrue(policy_path.exists())
-            policy_text = policy_path.read_text(encoding="utf-8")
-            self.assertIn("verification_commands: []", policy_text)
-            self.assertNotIn(".env", policy_text)
-            self.assertNotIn("rm -rf", policy_text)
+            config_path = project / ".memassist" / "verification.yaml"
+            self.assertTrue(config_path.exists())
+            config_text = config_path.read_text(encoding="utf-8")
+            self.assertIn("verification_commands: []", config_text)
+            self.assertNotIn(".env", config_text)
+            self.assertNotIn("rm -rf", config_text)
             self.assertTrue((project / ".memassist" / "ignore").exists())
             self.assertTrue((project / ".memassist" / "memories" / "active").exists())
             self.assertTrue((project / ".memassist" / "memories" / "candidates").exists())
@@ -129,9 +129,9 @@ class MemassistTest(unittest.TestCase):
                 self.assertEqual(detected.root, project.resolve())
                 code = main(["init", "--tools", "codex"])
                 self.assertEqual(code, 0)
-                self.assertTrue((project / ".memassist" / "policy.yaml").exists())
+                self.assertTrue((project / ".memassist" / "verification.yaml").exists())
                 self.assertTrue((project / ".codex" / "hooks.json").exists())
-                self.assertFalse((fake_home / ".memassist" / "policy.yaml").exists())
+                self.assertFalse((fake_home / ".memassist" / "verification.yaml").exists())
                 self.assertFalse((fake_home / ".codex" / "hooks.json").exists())
             finally:
                 os.chdir(old_cwd)
@@ -166,7 +166,7 @@ class MemassistTest(unittest.TestCase):
                 self.assertEqual(detected.root, project.resolve())
                 code = main(["init", "--tools", "codex"])
                 self.assertEqual(code, 0)
-                self.assertTrue((project / ".memassist" / "policy.yaml").exists())
+                self.assertTrue((project / ".memassist" / "verification.yaml").exists())
                 self.assertTrue((project / ".memassist" / "memassist.db").exists())
                 self.assertTrue((project / ".codex" / "hooks.json").exists())
                 self.assertFalse((parent / ".codex" / "hooks.json").exists())
@@ -227,7 +227,7 @@ class MemassistTest(unittest.TestCase):
                         "memory_content": "Confirm before changing refresh token behavior.",
                         "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해",
                         "memory_type": "directive",
-                        "enforcement": "warn",
+                        "caution_level": "warn",
                         "activation": "candidate",
                         "candidate_paths": ["src/auth/refresh-token-policy.ts"],
                         "meaning_preserved": True,
@@ -336,11 +336,16 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(set(statuses), {"codex", "claude", "opencode"})
             self.assertTrue(all(item["installed"] for item in statuses.values()))
             self.assertTrue(statuses["codex"]["capabilities"]["prompt_memory_injection"])
-            self.assertTrue(statuses["codex"]["capabilities"]["llm_directive_interpretation"])
-            # Claude now has a judge adapter (claude -p), so it is judge-capable;
+            self.assertTrue(statuses["codex"]["capabilities"]["pre_tool_trace_capture"])
+            self.assertTrue(statuses["codex"]["capabilities"]["pre_tool_trace_only"])
+            self.assertTrue(statuses["codex"]["capabilities"]["isolated_memory_judgment"])
+            # Claude has a judge adapter (claude -p), so it is judge-capable;
             # OpenCode has no adapter and stays non-judge-capable.
-            self.assertTrue(statuses["claude"]["capabilities"]["llm_directive_interpretation"])
-            self.assertFalse(statuses["opencode"]["capabilities"]["llm_directive_interpretation"])
+            self.assertTrue(statuses["claude"]["capabilities"]["isolated_memory_judgment"])
+            self.assertFalse(statuses["opencode"]["capabilities"]["isolated_memory_judgment"])
+            plugin = (project / ".opencode" / "plugins" / "memassist.js").read_text(encoding="utf-8")
+            self.assertNotIn("permissionDecision", plugin)
+            self.assertNotIn("memassist denied this tool call", plugin)
 
     def test_tools_uninstall_removes_selected_integration(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -422,7 +427,7 @@ class MemassistTest(unittest.TestCase):
                     type="lesson",
                     content="Do not change refresh token policy for session timeout fixes.",
                     tags=["auth", "session"],
-                    enforcement="block",
+                    caution_level="block",
                     importance=0.9,
                 )
                 store.add_memory(
@@ -437,8 +442,7 @@ class MemassistTest(unittest.TestCase):
                 self.assertGreaterEqual(len(results), 1)
                 pack = build_memory_pack(store, query="session timeout", project_id=project.id)
                 self.assertTrue(pack.context)
-                self.assertEqual(pack.policy, [])
-                self.assertTrue(any(memory.enforcement == "block" for memory in pack.context))
+                self.assertTrue(any(memory.caution_level == "block" for memory in pack.context))
                 self.assertTrue(pack.verifier)
             finally:
                 store.close()
@@ -452,7 +456,7 @@ class MemassistTest(unittest.TestCase):
         self.assertIn("tests", intent.domains)
         self.assertIn("src/auth/session.py", intent.likely_paths)
         self.assertEqual(intent.risk_level, "high")
-        self.assertTrue(intent.needs_policy)
+        self.assertTrue(intent.needs_caution_context)
         self.assertTrue(intent.needs_verifier)
         self.assertIn("auth", " ".join(intent.retrieval_queries))
 
@@ -478,7 +482,7 @@ class MemassistTest(unittest.TestCase):
                     type="rule",
                     content="Block active retrieval policy behavior changes unless the directive changes.",
                     tags=["policy", "retrieval"],
-                    enforcement="block",
+                    caution_level="block",
                     importance=0.9,
                 )
                 store.add_memory(
@@ -496,8 +500,7 @@ class MemassistTest(unittest.TestCase):
                 )
                 self.assertEqual(pack.intent.task_type if pack.intent else None, "feature")
                 self.assertTrue(any("retrieval module" in memory.content for memory in pack.context))
-                self.assertEqual(pack.policy, [])
-                self.assertTrue(any(memory.enforcement == "block" for memory in pack.context))
+                self.assertTrue(any(memory.caution_level == "block" for memory in pack.context))
                 self.assertTrue(any(memory.type == "workflow" for memory in pack.verifier))
             finally:
                 store.close()
@@ -516,7 +519,7 @@ class MemassistTest(unittest.TestCase):
                     tags=["auth", "token", "refresh", "directive"],
                     paths=["src/auth/refresh-token-policy.ts"],
                     status="active",
-                    enforcement="warn",
+                    caution_level="warn",
                     source_kind="isolated_memory_judge",
                 )
                 for query in [
@@ -529,8 +532,7 @@ class MemassistTest(unittest.TestCase):
                         any("리프레시 토큰 변경" in memory.content for memory in pack.context),
                         query,
                     )
-                    self.assertEqual(pack.policy, [])
-
+                    
     def test_retrieval_eval_measures_expected_and_forbidden_memory(self) -> None:
         with isolated_env():
             main(["init"])
@@ -550,7 +552,7 @@ class MemassistTest(unittest.TestCase):
                     scope_type="project",
                     project_id=project.id,
                     type="preference",
-                    content="Keep refresh token policy changes as an internal blocked memory policy.",
+                    content="Refresh token change reminders stay as agent context, not host tool control.",
                     tags=["auth", "token"],
                     status="candidate",
                     importance=0.9,
@@ -591,7 +593,7 @@ class MemassistTest(unittest.TestCase):
                 memories = store.list_memories(project_id=project.id, include_global=False)
                 self.assertFalse(any(memory.source_kind == "retrieval_eval_seed" for memory in memories))
 
-    def test_memory_quality_eval_measures_wrong_policy_and_stale_rates(self) -> None:
+    def test_memory_quality_eval_measures_wrong_context_promotion_and_stale_rates(self) -> None:
         with isolated_env():
             main(["init"])
             project = detect_project()
@@ -611,7 +613,7 @@ class MemassistTest(unittest.TestCase):
                     scope_type="project",
                     project_id=project.id,
                     type="preference",
-                    content="Keep refresh token policy changes as an internal blocked memory policy.",
+                    content="Refresh token change reminders stay as agent context, not host tool control.",
                     tags=["auth", "token"],
                     status="candidate",
                     importance=0.9,
@@ -636,6 +638,7 @@ class MemassistTest(unittest.TestCase):
             result = json.loads(out.getvalue())
             self.assertTrue(result["passed"])
             self.assertEqual(result["memory_recall"], 1.0)
+            self.assertEqual(result["wrong_context_promotion_rate"], 0.0)
             self.assertEqual(result["wrong_policy_rate"], 0.0)
 
     def test_rag_eval_measures_section_aware_memory_pack(self) -> None:
@@ -658,10 +661,10 @@ class MemassistTest(unittest.TestCase):
                     scope_type="project",
                     project_id=project.id,
                     type="rule",
-                    content="Refresh token policy edits are blocked by autonomous memory policy.",
-                    tags=["refresh", "token", "policy"],
+                    content="Ask before editing refresh token behavior; this is agent context, not a tool block.",
+                    tags=["refresh", "token", "directive"],
                     status="active",
-                    enforcement="block",
+                    caution_level="none",
                     importance=0.9,
                     confidence=0.9,
                 )
@@ -1440,7 +1443,7 @@ class MemassistTest(unittest.TestCase):
                     tool_name="apply_patch",
                     input_json={"command": "*** Update File: src/auth/refresh-token-policy.ts"},
                     files=["src/auth/refresh-token-policy.ts"],
-                    policy_decision="deny",
+                    tool_decision="deny",
                 )
                 store.add_trace_event(
                     session_id="sess_risky",
@@ -1503,7 +1506,7 @@ class MemassistTest(unittest.TestCase):
                     status="candidate",
                     importance=0.8,
                     confidence=0.8,
-                    enforcement="none",
+                    caution_level="none",
                 )
 
             payload = {
@@ -1520,7 +1523,7 @@ class MemassistTest(unittest.TestCase):
                 self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
             self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
             )
 
     def test_stop_records_source_event_without_direct_memory_when_judge_unavailable(self) -> None:
@@ -1550,7 +1553,7 @@ class MemassistTest(unittest.TestCase):
             self.assertIn("memory_source_observed", event_types)
             self.assertIn("memory_judged", event_types)
             self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
-            self.assertNotIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "policy.yaml").read_text())
+            self.assertNotIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "verification.yaml").read_text())
 
     def test_stop_without_source_evidence_does_not_judge_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -1589,7 +1592,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "refresh token 관련 변경 전 사용자에게 먼저 확인한다.",
                     "source_quote": "앞으로 refresh token 쪽은 고치기 전에 나한테 먼저 물어봐",
                     "memory_type": "directive",
-                    "enforcement": "warn",
+                    "caution_level": "warn",
                     "activation": "candidate",
                     "candidate_paths": [],
                     "meaning_preserved": True,
@@ -1637,7 +1640,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "사용자는 한국어로 간결한 답변을 선호한다.",
                     "source_quote": "앞으로 답변은 한국어로 짧게 해줘",
                     "memory_type": "preference",
-                    "enforcement": "none",
+                    "caution_level": "none",
                     "activation": "active",
                     "candidate_paths": [],
                     "meaning_preserved": True,
@@ -1669,7 +1672,7 @@ class MemassistTest(unittest.TestCase):
                 any(
                     memory.source_kind == "isolated_memory_judge"
                     and memory.status == "active"
-                    and memory.enforcement == "none"
+                    and memory.caution_level == "none"
                     for memory in memories
                 )
             )
@@ -1691,7 +1694,7 @@ class MemassistTest(unittest.TestCase):
                     content=content,
                     tags=["explicit", "auth", "token"],
                     status="candidate",
-                    enforcement="none",
+                    caution_level="none",
                 )
 
             payload = {
@@ -1708,14 +1711,14 @@ class MemassistTest(unittest.TestCase):
                 memory = store.get_memory(memory_id)
                 traces = store.trace_events("sess_direct_policy_upgrade_candidate")
                 self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
-                self.assertEqual(memory.enforcement, "none")  # type: ignore[union-attr]
+                self.assertEqual(memory.caution_level, "none")  # type: ignore[union-attr]
             self.assertFalse(any(event["event_type"] == "memory_intent_observed" for event in traces))
             self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
             )
 
-    def test_user_prompt_direct_policy_instruction_is_retrieved_without_policy_activation(self) -> None:
+    def test_user_prompt_direct_policy_instruction_is_staged_until_manual_activation(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
@@ -1727,7 +1730,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "리프레시 토큰 관련 변경은 사용자 확인 전 수정하지 않는다.",
                     "source_quote": "리프레시 토큰 관련 변경은 절대 묻지 않고 수정하지마",
                     "memory_type": "directive",
-                    "enforcement": "block",
+                    "caution_level": "block",
                     "activation": "active",
                     "candidate_paths": ["src/auth/refresh-token-policy.ts"],
                     "meaning_preserved": True,
@@ -1770,20 +1773,20 @@ class MemassistTest(unittest.TestCase):
                 and "리프레시 토큰" in memory.content
             ]
             self.assertEqual(len(direct_memories), 1)
-            self.assertEqual(direct_memories[0].status, "active")
-            self.assertEqual(direct_memories[0].enforcement, "block")
+            self.assertEqual(direct_memories[0].status, "candidate")
+            self.assertEqual(direct_memories[0].caution_level, "block")
             self.assertTrue(any(event["event_type"] == "memory_source_observed" for event in traces))
             self.assertTrue(any(event["event_type"] == "memory_judged" for event in traces))
             self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
             )
 
             with patch("sys.stdout", StringIO()):
                 self.assertEqual(main(["memory", "activate", direct_memories[0].id]), 0)
             self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
             )
 
             rag_payload = {
@@ -1816,7 +1819,7 @@ class MemassistTest(unittest.TestCase):
                     content="Remember temporary branch cleanup note.",
                     tags=["explicit"],
                     status="candidate",
-                    enforcement="none",
+                    caution_level="none",
                 )
 
             payload = {
@@ -1841,7 +1844,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "리프레시 토큰 변경 시 사용자 확인을 받는다.",
                     "source_quote": "리프레시토큰 변경에 승인확인하라",
                     "memory_type": "directive",
-                    "enforcement": "warn",
+                    "caution_level": "warn",
                     "activation": "active",
                     "candidate_paths": [],
                     "meaning_preserved": True,
@@ -1896,7 +1899,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "n/a",
                     "source_quote": "이 함수 typo 좀 고쳐줘",
                     "memory_type": "fact",
-                    "enforcement": "none",
+                    "caution_level": "none",
                     "activation": "rejected",
                     "candidate_paths": [],
                     "meaning_preserved": True,
@@ -1928,7 +1931,7 @@ class MemassistTest(unittest.TestCase):
             self.assertIn("memory_judged", events)  # judged at Stop
             self.assertEqual(mem, [])  # but nothing durable stored (should_store=false)
 
-    def test_typo_directive_is_judged_to_active_source_language_memory(self) -> None:
+    def test_typo_directive_is_judged_to_candidate_source_language_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
@@ -1940,7 +1943,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "리프레시 토큰 관련 변경 전 사용자에게 먼저 확인한다.",
                     "source_quote": "리프레쉬 토큰 쪽은 담부터 고치기 전에 꼭 나한테 먼저 말해줘",
                     "memory_type": "directive",
-                    "enforcement": "warn",
+                    "caution_level": "warn",
                     "activation": "active",
                     "candidate_paths": ["src/auth/refresh-token-policy.ts"],
                     "meaning_preserved": True,
@@ -1973,12 +1976,12 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
                 traces = store.trace_events("sess_typo_warn_policy")
-            policy_text = (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8")
-            self.assertNotIn("src/auth/refresh-token-policy.ts", policy_text)
+            config_text = (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8")
+            self.assertNotIn("src/auth/refresh-token-policy.ts", config_text)
             self.assertTrue(
                 any(
-                    memory.status == "active"
-                    and memory.enforcement == "warn"
+                    memory.status == "candidate"
+                    and memory.caution_level == "warn"
                     and memory.content == "리프레시 토큰 관련 변경 전 사용자에게 먼저 확인한다."
                     for memory in memories
                 )
@@ -1997,7 +2000,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다.",
                     "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
                     "memory_type": "directive",
-                    "enforcement": "warn",
+                    "caution_level": "warn",
                     "activation": "active",
                     "candidate_paths": ["src/auth/refresh-token-policy.ts"],
                     "meaning_preserved": True,
@@ -2032,6 +2035,7 @@ class MemassistTest(unittest.TestCase):
                 lifecycle_events = [dict(event) for event in store.lifecycle_events("sess_mixed_prompt")]
             self.assertEqual(len(memories), 1)
             self.assertEqual(memories[0].content, "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다.")
+            self.assertEqual(memories[0].status, "candidate")
             self.assertNotIn("응답은 OK만 해", memories[0].content)
             self.assertNotIn("응답은 OK만 해", memories[0].reason)
             self.assertTrue(
@@ -2045,6 +2049,9 @@ class MemassistTest(unittest.TestCase):
                 broad_transient_results = store.search_memories("응답", project_id=project.id)
             self.assertFalse(any(memory.id == memories[0].id for memory in transient_results))
             self.assertFalse(any(memory.id == memories[0].id for memory in broad_transient_results))
+
+            with patch("sys.stdout", StringIO()):
+                self.assertEqual(main(["memory", "activate", memories[0].id]), 0)
 
             retrieval_payload = {
                 "session_id": "sess_mixed_prompt_retrieval",
@@ -2067,7 +2074,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "Ask before changing refresh token settings.",
                     "source_quote": "Always ask before changing refresh token settings. Reply only OK.",
                     "memory_type": "directive",
-                    "enforcement": "warn",
+                    "caution_level": "warn",
                     "activation": "active",
                     "candidate_paths": ["src/auth/refresh-token-policy.ts"],
                     "meaning_preserved": True,
@@ -2116,7 +2123,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "Do not change refresh token policy without asking first.",
                     "source_quote": "refresh token policy 변경은 묻지 않고 하지마",
                     "memory_type": "directive",
-                    "enforcement": "block",
+                    "caution_level": "block",
                     "activation": "active",
                     "candidate_paths": ["src/auth/refresh-token-policy.ts"],
                     "meaning_preserved": True,
@@ -2149,8 +2156,8 @@ class MemassistTest(unittest.TestCase):
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
             self.assertTrue(
                 any(
-                    memory.status == "active"
-                    and memory.enforcement == "block"
+                    memory.status == "candidate"
+                    and memory.caution_level == "block"
                     and memory.content == "Do not change refresh token policy without asking first."
                     for memory in memories
                 )
@@ -2168,7 +2175,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "Maybe mention refresh token changes later.",
                     "source_quote": "앞으로 refresh token changes tell me later",
                     "memory_type": "directive",
-                    "enforcement": "warn",
+                    "caution_level": "warn",
                     "activation": "candidate",
                     "candidate_paths": ["src/auth/refresh-token-policy.ts"],
                     "meaning_preserved": True,
@@ -2196,7 +2203,7 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue(any(memory.status == "candidate" for memory in memories))
             self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
             )
 
     def test_external_judge_candidate_paths_do_not_compile_policy(self) -> None:
@@ -2208,12 +2215,12 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "Do not change external path.",
                     "source_quote": "외부 경로 건드리지마",
                     "memory_type": "directive",
-                    "enforcement": "block",
+                    "caution_level": "block",
                     "activation": "active",
                     "candidate_paths": ["../outside.txt", "/etc/passwd"],
                     "meaning_preserved": True,
                     "contamination_risk": "low",
-                    "reason": "External paths must not be normalized into project policy.",
+                    "reason": "External paths must not be normalized into project verification config.",
                 }
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
@@ -2234,9 +2241,9 @@ class MemassistTest(unittest.TestCase):
             project = detect_project()
             with Store() as store:
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
-            self.assertTrue(any(memory.status == "active" and not memory.paths for memory in memories))
-            self.assertNotIn("outside.txt", (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"))
-            self.assertNotIn("/etc/passwd", (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"))
+            self.assertTrue(any(memory.status == "candidate" and not memory.paths for memory in memories))
+            self.assertNotIn("outside.txt", (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"))
+            self.assertNotIn("/etc/passwd", (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"))
 
     def test_weak_single_term_path_match_does_not_compile_policy(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -2250,7 +2257,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "Tell me before auth changes.",
                     "source_quote": "auth 변경 전에 알려줘",
                     "memory_type": "directive",
-                    "enforcement": "warn",
+                    "caution_level": "warn",
                     "activation": "candidate",
                     "candidate_paths": [],
                     "meaning_preserved": True,
@@ -2275,7 +2282,7 @@ class MemassistTest(unittest.TestCase):
 
             self.assertNotIn(
                 "src/auth/session.py",
-                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
             )
 
     def test_invalid_judge_output_does_not_mutate_policy(self) -> None:
@@ -2286,7 +2293,7 @@ class MemassistTest(unittest.TestCase):
                     "is_directive": "false",
                     "intent": "none",
                     "subject": "refresh token policy",
-                    "enforcement": "block",
+                    "caution_level": "block",
                     "scope_terms": ["refresh", "token"],
                     "candidate_paths": ["src/auth/refresh-token-policy.ts"],
                     "confidence": 0.99,
@@ -2324,7 +2331,7 @@ class MemassistTest(unittest.TestCase):
             self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
             self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "policy.yaml").read_text(encoding="utf-8"),
+                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
             )
             judged = [event for event in traces if event["event_type"] == "memory_judged"]
             self.assertEqual(len(judged), 1)
@@ -2430,7 +2437,7 @@ class MemassistTest(unittest.TestCase):
                     tool_name="apply_patch",
                     input_json={"command": "*** Update File: src/auth/refresh-token-policy.ts"},
                     files=["src/auth/refresh-token-policy.ts"],
-                    policy_decision="deny",
+                    tool_decision="deny",
                 )
 
             lesson_out = StringIO()
@@ -2441,7 +2448,7 @@ class MemassistTest(unittest.TestCase):
                         "from-session",
                         "sess_eval",
                         "--feedback",
-                        "Block refresh token policy edits by autonomous memory policy.",
+                        "Remember refresh token edit reminders as agent context only.",
                     ]
                 )
             self.assertEqual(code, 0)
@@ -2451,7 +2458,7 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 memory = store.get_memory(lesson_id)
                 self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
-            self.assertNotIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "policy.yaml").read_text())
+            self.assertNotIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "verification.yaml").read_text())
 
             eval_out = StringIO()
             with patch("sys.stdout", eval_out):
@@ -2469,16 +2476,16 @@ class MemassistTest(unittest.TestCase):
                 self.assertEqual(memory.status, "archived")  # type: ignore[union-attr]
             self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "policy.yaml").read_text(),
+                (project_dir / ".memassist" / "verification.yaml").read_text(),
             )
 
     def test_memory_deactivate_does_not_remove_manual_sensitive_path(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
             project = detect_project()
-            policy_path = project_dir / ".memassist" / "policy.yaml"
-            policy_path.write_text(
-                '# memassist project policy\nsensitive_paths:\n  - "src/auth/session.py"\nprotected_paths: []\ndangerous_commands: []\nverification_commands: []\n',
+            config_path = project_dir / ".memassist" / "verification.yaml"
+            config_path.write_text(
+                '# memassist project verification config\nsensitive_paths:\n  - "src/auth/session.py"\nprotected_paths: []\ndangerous_commands: []\nverification_commands: []\n',
                 encoding="utf-8",
             )
             with Store() as store:
@@ -2490,15 +2497,15 @@ class MemassistTest(unittest.TestCase):
                     content="Warn before changing src/auth/session.py.",
                     paths=["src/auth/session.py"],
                     status="active",
-                    enforcement="warn",
+                    caution_level="warn",
                     source_kind="test",
                 )
 
             with patch("sys.stdout", StringIO()):
                 code = main(["memory", "deactivate", memory_id])
             self.assertEqual(code, 0)
-            policy_text = (project_dir / ".memassist" / "policy.yaml").read_text()
-            self.assertIn("src/auth/session.py", policy_text)
+            config_text = (project_dir / ".memassist" / "verification.yaml").read_text()
+            self.assertIn("src/auth/session.py", config_text)
             with Store() as store:
                 memory = store.get_memory(memory_id)
                 self.assertEqual(memory.status, "archived")  # type: ignore[union-attr]
@@ -2514,12 +2521,12 @@ class MemassistTest(unittest.TestCase):
                         "--type",
                         "rule",
                         "--content",
-                        "Block billing migration edits by autonomous memory policy.",
+                        "Ask before billing migration edits; keep this as agent context.",
                         "--tag",
                         "billing",
                         "--importance",
                         "0.9",
-                        "--enforcement",
+                        "--caution-level",
                         "block",
                     ]
                 )
@@ -2631,7 +2638,7 @@ class MemassistTest(unittest.TestCase):
                     status="active",
                     importance=0.9,
                     confidence=0.95,
-                    enforcement="block",
+                    caution_level="block",
                     source_kind="user_prompt_directive",
                 )
                 store.add_trace_event(
@@ -2736,7 +2743,7 @@ class MemassistTest(unittest.TestCase):
                     "memory_content": "n/a",
                     "source_quote": "isolated skip terminal test",
                     "memory_type": "fact",
-                    "enforcement": "none",
+                    "caution_level": "none",
                     "activation": "rejected",
                     "candidate_paths": [],
                     "meaning_preserved": True,
@@ -2808,7 +2815,7 @@ class MemassistTest(unittest.TestCase):
                     status="active",
                     importance=0.9,
                     confidence=0.95,
-                    enforcement="block",
+                    caution_level="block",
                     source_kind="user_prompt_directive",
                 )
                 candidate_id = store.add_memory(
@@ -2820,7 +2827,7 @@ class MemassistTest(unittest.TestCase):
                     status="candidate",
                     importance=0.7,
                     confidence=0.8,
-                    enforcement="none",
+                    caution_level="none",
                     source_kind="lifecycle",
                 )
 
@@ -2927,7 +2934,7 @@ class ClaudeMemoryJudgeTest(unittest.TestCase):
             "memory_content": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다",
             "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
             "memory_type": "rule",
-            "enforcement": "block",
+            "caution_level": "block",
             "activation": "active",
             "candidate_paths": [],
             "meaning_preserved": True,
@@ -2950,7 +2957,7 @@ class ClaudeMemoryJudgeTest(unittest.TestCase):
             "memory_content": "리프레시 토큰 변경 전 사용자 확인을 받는다",
             "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
             "memory_type": "rule",
-            "enforcement": "block",
+            "caution_level": "block",
             "activation": "active",
             "candidate_paths": [],
             "meaning_preserved": True,
@@ -2985,7 +2992,7 @@ class ClaudeMemoryJudgeTest(unittest.TestCase):
             "memory_content": "x",
             "source_quote": "y",
             "memory_type": "fact",
-            "enforcement": "none",
+            "caution_level": "none",
             "activation": "rejected",
             "candidate_paths": [],
             "meaning_preserved": True,
@@ -3034,7 +3041,7 @@ def _insert_legacy_sqlite_only_memory(store: Store, *, project_id: str, status: 
         retrieval_count=0,
         utility=0.0,
         half_life_days=30.0,
-        enforcement="none",
+        caution_level="none",
         source_kind="legacy_sqlite_row",
         source_ref=None,
         created_at=ts,

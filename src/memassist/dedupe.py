@@ -25,7 +25,7 @@ SYNONYMS = {
     "정책": "policy",
     "변경": "change",
     "수정": "change",
-    "확인": "policy",
+    "확인": "confirm",
     "인증": "auth",
     "세션": "session",
 }
@@ -44,14 +44,14 @@ def find_semantic_duplicate(
     candidate_type: str,
     candidate_tags: list[str],
     candidate_status: str,
-    candidate_enforcement: str,
+    candidate_caution_level: str,
     existing_memories: list[Memory],
     threshold: float = 0.65,
 ) -> DuplicateMatch | None:
     candidate_tokens = _tokens(" ".join([candidate_content, " ".join(candidate_tags)]))
     if not candidate_tokens:
         return None
-    candidate_protective = _is_protective(candidate_content, candidate_enforcement)
+    candidate_protective = _is_protective(candidate_content, candidate_caution_level)
     best: DuplicateMatch | None = None
     for memory in existing_memories:
         if memory.status == "archived":
@@ -63,7 +63,7 @@ def find_semantic_duplicate(
             continue
         overlap = len(candidate_tokens & memory_tokens) / max(len(candidate_tokens), 1)
         tag_overlap = len(set(candidate_tags) & set(memory.tags)) / max(len(set(candidate_tags)), 1)
-        protective_bonus = 0.18 if candidate_protective and _is_protective(memory.content, memory.enforcement) else 0.0
+        protective_bonus = 0.18 if candidate_protective and _is_protective(memory.content, memory.caution_level) else 0.0
         strength_bonus = 0.12 if _is_stronger(memory.status, candidate_status) else 0.0
         score = min(1.0, overlap * 0.70 + tag_overlap * 0.18 + protective_bonus + strength_bonus)
         if score >= threshold and (best is None or score > best.score):
@@ -96,8 +96,8 @@ def _is_stronger(memory_status: str, candidate_status: str) -> bool:
     return rank.get(memory_status, 0) > rank.get(candidate_status, 0)
 
 
-def _is_protective(content: str, enforcement: str) -> bool:
-    if enforcement in {"warn", "block"}:
+def _is_protective(content: str, caution_level: str) -> bool:
+    if caution_level in {"warn", "block"}:
         return True
     text = content.lower()
     return any(term in text for term in PROTECTIVE_TERMS)

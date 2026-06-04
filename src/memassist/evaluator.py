@@ -15,7 +15,7 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
     total = _weighted_total(scores)
     status = base.status
     decision = base.decision
-    enforcement = base.enforcement
+    caution_level = base.caution_level
     reason = base.reason
 
     if status == "candidate" and decision != "keep_candidate" and total >= 0.68:
@@ -31,14 +31,14 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
         decision = "archive_low_quality"
         reason = "Risky candidate did not meet minimum evidence quality for inactive storage."
     elif decision == "keep_candidate" and candidate.type in {"rule", "lesson"} and total >= 0.72:
-        enforcement = "warn"
+        caution_level = "warn"
         reason = "Risky inferred memory is retained as a reminder with warning semantics, not a gate."
 
     return replace(
         base,
         decision=decision,
         status=status,
-        enforcement=enforcement,
+        caution_level=caution_level,
         reason=reason,
         scores=scores,
         total_score=total,

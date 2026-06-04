@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 import uuid
 
-from .models import ENFORCEMENTS, MEMORY_STATUSES
+from .models import CAUTION_LEVELS, MEMORY_STATUSES
 from .storage import Store
 
 
@@ -17,12 +17,14 @@ class SeedMemory:
     status: str
     importance: float
     confidence: float
-    enforcement: str
+    caution_level: str
+    source_quote: str | None = None
+    source_ref: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "SeedMemory":
         status = str(value.get("status") or "active")
-        enforcement = str(value.get("enforcement") or "none")
+        caution_level = str(value.get("caution_level") or "none")
         return cls(
             type=str(value.get("type") or "fact"),
             content=str(value.get("content", "")),
@@ -31,7 +33,9 @@ class SeedMemory:
             status=status if status in MEMORY_STATUSES else "archived",
             importance=float(value.get("importance", 0.8)),
             confidence=float(value.get("confidence", 0.85)),
-            enforcement=enforcement if enforcement in ENFORCEMENTS else "none",
+            caution_level=caution_level if caution_level in CAUTION_LEVELS else "none",
+            source_quote=value.get("source_quote") if isinstance(value.get("source_quote"), str) else None,
+            source_ref=value.get("source_ref") if isinstance(value.get("source_ref"), str) else None,
         )
 
 
@@ -57,9 +61,10 @@ def insert_seed_memories(store: Store, *, project_id: str, seed: list[SeedMemory
             status=memory.status,
             importance=memory.importance,
             confidence=memory.confidence,
-            enforcement=memory.enforcement,
+            caution_level=memory.caution_level,
             source_kind=source_kind,
-            source_ref=f"{source_kind}:{uuid.uuid4().hex[:12]}",
+            source_ref=memory.source_ref or f"{source_kind}:{uuid.uuid4().hex[:12]}",
+            source_quote=memory.source_quote,
         )
         ids.append(memory_id)
     return ids
