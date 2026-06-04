@@ -19,7 +19,6 @@ The isolated memory judge currently preserves the full user prompt as the stored
 ### Modified Capabilities
 
 - `isolated-memory-judgment`: Prompt-derived memories must retain source evidence while storing only the durable portion as retrievable content.
-- `llm-memory-directive-interpretation`: Direct user memory directives must separate durable future behavior from one-shot response or execution instructions in the same prompt.
 
 ## Impact
 
