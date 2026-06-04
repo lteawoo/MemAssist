@@ -60,6 +60,7 @@ def insert_seed_memories(store: Store, *, project_id: str, seed: list[SeedMemory
             enforcement=memory.enforcement,
             source_kind=source_kind,
             source_ref=f"{source_kind}:{uuid.uuid4().hex[:12]}",
+            persist_artifact=False,
         )
         ids.append(memory_id)
     return ids

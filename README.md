@@ -13,8 +13,8 @@
 > 같은 프로젝트 설명, 같은 테스트 명령, 같은 주의사항을 매번 다시 말하지 않게 한다.
 
 `memassist`는 로컬 우선 도구입니다. 프로젝트에서 `memassist init`을 실행하면
-프로젝트 루트의 `.memassist/` 하나에 정책, ignore 파일, SQLite DB, trace와 memory가
-함께 저장됩니다. `~/.memassist`는 아직 초기화하지 않은 경로나 명시적인 전역 사용을 위한
+프로젝트 루트의 `.memassist/` 하나에 정책, ignore 파일, Markdown memory, trace, SQLite
+검색 인덱스가 함께 저장됩니다. `~/.memassist`는 아직 초기화하지 않은 경로나 명시적인 전역 사용을 위한
 fallback/global home입니다.
 
 > 현재 상태: 초기 로컬 도구입니다. CLI와 저장 구조는 사용할 수 있지만, 위험도가 높은
@@ -95,7 +95,7 @@ hook 실행 중에도 같은 프로젝트 DB와 정책 파일을 사용합니다
 - 낮은 위험의 workflow, preference, 검증 습관은 자동 활성화합니다.
 - 반복적으로 확인된 좋은 기억은 장기 메모리로 승격합니다.
 - 보안, 인증, 삭제, 보호 경로처럼 위험한 내용은 더 보수적으로 다룹니다.
-- 사용자가 일반 대화 속에서 직접 남긴 지시는 source event로 남긴 뒤, 분리된 memory judge가 기억할 가치와 의미 보존 여부를 판단합니다.
+- 사용자가 일반 대화 속에서 직접 남긴 지시는 turn end에서 확인한 source evidence를 바탕으로, 분리된 memory judge가 기억할 가치와 의미 보존 여부를 판단합니다.
 - `init` 때 연결한 도구가 지원하면 별도 judge 실행으로 다국어, 오탈자, 완곡 표현도 구조화된 memory 후보로 만들 수 있습니다.
 - 다음 요청에는 관련 기억을 `Relevant memassist memory`와 검증 reminder로 주입합니다.
 
@@ -116,14 +116,13 @@ memory로 저장하고, 다음 관련 요청에서 RAG context로 찾아와 현�
 ```mermaid
 flowchart LR
     A[사용자가 AI 코딩 도구에 요청] --> B[도구 integration hook 실행]
-    B --> C[UserPromptSubmit / PreToolUse / PostToolUse / Stop 이벤트 기록]
-    C --> D[세션 trace 저장]
-    D --> E[메모리 의도 source event 관찰]
-    E --> F[분리된 memory judge 실행]
-    F --> G[active / candidate / ephemeral / rejected 분류]
-    G --> H[다음 요청에서 관련 메모리 검색]
-    H --> I[context / policy / verifier memory pack 생성]
-    I --> J[AI 코딩 도구 prompt context에 주입]
+    B --> C[UserPromptSubmit에서 관련 메모리 검색]
+    C --> D[AI 코딩 도구 prompt context에 주입]
+    D --> E[PreToolUse / PostToolUse trace 저장]
+    E --> F[Stop에서 source evidence 확인]
+    F --> G[분리된 memory judge 실행]
+    G --> H[active / candidate / archived 분류]
+    H --> I[다음 요청에서 다시 검색 및 주입]
 ```
 
 도구마다 hook 형식은 다르지만, `memassist`는 이를 공통 이벤트로 정규화합니다.
@@ -136,15 +135,15 @@ sequenceDiagram
 
     U->>A: 작업 요청
     A->>M: UserPromptSubmit
-    M-->>M: memory_intent_observed 기록
-    M-->>M: isolated memory judge 실행 가능 시 판단
+    M-->>M: 관련 memory retrieval 및 telemetry 갱신
     M-->>A: 관련 memory context 반환
     A->>M: PreToolUse
     M-->>M: 도구 사용 trace 저장
     A->>M: PostToolUse
     M-->>M: 도구 사용 trace 저장
     A->>M: Stop
-    M-->>M: 세션 검증 및 memory lifecycle 실행
+    M-->>M: source evidence 확인
+    M-->>M: isolated memory judge 및 memory lifecycle 실행
 ```
 
 이 구조 덕분에 Codex, Claude Code, OpenCode integration이 서로 달라도 내부의
@@ -158,42 +157,27 @@ PreToolUse hook은 trace 기록만 수행합니다. 사용자가 "리프레시 �
 
 ## 메모리 라이프사이클
 
-`memassist`는 모든 관찰을 곧바로 장기 기억으로 만들지 않습니다. 기억은 상태를 거치며
-강화되거나, 후보 상태로 남거나, 오래되면 약해지고 정리됩니다.
+`memassist`는 모든 관찰을 곧바로 활성 기억으로 만들지 않습니다. Stop 시점의 isolated
+judge가 저장 후보를 만들고, deterministic policy가 `candidate`, `active`, `archived`
+중 하나로 정합니다. 상태의 권위는 Markdown 파일 위치와 metadata입니다.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> observed: 세션에서 관찰
-    observed --> auto_active: 낮은 위험의 workflow/preference
-    observed --> candidate: 유용하지만 검토 필요
-    observed --> ephemeral: 세션 증거로만 유용
-    observed --> rejected: 신호가 약함
-
-    candidate --> active: 활성화
-    auto_active --> long_term: 반복 관찰되어 강화
-    active --> durable: 반복 사용되어 장기화
-    long_term --> durable: 반복 사용되어 장기화
-
-    durable --> decaying: 오래 사용되지 않음
-    decaying --> stale: 약해짐
-    stale --> expired: 만료
-    active --> superseded: 더 나은 기억으로 대체
-    auto_active --> superseded: 더 나은 기억으로 대체
+    [*] --> candidate: 저장 가치 있음
+    [*] --> active: 낮은 위험과 충분한 근거
+    [*] --> archived: 저장 불필요 또는 비활성
+    candidate --> active: 수동 활성화
+    active --> archived: 수동 비활성화 또는 정리
+    candidate --> archived: 정리
 ```
 
 주요 상태는 다음과 같습니다.
 
 | 상태 | 의미 |
 | --- | --- |
-| `observed` | 세션 trace에서 어떤 행동이나 신호가 관찰되었습니다. |
 | `candidate` | 유용할 수 있지만 아직 활성화하지 않은 후보입니다. |
-| `auto_active` | 위험도가 낮아 자동으로 활성화된 기억입니다. |
 | `active` | 현재 유효한 활성 기억입니다. |
-| `durable` | 반복 관찰되거나 자주 쓰여 장기 기억으로 강화된 상태입니다. |
-| `ephemeral` | 장기 규칙이 아니라 세션 증거로만 보관되는 기억입니다. |
-| `rejected` | 자동 기준에 맞지 않아 사용하지 않는 기억입니다. |
-| `stale` / `expired` | 오래되었거나 만료되어 retrieval에서 멀어지는 기억입니다. |
-| `superseded` | 더 새로운 기억으로 대체된 기억입니다. |
+| `archived` | 더 이상 retrieval/injection 대상이 아닌 보관 기억입니다. |
 
 최근 세션의 lifecycle 결과는 CLI로 확인할 수 있습니다.
 
@@ -212,8 +196,9 @@ memory를 찾고, 결과를 `additionalContext`로 주입합니다.
 
 기억 적재와 RAG 주입은 다음 흐름으로 동작합니다.
 
-- `UserPromptSubmit`은 사용자의 메모리 의도를 source event로 남기고, 관련 memory retrieval을 수행합니다.
-- 분리된 memory judge가 사용자 source event만 보고 `should_store`, `source_quote`, `memory_content`, `candidate_paths`, `meaning_preserved` 같은 구조화 결과를 만듭니다.
+- `UserPromptSubmit`은 관련 memory retrieval과 `additionalContext` 주입만 수행합니다. 검색된 memory의 `retrieval_count`, `last_used_at` 같은 read-side telemetry는 갱신될 수 있습니다.
+- `Stop`에서 host payload, transcript path, history 같은 turn-end source evidence를 확인한 뒤 분리된 memory judge를 실행합니다.
+- 분리된 memory judge가 사용자 source evidence만 보고 `should_store`, `source_quote`, `memory_content`, `candidate_paths`, `meaning_preserved` 같은 구조화 결과를 만듭니다.
 - 저장되는 primary memory content는 `memory_content`입니다. judge는 가능한 한 사용자의 원문 언어로, 오래 유지될 기억만 분리해 씁니다.
 - 원문 전체는 `source_quote`로 lifecycle metadata에 보존합니다. 예를 들어 “앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.”라면 앞 문장만 retrieval 대상 memory가 되고, `응답은 OK만 해`는 현재 턴 지시로 남습니다.
 - 관련 memory는 `Relevant memassist memory` context로 주입됩니다. `memassist`는 이 기억을 자동 정책으로 컴파일하거나 tool 실행을 강제 차단하지 않습니다.
@@ -225,23 +210,26 @@ judge는 `memassist init --tools ...`에서 설치한 도구를 backend로 사�
 judge JSON을 만듭니다. 어느 쪽이든 hook 재귀를 막기 위해 judge 실행에는 guard 환경 변수를
 설정합니다. `claude -p`는 자식 세션에서 자체 hook을 발동하지만, guard 환경 변수가 자식 hook으로
 전파되어 그 hook은 trace·retrieval·judge 없이 즉시 빠져나갑니다. 초기화된 judge adapter가 없거나
-JSON이 유효하지 않으면 durable memory를 쓰지 않고 trace diagnostic만 남깁니다.
+JSON이 유효하지 않으면 persistent memory를 쓰지 않고 trace diagnostic만 남깁니다.
 
-judge payload는 컨텍스트 오염을 줄이기 위해 제한됩니다. 포함되는 것은 사용자 source event,
+judge payload는 컨텍스트 오염을 줄이기 위해 제한됩니다. 포함되는 것은 사용자 source evidence,
 프로젝트 파일 힌트, 기존 memory conflict의 식별자와 상태 같은 최소 정보입니다. assistant
 응답, 주입된 memory context, system/developer prompt, 현재 agent reasoning, 전체 대화 기록은
 judge payload에 넣지 않습니다.
 
 ```mermaid
 flowchart TD
-    A[UserPromptSubmit] --> B[memory_intent_observed]
-    B --> C[isolated memory judge]
-    C --> D{저장할 가치가 있는가?}
-    D -->|아니오| E[trace diagnostic only]
-    D -->|예| F[source-language memory 저장]
-    F --> G[retrieval metadata 갱신]
-    G --> H[다음 UserPromptSubmit에서 관련 memory 탐색]
-    H --> I[Relevant memassist memory로 주입]
+    A[UserPromptSubmit] --> B[관련 memory retrieval]
+    B --> C[Relevant memassist memory 주입]
+    C --> D[Stop]
+    D --> E[source evidence 확인]
+    E --> F[isolated memory judge]
+    F --> G{저장할 가치가 있는가?}
+    G -->|아니오| H[trace diagnostic only]
+    G -->|예| I[Markdown memory 작성]
+    I --> J[SQLite 검색 인덱스 갱신]
+    J --> K[다음 UserPromptSubmit에서 관련 memory 탐색]
+    K --> L[Relevant memassist memory로 주입]
 ```
 
 기본 정책 파일은 `.memassist/policy.yaml`입니다. 이 파일은 `verification_commands`
@@ -349,11 +337,11 @@ memassist memory pack "login session bug" --json
 | 기준 | 설명 | 결과에 주는 영향 |
 | --- | --- | --- |
 | 유용성 | 다음 작업에서 다시 쓸 가능성이 있는가 | 높으면 memory 후보가 됩니다. |
-| 반복성 | 여러 세션에서 반복되는가 | 높으면 `long_term` 승격 가능성이 커집니다. |
+| 반복성 | 여러 세션에서 반복되는가 | 높으면 기존 memory의 confidence/importance를 강화합니다. |
 | 명시성 | 사용자가 직접 지시했는가 | judge 후보 생성 가능성이 커집니다. |
 | 위험도 | 보안, 인증, 삭제, 배포, 정책 변경과 관련되는가 | 높으면 자동 활성화를 제한합니다. |
 | 증거성 | trace, 파일 변경, 명령 실행, 응답 근거가 있는가 | confidence 판단에 사용합니다. |
-| 최신성 | 오래되었거나 더 이상 맞지 않는가 | `stale`, `expired`, `superseded` 판단에 사용합니다. |
+| 최신성 | 오래되었거나 더 이상 맞지 않는가 | `archived` 전환 판단에 사용합니다. |
 | 범위 | 전역 기억인지, 프로젝트 기억인지, 세션 한정 정보인지 | memory scope를 결정합니다. |
 
 대략적인 분류 원리는 다음과 같습니다.
@@ -361,30 +349,25 @@ memassist memory pack "login session bug" --json
 ```mermaid
 flowchart TD
     A[메모리 후보] --> B{다음 작업에 유용한가?}
-    B -->|아니오| C[rejected]
+    B -->|아니오| C[archived]
     B -->|예| D{위험도가 높은가?}
-    D -->|아니오| E{반복 가능한 workflow/preference인가?}
-    E -->|예| F[auto_active]
-    E -->|아니오| G[ephemeral 또는 candidate]
+    D -->|아니오| E[active]
     D -->|예| H{사용자의 명시 지시인가?}
-    H -->|예| I[source-language memory]
-    I --> J[retrieval metadata 포함]
-    H -->|아니오| M[candidate 또는 reminder]
+    H -->|예| I[candidate]
+    H -->|아니오| M[archived]
 ```
 
-같은 기억이 반복되면 새로 중복 저장하기보다 기존 기억을 강화합니다. 오래된 기억은
-정리 대상이 되고, 더 나은 기억이 생기면 이전 기억은 `superseded`가 될 수 있습니다.
+같은 기억이 반복되면 새로 중복 저장하기보다 기존 기억을 강화합니다. 정리 대상은
+삭제하지 않고 `archived`로 이동해 검색 주입 대상에서 제외합니다.
 
 ```mermaid
 flowchart TD
     A[새 후보] --> B{기존 memory와 같은가?}
     B -->|예| C[기존 memory confidence/importance 강화]
     B -->|아니오| D[새 memory 저장]
-    D --> E{반복 사용되는가?}
-    E -->|예| F[durable]
-    E -->|아니오| G{오래되었는가?}
-    G -->|예| H[stale 또는 expired]
-    G -->|아니오| I[active 상태 유지]
+    D --> E{활성 조건을 만족하는가?}
+    E -->|예| F[active]
+    E -->|아니오| G[candidate]
 ```
 
 ## 평가 명령
@@ -496,11 +479,13 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 
 ## 저장 위치와 개인정보
 
-- 프로젝트 초기화 후 기본 데이터베이스는 프로젝트 루트의 `.memassist/memassist.db`에 저장됩니다.
+- 프로젝트 memory의 원본은 프로젝트 루트의 `.memassist/memories/{active,candidates,archived}` Markdown 파일입니다.
+- 기본 SQLite 인덱스는 프로젝트 루트의 `.memassist/memassist.db`에 저장됩니다.
 - 프로젝트 정책과 ignore 파일도 같은 `.memassist/`에 저장됩니다.
 - memory와 trace는 기본적으로 로컬에 남습니다.
 - 민감 파일이나 생성물은 `.memassist/ignore`에 추가해 trace-derived memory 후보에서 제외할 수 있습니다.
-- 프로젝트 memory는 SQLite 데이터베이스를 공유하지 않고 export/import할 수 있습니다.
+- Markdown memory를 직접 편집한 뒤에는 `memassist memory rebuild-index`로 SQLite 검색 인덱스를 갱신할 수 있습니다.
+- 프로젝트 memory는 SQLite 데이터베이스를 공유하지 않고 Markdown 파일 또는 export/import로 이동할 수 있습니다.
 - `~/.memassist`는 초기화되지 않은 경로나 명시적인 global/user home 용도로만 사용됩니다.
 
 ```bash
@@ -508,7 +493,7 @@ memassist memory export
 memassist memory import .memassist/memories.json
 ```
 
-import된 memory는 기본적으로 draft입니다. 필요하면 `memassist memory activate`로 활성화합니다.
+import된 memory는 기본적으로 candidate입니다. 필요하면 `memassist memory activate`로 활성화합니다.
 
 ## 현재 한계
 

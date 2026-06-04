@@ -239,7 +239,7 @@ def _default_status(section: str) -> str:
     if section == "policy":
         return "active"
     if section == "verifier":
-        return "durable"
+        return "active"
     return "active"
 
 
@@ -266,6 +266,7 @@ def _insert_seed_memories(store: Store, *, project_id: str, seed: list[RagSeedMe
             enforcement=memory.enforcement,
             source_kind="rag_eval_seed",
             source_ref=f"rag_eval:{uuid.uuid4().hex[:12]}",
+            persist_artifact=False,
         )
         ids.append(memory_id)
     return ids

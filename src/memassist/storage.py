@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import re
 import sqlite3
@@ -8,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .memory_artifacts import load_memory_artifacts, sync_memory_artifact
 from .models import ENFORCEMENTS, MEMORY_STATUSES, MEMORY_TYPES, Memory
 from .paths import db_path
 from .project import Project
@@ -181,7 +183,9 @@ class Store:
         enforcement: str = "none",
         source_kind: str = "manual",
         source_ref: str | None = None,
+        source_quote: str | None = None,
         expires_at: str | None = None,
+        persist_artifact: bool = True,
     ) -> str:
         if scope_type not in {"global", "project", "session"}:
             raise ValueError(f"invalid scope_type: {scope_type}")
@@ -197,52 +201,36 @@ class Store:
         paths = paths or []
         strength = _clamp(strength if strength is not None else (importance + confidence) / 2)
         half_life_days = half_life_days if half_life_days is not None else _default_half_life_days(type, status, enforcement)
-        self.conn.execute(
-            """
-            INSERT INTO memories (
-              id, scope_type, project_id, session_id, type, content, reason,
-              tags_json, paths_json, status, importance, confidence,
-              strength, recurrence, retrieval_count, utility, half_life_days,
-              enforcement, source_kind, source_ref, created_at, updated_at, expires_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                memory_id,
-                scope_type,
-                project_id,
-                session_id,
-                type,
-                content,
-                reason,
-                json.dumps(tags),
-                json.dumps(paths),
-                status,
-                importance,
-                confidence,
-                strength,
-                recurrence,
-                retrieval_count,
-                utility,
-                half_life_days,
-                enforcement,
-                source_kind,
-                source_ref,
-                ts,
-                ts,
-                expires_at,
-            ),
-        )
-        self._upsert_fts(
-            memory_id,
-            content,
-            tags,
+        memory = Memory(
+            id=memory_id,
+            scope_type=scope_type,
+            project_id=project_id,
+            session_id=session_id,
             type=type,
+            content=content,
             reason=reason,
+            tags=tags,
             paths=paths,
             status=status,
+            importance=importance,
+            confidence=confidence,
+            strength=strength,
+            recurrence=recurrence,
+            retrieval_count=retrieval_count,
+            utility=utility,
+            half_life_days=half_life_days,
             enforcement=enforcement,
+            source_kind=source_kind,
+            source_ref=source_ref,
+            created_at=ts,
+            updated_at=ts,
+            last_used_at=None,
+            expires_at=expires_at,
+            superseded_by=None,
         )
+        if persist_artifact:
+            sync_memory_artifact(self.path.parent, memory, source_quote=source_quote)
+        self._upsert_memory_cache(memory)
         self.conn.commit()
         return memory_id
 
@@ -340,7 +328,7 @@ class Store:
         project_id: str | None,
         limit: int = 10,
     ) -> list[Memory]:
-        active_statuses = ("active", "auto_active", "long_term", "durable", "pinned")
+        active_statuses = ("active",)
         scope_clause = "(m.scope_type = 'global' OR m.project_id = ?)"
         params: list[Any] = [_fts_query(query), project_id, *active_statuses]
         try:
@@ -351,11 +339,8 @@ class Store:
                 JOIN memories m ON m.id = memory_fts.memory_id
                 WHERE memory_fts MATCH ?
                   AND {scope_clause}
-                  AND m.status IN (?, ?, ?, ?, ?)
+                  AND m.status IN (?)
                 ORDER BY
-                  CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'durable' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'long_term' THEN 1 ELSE 0 END DESC,
                   text_score ASC,
                   m.strength DESC,
                   m.utility DESC,
@@ -373,11 +358,8 @@ class Store:
                 FROM memories m
                 WHERE (m.content LIKE ? OR m.tags_json LIKE ?)
                   AND {scope_clause}
-                  AND m.status IN (?, ?, ?, ?, ?)
+                  AND m.status IN (?)
                 ORDER BY
-                  CASE m.status WHEN 'pinned' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'durable' THEN 1 ELSE 0 END DESC,
-                  CASE m.status WHEN 'long_term' THEN 1 ELSE 0 END DESC,
                   m.strength DESC,
                   m.utility DESC,
                   m.confidence DESC,
@@ -395,41 +377,38 @@ class Store:
     def update_status(self, memory_id: str, status: str) -> None:
         if status not in MEMORY_STATUSES:
             raise ValueError(f"invalid memory status: {status}")
-        self.conn.execute(
-            "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
-            (status, now_iso(), memory_id),
-        )
-        self._refresh_fts(memory_id)
-        self.conn.commit()
+        memory = self.get_memory(memory_id)
+        if memory:
+            updated = replace(memory, status=status, updated_at=now_iso())
+            sync_memory_artifact(self.path.parent, updated)
+            self._upsert_memory_cache(updated)
+            self.conn.commit()
 
     def update_paths(self, memory_id: str, paths: list[str]) -> None:
-        self.conn.execute(
-            "UPDATE memories SET paths_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(paths), now_iso(), memory_id),
-        )
-        self._refresh_fts(memory_id)
-        self.conn.commit()
+        memory = self.get_memory(memory_id)
+        if memory:
+            updated = replace(memory, paths=paths, updated_at=now_iso())
+            sync_memory_artifact(self.path.parent, updated)
+            self._upsert_memory_cache(updated)
+            self.conn.commit()
 
     def update_enforcement(self, memory_id: str, enforcement: str) -> None:
         if enforcement not in ENFORCEMENTS:
             raise ValueError(f"invalid enforcement: {enforcement}")
-        self.conn.execute(
-            "UPDATE memories SET enforcement = ?, updated_at = ? WHERE id = ?",
-            (enforcement, now_iso(), memory_id),
-        )
-        self._refresh_fts(memory_id)
-        self.conn.commit()
+        memory = self.get_memory(memory_id)
+        if memory:
+            updated = replace(memory, enforcement=enforcement, updated_at=now_iso())
+            sync_memory_artifact(self.path.parent, updated)
+            self._upsert_memory_cache(updated)
+            self.conn.commit()
 
     def supersede(self, old_id: str, new_id: str) -> None:
-        self.conn.execute(
-            """
-            UPDATE memories
-            SET status = 'superseded', superseded_by = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (new_id, now_iso(), old_id),
-        )
-        self.conn.commit()
+        memory = self.get_memory(old_id)
+        if memory:
+            updated = replace(memory, status="superseded", superseded_by=new_id, updated_at=now_iso())
+            sync_memory_artifact(self.path.parent, updated)
+            self._upsert_memory_cache(updated)
+            self.conn.commit()
 
     def touch_memory(self, memory_id: str) -> None:
         self.conn.execute(
@@ -591,20 +570,30 @@ class Store:
         strength = min(1.0, memory.strength + 0.08)
         recurrence = memory.recurrence + 1
         status = memory.status
-        if status in {"auto_active", "active", "long_term"} and (
-            confidence >= 0.85 and importance >= 0.75 and recurrence >= 2
-        ):
-            status = "durable"
-        self.conn.execute(
-            """
-            UPDATE memories
-            SET confidence = ?, importance = ?, strength = ?, recurrence = ?, status = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (confidence, importance, strength, recurrence, status, now_iso(), memory_id),
+        updated = replace(
+            memory,
+            confidence=confidence,
+            importance=importance,
+            strength=strength,
+            recurrence=recurrence,
+            status=status,
+            updated_at=now_iso(),
         )
+        sync_memory_artifact(self.path.parent, updated)
+        self._upsert_memory_cache(updated)
         self.conn.commit()
-        return self.get_memory(memory_id)
+        return updated
+
+    def rebuild_memory_index_from_artifacts(self, *, prune_missing: bool = True) -> list[str]:
+        indexed: list[str] = []
+        for memory in load_memory_artifacts(self.path.parent):
+            normalized = _with_required_timestamps(memory)
+            self._upsert_memory_cache(normalized)
+            indexed.append(normalized.id)
+        if prune_missing:
+            self._prune_memory_cache(set(indexed))
+        self.conn.commit()
+        return indexed
 
     def add_lifecycle_event(
         self,
@@ -689,6 +678,93 @@ class Store:
             "INSERT INTO memory_fts (memory_id, content, tags) VALUES (?, ?, ?)",
             (memory_id, index_text, tag_text),
         )
+
+    def _upsert_memory_cache(self, memory: Memory) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO memories (
+              id, scope_type, project_id, session_id, type, content, reason,
+              tags_json, paths_json, status, importance, confidence,
+              strength, recurrence, retrieval_count, utility, half_life_days,
+              enforcement, source_kind, source_ref, created_at, updated_at,
+              last_used_at, expires_at, superseded_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              scope_type = excluded.scope_type,
+              project_id = excluded.project_id,
+              session_id = excluded.session_id,
+              type = excluded.type,
+              content = excluded.content,
+              reason = excluded.reason,
+              tags_json = excluded.tags_json,
+              paths_json = excluded.paths_json,
+              status = excluded.status,
+              importance = excluded.importance,
+              confidence = excluded.confidence,
+              strength = excluded.strength,
+              recurrence = excluded.recurrence,
+              retrieval_count = excluded.retrieval_count,
+              utility = excluded.utility,
+              half_life_days = excluded.half_life_days,
+              enforcement = excluded.enforcement,
+              source_kind = excluded.source_kind,
+              source_ref = excluded.source_ref,
+              created_at = excluded.created_at,
+              updated_at = excluded.updated_at,
+              last_used_at = excluded.last_used_at,
+              expires_at = excluded.expires_at,
+              superseded_by = excluded.superseded_by
+            """,
+            (
+                memory.id,
+                memory.scope_type,
+                memory.project_id,
+                memory.session_id,
+                memory.type,
+                memory.content,
+                memory.reason,
+                json.dumps(memory.tags),
+                json.dumps(memory.paths),
+                memory.status,
+                memory.importance,
+                memory.confidence,
+                memory.strength,
+                memory.recurrence,
+                memory.retrieval_count,
+                memory.utility,
+                memory.half_life_days,
+                memory.enforcement,
+                memory.source_kind,
+                memory.source_ref,
+                memory.created_at,
+                memory.updated_at,
+                memory.last_used_at,
+                memory.expires_at,
+                memory.superseded_by,
+            ),
+        )
+        self._upsert_fts(
+            memory.id,
+            memory.content,
+            memory.tags,
+            type=memory.type,
+            reason=memory.reason,
+            paths=memory.paths,
+            status=memory.status,
+            enforcement=memory.enforcement,
+        )
+
+    def _prune_memory_cache(self, artifact_ids: set[str]) -> None:
+        rows = self.conn.execute("SELECT id FROM memories").fetchall()
+        missing = [str(row["id"]) for row in rows if str(row["id"]) not in artifact_ids]
+        if not missing:
+            return
+        placeholders = ", ".join("?" for _ in missing)
+        self.conn.execute(f"DELETE FROM memory_links WHERE source_id IN ({placeholders})", missing)
+        self.conn.execute(f"DELETE FROM memory_links WHERE target_id IN ({placeholders})", missing)
+        self.conn.execute(f"DELETE FROM memory_fts WHERE memory_id IN ({placeholders})", missing)
+        self.conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", missing)
 
     def _refresh_fts(self, memory_id: str) -> None:
         row = self.conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
@@ -788,10 +864,6 @@ def _memory_index_text(
 
 
 def _default_half_life_days(type: str, status: str, enforcement: str) -> float:
-    if status == "pinned":
-        return 3650.0
-    if status in {"durable", "long_term"}:
-        return 180.0
     if type == "workflow":
         return 120.0
     if type in {"decision", "preference", "rule", "directive"}:
@@ -801,6 +873,13 @@ def _default_half_life_days(type: str, status: str, enforcement: str) -> float:
     if type == "open_thread":
         return 7.0
     return 30.0
+
+
+def _with_required_timestamps(memory: Memory) -> Memory:
+    ts = now_iso()
+    created_at = memory.created_at or ts
+    updated_at = memory.updated_at or created_at
+    return replace(memory, created_at=created_at, updated_at=updated_at)
 
 
 def _clamp(value: float) -> float:

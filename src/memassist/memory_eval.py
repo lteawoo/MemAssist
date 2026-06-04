@@ -16,7 +16,7 @@ from .models import Memory
 from .storage import Store
 
 
-ACTIVE_STATUSES = {"active", "auto_active", "long_term", "durable", "pinned"}
+ACTIVE_STATUSES = {"active"}
 
 
 @dataclass(frozen=True)
@@ -101,13 +101,13 @@ def evaluate_memory_quality(
             retrieved = store.search_memories(case.query, project_id=project_id, limit=case.limit)
             expected_hits = _matched_terms(retrieved, case.expect, set(case.expect_statuses))
             forbidden_hits = _matched_terms(retrieved, case.forbid, set(case.forbid_statuses))
-            stale = [memory.id for memory in retrieved if memory.status in {"stale", "expired", "superseded", "disabled"}]
+            stale = [memory.id for memory in retrieved if memory.status == "archived"]
             wrong_policy: list[str] = []
             wrong_promotion = [
                 term
                 for term in case.forbid
                 for memory in retrieved
-                if memory.status in {"long_term", "durable", "pinned"} and _contains(memory, term)
+                if memory.status == "active" and _contains(memory, term)
             ]
         finally:
             remove_seed_memories(store, seed_ids)

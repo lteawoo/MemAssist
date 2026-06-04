@@ -85,7 +85,18 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                 self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
             # WRITE happens at turn end (Stop); the creating prompt cannot inject memory
             # it has not stored yet. Next-turn injection is verified via rag_payload below.
-            with patch("sys.stdin", StringIO(json.dumps({"session_id": "sess_e2e", "cwd": str(project)}))), patch("sys.stdout", StringIO()):
+            with patch(
+                "sys.stdin",
+                StringIO(
+                    json.dumps(
+                        {
+                            "session_id": "sess_e2e",
+                            "cwd": str(project),
+                            "prompt": prompt_payload["prompt"],
+                        }
+                    )
+                ),
+            ), patch("sys.stdout", StringIO()):
                 self.assertEqual(main(["hook", "stop"]), 0)
 
             with Store() as store:
@@ -195,7 +206,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
         submit = {"session_id": "sess_judge_e2e", "cwd": str(project), "prompt": self._MIXED_PROMPT}
         with patch("sys.stdin", StringIO(json.dumps(submit))), patch("sys.stdout", StringIO()):
             self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
-        stop = {"session_id": "sess_judge_e2e", "cwd": str(project)}
+        stop = {"session_id": "sess_judge_e2e", "cwd": str(project), "prompt": self._MIXED_PROMPT}
         with patch("sys.stdin", StringIO(json.dumps(stop))), patch("sys.stdout", StringIO()):
             self.assertEqual(main(["hook", "stop"]), 0)
 

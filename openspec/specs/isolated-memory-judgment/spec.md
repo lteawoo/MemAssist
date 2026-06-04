@@ -1,23 +1,23 @@
 # isolated-memory-judgment Specification
 
 ## Purpose
-Define how memassist evaluates prompt-derived durable memories with an isolated judge, preserves user meaning, avoids contaminated context, and stages policy-like memories until explicit activation.
+Define how memassist evaluates prompt-derived persistent memories with an isolated judge, preserves user meaning, avoids contaminated context, and stages policy-like memories until explicit activation.
 ## Requirements
-### Requirement: memassist SHALL judge prompt-derived durable memories in isolation
+### Requirement: memassist SHALL judge prompt-derived persistent memories in isolation
 
-memassist SHALL use an isolated memory judge for automatic durable memories derived from user prompts. The judge input MUST be limited to source events and allowed compact project hints, and MUST exclude assistant responses, injected memory context, system/developer prompts, current agent reasoning, and full conversation history.
+memassist SHALL use an isolated memory judge for automatic persistent memories derived from user prompts. The judge input MUST be built at turn end from host-provided source evidence and allowed compact project hints. It MUST exclude assistant responses, injected memory context, system/developer prompts, current agent reasoning, and full conversation history unless a future requirement explicitly permits an additional source type.
 
-#### Scenario: User directive is judged from source event only
+#### Scenario: User directive is judged from turn-end source evidence only
 
 - **WHEN** a user prompt says `앞으로 refresh token 쪽은 고치기 전에 나한테 먼저 물어봐`
-- **THEN** memassist SHALL create or enqueue a source event containing the user prompt
-- **AND** the isolated judge input SHALL include that source event
+- **AND** the turn reaches the Stop lifecycle event with host source evidence for that prompt
+- **THEN** memassist SHALL build isolated judge input from that source evidence
 - **AND** the isolated judge input SHALL NOT include assistant echo or retrieved memory context
 
 #### Scenario: Assistant echo is not a memory source
 
 - **WHEN** an assistant response says `앞으로 페이지/브라우저/서버 등 리프레시에 해당하는 동작은 실행 전에 먼저 승인 요청하겠습니다`
-- **THEN** memassist SHALL NOT use that assistant response as the source for a durable memory derived from the user's preference
+- **THEN** memassist SHALL NOT use that assistant response as the source for a persistent memory derived from the user's preference
 
 ### Requirement: memassist SHALL keep automatic memory ingestion invisible to users
 
@@ -25,13 +25,13 @@ Users SHALL NOT need to know about memory commands or explicitly request memory 
 
 #### Scenario: Low-risk preference is automatically stored
 
-- **WHEN** the isolated judge determines that a user prompt contains a low-risk durable preference
+- **WHEN** the isolated judge determines that a user prompt contains a low-risk persistent preference
 - **THEN** memassist SHALL store the memory without requiring the user to run a memory command
 - **AND** future RAG SHALL be able to retrieve that memory
 
 #### Scenario: Memory system knowledge is not required
 
-- **WHEN** a user states a durable preference in natural language
+- **WHEN** a user states a persistent preference in natural language
 - **THEN** memassist SHALL evaluate it for memory ingestion without requiring the user to mention memassist, memory, RAG, or storage
 
 ### Requirement: memassist SHALL stage policy-like memory separately from policy compilation
@@ -58,44 +58,62 @@ When the isolated judge identifies a directive that affects approval, warning, b
 
 ### Requirement: memassist SHALL control judge token cost
 
-memassist SHALL record every non-empty user prompt as a pending source event without keyword-based pre-filtering, and SHALL run the isolated judge over pending source events at turn end (the Stop lifecycle event) using a low-cost model, rather than blocking the prompt with inline judgment. Whether a prompt yields durable memory SHALL be decided by the isolated judge, not by a keyword rule.
+memassist SHALL avoid keyword-based inline judging during `UserPromptSubmit`, and SHALL run the isolated judge at turn end using a low-cost model when prompt-derived source evidence is available. Whether a prompt yields persistent memory SHALL be decided by the isolated judge and deterministic lifecycle policy, not by a keyword rule or submit-time storage.
 
 #### Scenario: Directive without trigger keywords is still judged
 
-- **WHEN** a user prompt expresses a durable preference but matches no predefined keyword list
-- **THEN** memassist SHALL record it as a pending source event
-- **AND** memassist SHALL submit it to the isolated judge at turn end
+- **WHEN** a user prompt expresses a persistent preference but matches no predefined keyword list
+- **AND** turn-end processing can access source evidence for that prompt
+- **THEN** memassist SHALL submit the source evidence to the isolated judge at turn end
 
 #### Scenario: Ordinary task is recorded but not inline-judged
 
 - **WHEN** a user prompt asks for a one-off task such as `refresh token TTL을 15분으로 바꿔줘`
 - **THEN** memassist SHALL NOT run the isolated judge during `UserPromptSubmit`
-- **AND** the isolated judge at turn end MAY determine that no durable memory should be stored
+- **AND** the isolated judge at turn end MAY determine that no persistent memory should be stored
 
 #### Scenario: UserPromptSubmit only reads memory
 
 - **WHEN** a user submits a prompt
 - **THEN** memassist SHALL retrieve and inject relevant memory during `UserPromptSubmit`
-- **AND** memassist SHALL NOT create durable memory during `UserPromptSubmit`
+- **AND** memassist SHALL NOT create source events, persistent memory, or memory candidates during `UserPromptSubmit`
 
-### Requirement: memassist SHALL keep session approval separate from durable memory judgment
+### Requirement: memassist SHALL let deterministic lifecycle policy decide memory status
+The isolated judge SHALL provide candidate content and evidence fields, while deterministic lifecycle policy SHALL decide whether the memory is stored as `candidate`, `active`, or `archived`. Judge-provided activation hints MAY be used as non-authoritative input but MUST NOT bypass duplicate, conflict, safety, source, scope, or confidence gates.
 
-Explicit approval prompts SHALL continue to create short-lived session approval grants and SHALL NOT create durable memory candidates through the isolated judge.
+#### Scenario: Judge candidate is gated by lifecycle policy
+- **WHEN** the isolated judge returns memory content with a source quote and confidence hints
+- **THEN** memassist SHALL run deterministic duplicate, conflict, safety, source, scope, and confidence checks
+- **AND** memassist SHALL choose the stored status using lifecycle policy
+- **AND** memassist SHALL NOT activate the memory solely because the judge requested activation
+
+### Requirement: memassist SHALL preserve source evidence for stored memories
+Every stored prompt-derived memory SHALL include source evidence that allows the user or system to audit why the memory exists. At minimum, stored evidence SHALL include `source_quote` when available and `source_ref` when the host provides a stable source reference.
+
+#### Scenario: Stored candidate has source evidence
+- **WHEN** memassist stores a candidate or active memory from turn-end judgment
+- **THEN** the stored record SHALL include the memory content
+- **AND** the stored record SHALL include the source quote when available
+- **AND** the stored record SHALL include the source reference when available
+
+### Requirement: memassist SHALL keep session approval separate from persistent memory judgment
+
+Explicit approval prompts SHALL continue to create short-lived session approval grants and SHALL NOT create persistent memory candidates through the isolated judge.
 
 #### Scenario: Approval prompt creates grant only
 
 - **WHEN** a user prompt says `승인`
 - **THEN** memassist SHALL create a session-scoped approval grant when applicable
-- **AND** memassist SHALL NOT create a durable memory candidate from that approval prompt
+- **AND** memassist SHALL NOT create a persistent memory candidate from that approval prompt
 
 ### Requirement: memassist SHALL select the isolated judge backend from initialized tools
 
-memassist SHALL choose the isolated memory judge backend from the tools initialized for the project, rather than from a single hardcoded tool. When more than one initialized tool provides a judge adapter, memassist SHALL select deterministically by a fixed preference order. When no initialized tool provides a judge adapter, memassist SHALL return an unavailable judge and SHALL NOT write durable prompt-derived memory.
+memassist SHALL choose the isolated memory judge backend from the tools initialized for the project, rather than from a single hardcoded tool. When more than one initialized tool provides a judge adapter, memassist SHALL select deterministically by a fixed preference order. When no initialized tool provides a judge adapter, memassist SHALL return an unavailable judge and SHALL NOT write persistent prompt-derived memory.
 
 #### Scenario: Claude-only project selects the Claude judge
 
 - **WHEN** a project has initialized the `claude` tool and not the `codex` tool
-- **THEN** memassist SHALL select the Claude judge backend for prompt-derived durable memory
+- **THEN** memassist SHALL select the Claude judge backend for prompt-derived persistent memory
 - **AND** memassist SHALL NOT report the judge as unavailable solely because `codex` is absent
 
 #### Scenario: Codex remains the backend when initialized
@@ -108,11 +126,11 @@ memassist SHALL choose the isolated memory judge backend from the tools initiali
 
 - **WHEN** a project has not initialized any tool that provides a judge adapter
 - **THEN** memassist SHALL return an unavailable judge
-- **AND** memassist SHALL NOT write durable prompt-derived memory
+- **AND** memassist SHALL NOT write persistent prompt-derived memory
 
 ### Requirement: memassist SHALL support a Claude Code isolated judge backend
 
-memassist SHALL provide a Claude Code judge adapter that evaluates a source event in a separate `claude` process and returns a structured judgment. The adapter MUST locate the judge JSON within the Claude CLI result envelope, MUST set recursion-guard environment variables on the subprocess, and MUST record diagnostics without writing durable memory when the process fails or returns invalid output.
+memassist SHALL provide a Claude Code judge adapter that evaluates a source event in a separate `claude` process and returns a structured judgment. The adapter MUST locate the judge JSON within the Claude CLI result envelope, MUST set recursion-guard environment variables on the subprocess, and MUST record diagnostics without writing persistent memory when the process fails or returns invalid output.
 
 #### Scenario: Claude judge JSON is parsed from the result envelope
 
@@ -129,7 +147,7 @@ memassist SHALL provide a Claude Code judge adapter that evaluates a source even
 
 - **WHEN** the Claude judge process times out, errors, or returns output without a valid judgment object
 - **THEN** memassist SHALL record judge diagnostics in the trace
-- **AND** memassist SHALL NOT write a durable memory for that source event
+- **AND** memassist SHALL NOT write a persistent memory for that source event
 
 ### Requirement: memassist SHALL report isolated judge backend readiness in diagnostics
 
@@ -197,7 +215,7 @@ When an isolated judge call fails to produce a judgment (no candidate — e.g. e
 
 - **WHEN** a source event's isolated judge calls have failed the maximum number of times
 - **THEN** memassist SHALL stop retrying that source event
-- **AND** memassist SHALL NOT have created durable memory from it
+- **AND** memassist SHALL NOT have created persistent memory from it
 
 #### Scenario: A genuine decision is not retried
 
@@ -215,14 +233,14 @@ memassist SHALL launch the isolated judge subprocess with the host coding tool's
 - **THEN** the subprocess environment SHALL NOT contain the host Claude Code session markers (`CLAUDECODE` and `CLAUDE_CODE_*`)
 - **AND** the subprocess environment SHALL still set the recursion-guard variables
 
-### Requirement: memassist SHALL separate durable memory content from source evidence
+### Requirement: memassist SHALL separate persistent memory content from source evidence
 
-memassist SHALL store only the durable preference, directive, fact, or workflow as retrievable memory content when an isolated judge accepts a prompt-derived memory. The original user prompt or source quote MUST remain available as evidence metadata, but transient current-turn instructions MUST NOT be stored as the primary memory content unless the user explicitly asks to remember them for future turns.
+memassist SHALL store only the persistent preference, directive, fact, or workflow as retrievable memory content when an isolated judge accepts a prompt-derived memory. The original user prompt or source quote MUST remain available as evidence metadata, but transient current-turn instructions MUST NOT be stored as the primary memory content unless the user explicitly asks to remember them for future turns.
 
-#### Scenario: Durable directive with one-shot response instruction
+#### Scenario: Persistent directive with one-shot response instruction
 
 - **WHEN** a user prompt says `앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.`
-- **THEN** memassist SHALL store a durable memory equivalent to `앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해`
+- **THEN** memassist SHALL store a persistent memory equivalent to `앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해`
 - **AND** the stored memory content SHALL NOT contain `응답은 OK만 해`
 - **AND** lifecycle metadata SHALL preserve the original source quote
 
@@ -235,6 +253,5 @@ memassist SHALL store only the durable preference, directive, fact, or workflow 
 #### Scenario: Retrieval excludes transient source text
 
 - **WHEN** a later prompt retrieves memory relevant to refresh token changes
-- **THEN** the injected memory context SHALL include the durable refresh-token confirmation directive
+- **THEN** the injected memory context SHALL include the persistent refresh-token confirmation directive
 - **AND** the injected memory context SHALL NOT include current-turn response-format text from the original prompt
-

@@ -16,7 +16,7 @@ from .lesson import lesson_from_session
 from .lifecycle import cleanup_memories, process_session_lifecycle
 from .memory_judge import (
     likely_distorted_or_echo_memory,
-    observe_memory_intent,
+    observe_turn_end_memory_source,
     process_pending_memory_intents,
 )
 from .memory_eval import (
@@ -25,6 +25,7 @@ from .memory_eval import (
     evaluate_memory_quality,
     load_memory_quality_cases,
 )
+from .memory_artifacts import ensure_memory_artifact_dirs
 from .paths import db_path, memassist_home, project_memassist_home
 from .policy import (
     default_policy_yaml,
@@ -93,6 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
     mem_search.add_argument("--json", action="store_true")
     mem_search.set_defaults(func=cmd_memory_search)
 
+    mem_rebuild = memory_sub.add_parser("rebuild-index", help="rebuild SQLite search index from Markdown memories")
+    mem_rebuild.add_argument("--json", action="store_true")
+    mem_rebuild.set_defaults(func=cmd_memory_rebuild_index)
+
     mem_pack = memory_sub.add_parser("pack", help="build a memory pack")
     mem_pack.add_argument("query")
     mem_pack.add_argument("--json", action="store_true")
@@ -125,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     mem_links.add_argument("--json", action="store_true")
     mem_links.set_defaults(func=cmd_memory_links)
 
-    mem_drafts = memory_sub.add_parser("drafts", help="list draft memories")
+    mem_drafts = memory_sub.add_parser("drafts", help="list candidate memories")
     mem_drafts.add_argument("--json", action="store_true")
     mem_drafts.set_defaults(func=cmd_memory_drafts)
 
@@ -133,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     mem_activate.add_argument("id")
     mem_activate.set_defaults(func=cmd_memory_activate)
 
-    mem_deactivate = memory_sub.add_parser("deactivate", help="disable a memory")
+    mem_deactivate = memory_sub.add_parser("deactivate", help="archive a memory")
     mem_deactivate.add_argument("id")
     mem_deactivate.set_defaults(func=cmd_memory_deactivate)
 
@@ -147,7 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     mem_export.add_argument("--json", action="store_true")
     mem_export.set_defaults(func=cmd_memory_export)
 
-    mem_import = memory_sub.add_parser("import", help="import project memories as drafts")
+    mem_import = memory_sub.add_parser("import", help="import project memories as candidates")
     mem_import.add_argument("path", nargs="?")
     mem_import.add_argument("--activate", action="store_true")
     mem_import.add_argument("--json", action="store_true")
@@ -155,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     lesson = sub.add_parser("lesson", help="create lessons from traced sessions")
     lesson_sub = lesson.add_subparsers(required=True)
-    lesson_from = lesson_sub.add_parser("from-session", help="create a draft lesson from a session")
+    lesson_from = lesson_sub.add_parser("from-session", help="create a candidate lesson from a session")
     lesson_from.add_argument("session", nargs="?", default="latest")
     lesson_from.add_argument("--feedback")
     lesson_from.set_defaults(func=cmd_lesson_from_session)
@@ -250,6 +255,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     project = detect_project_for_init()
     mem_dir = project_memassist_home(project.root)
     mem_dir.mkdir(exist_ok=True)
+    ensure_memory_artifact_dirs(mem_dir)
     policy_path = mem_dir / "policy.yaml"
     if not policy_path.exists():
         policy_path.write_text(default_policy_yaml(), encoding="utf-8")
@@ -353,6 +359,16 @@ def cmd_memory_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_memory_rebuild_index(args: argparse.Namespace) -> int:
+    with _store() as store:
+        indexed = store.rebuild_memory_index_from_artifacts()
+    if args.json:
+        _print_json({"indexed": indexed, "count": len(indexed)})
+    else:
+        print(f"Indexed {len(indexed)} memories from Markdown.")
+    return 0
+
+
 def cmd_memory_pack(args: argparse.Namespace) -> int:
     project = detect_project()
     with _store() as store:
@@ -438,7 +454,7 @@ def cmd_memory_links(args: argparse.Namespace) -> int:
 def cmd_memory_drafts(args: argparse.Namespace) -> int:
     project = detect_project()
     with _store() as store:
-        memories = store.list_memories(project_id=project.id, include_global=True, status="draft")
+        memories = store.list_memories(project_id=project.id, include_global=True, status="candidate")
     if args.json:
         _print_json([memory.as_dict() for memory in memories])
     else:
@@ -459,8 +475,8 @@ def cmd_memory_activate(args: argparse.Namespace) -> int:
 
 def cmd_memory_deactivate(args: argparse.Namespace) -> int:
     with _store() as store:
-        store.update_status(args.id, "disabled")
-    print(f"deactivated {args.id}")
+        store.update_status(args.id, "archived")
+    print(f"archived {args.id}")
     return 0
 
 
@@ -531,7 +547,7 @@ def cmd_lesson_from_session(args: argparse.Namespace) -> int:
             content=content,
             reason="Created from traced session feedback.",
             tags=["lesson", "session"],
-            status="draft",
+            status="candidate",
             importance=0.8,
             confidence=0.6,
             source_kind="lesson_from_session",
@@ -599,14 +615,6 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
         store.upsert_project(project)
         if args.hook_event == "user-prompt-submit":
             query = str(payload.get("prompt") or payload.get("message") or payload.get("content") or "")
-            # Record the prompt as a pending source event for turn-end judging; do not
-            # judge inline (no prompt-path latency). The Stop hook runs the judge.
-            observe_memory_intent(
-                store,
-                session_id=session_id,
-                project_id=project.id,
-                prompt=query,
-            )
             pack = build_memory_pack(store, query=query, project_id=project.id)
             _record_memory_injection(store, session_id=session_id, project_id=project.id, query=query, pack=pack)
             context = render_prompt_context(pack)
@@ -649,6 +657,12 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
             payload=payload,
         )
         if args.hook_event == "stop":
+            observe_turn_end_memory_source(
+                store,
+                session_id=session_id,
+                project_id=project.id,
+                payload=payload,
+            )
             process_pending_memory_intents(store, project=project, session_id=session_id)
             process_session_lifecycle(store, session_id=session_id, project_id=project.id)
     return 0

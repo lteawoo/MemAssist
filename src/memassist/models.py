@@ -33,6 +33,7 @@ MEMORY_STATUSES = {
     "expired",
     "deleted",
     "tombstoned",
+    "archived",
 }
 
 ENFORCEMENTS = {"none", "warn", "block"}

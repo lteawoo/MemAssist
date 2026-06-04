@@ -10,10 +10,10 @@ deterministic PolicyEngine 기반 PreToolUse allow/warn/block 집행은 memassis
 
 ## Requirements
 
-### Requirement: memassist는 PreToolUse hook에서 tool call을 차단하거나 경고하지 않는다
+### Requirement: memassist SHALL NOT block or warn tool calls in the PreToolUse hook
 
-memassist는 `PolicyEngine.check_pre_tool` 또는 이와 동등한 기계적 로직으로
-`deny`/`block`/`warn`을 반환하지 않는다. 사용자 지시는 memory로 저장되어 retrieval을
+memassist SHALL NOT return `deny`/`block`/`warn` from `PolicyEngine.check_pre_tool`
+or equivalent mechanical policy logic. 사용자 지시는 memory로 저장되어 retrieval을
 통해 agent context에 주입된다.
 
 #### Scenario: pre-tool-use hook은 trace만 기록하고 집행 출력을 내지 않는다
@@ -25,17 +25,17 @@ memassist는 `PolicyEngine.check_pre_tool` 또는 이와 동등한 기계적 로
 #### Scenario: 사용자 지시는 memory retrieval → context 주입 경로로만 처리된다
 
 - **GIVEN** 사용자가 "리프레시 토큰 변경은 승인받고 진행해"라고 지시했다
-- **WHEN** isolated memory judge가 이를 durable memory로 저장했다
+- **WHEN** isolated memory judge가 이를 persistent memory로 저장했다
 - **WHEN** 다음 UserPromptSubmit에서 관련 작업이 요청된다
 - **THEN** memassist는 저장된 memory를 `additionalContext`로 주입한다
 - **AND** agent가 그 context를 읽고 승인을 요청하거나 멈추는 것은 agent의 자율 판단이다
 - **AND** memassist는 PreToolUse에서 기계적으로 차단하지 않는다
 
-### Requirement: verification_commands는 retrieval reminder로 보존된다
+### Requirement: verification_commands SHALL be preserved as retrieval reminders
 
-`policy.yaml`의 `verification_commands`는 집행(allow/warn/block) 목적이 아닌
-검증 reminder 데이터다. `load_policy`는 이 필드를 읽어 verifier 섹션 retrieval과
-verify/eval에서 사용한다.
+`policy.yaml`의 `verification_commands` SHALL be treated as retrieval reminders,
+not allow/warn/block enforcement data. `load_policy`는 이 필드를 읽어 verifier 섹션
+retrieval과 verify/eval에서 사용한다.
 
 #### Scenario: verification_commands 보존
 
@@ -44,10 +44,10 @@ verify/eval에서 사용한다.
 - **THEN** `verification_commands`는 로드된다
 - **AND** 이 데이터는 `verifier` memory 섹션 retrieval과 verify/eval에서 사용된다
 
-### Requirement: 생성된 policy 파일은 집행 키를 포함하지 않는다
+### Requirement: generated policy files SHALL NOT include enforcement keys
 
-새로 생성되는 `policy.yaml`은 `sensitive_paths`, `protected_paths`,
-`dangerous_commands` 키를 포함하지 않는다.
+새로 생성되는 `policy.yaml` SHALL NOT include `sensitive_paths`, `protected_paths`,
+or `dangerous_commands` keys.
 
 #### Scenario: 기본 policy 파일 형식
 

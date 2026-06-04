@@ -29,10 +29,11 @@ MAX_SOURCE_CHARS = 600
 MAX_HINTS = 8
 MAX_DEBUG_CHARS = 4000
 MAX_JUDGE_ATTEMPTS = 3
+SOURCE_EVENT_TYPE = "memory_source_observed"
 
 
 @dataclass(frozen=True)
-class MemoryIntentEvent:
+class MemorySourceEvent:
     event_id: str
 
 
@@ -87,6 +88,13 @@ class StoredJudgment:
     decision: str
 
 
+@dataclass(frozen=True)
+class TurnEndMemorySource:
+    content: str
+    source_ref: str
+    source_kind: str
+
+
 class MemoryJudge(Protocol):
     name: str
 
@@ -94,32 +102,69 @@ class MemoryJudge(Protocol):
         ...
 
 
-def observe_memory_intent(
+def extract_turn_end_memory_source(
+    payload: dict[str, Any],
+    *,
+    session_id: str,
+) -> TurnEndMemorySource | None:
+    direct = _payload_prompt(payload)
+    if direct:
+        return TurnEndMemorySource(
+            content=direct[:MAX_SOURCE_CHARS],
+            source_ref="hook_payload",
+            source_kind="hook_payload",
+        )
+    transcript_path = str(payload.get("transcript_path") or payload.get("transcriptPath") or "")
+    if transcript_path:
+        transcript = _latest_user_prompt_from_transcript(Path(transcript_path))
+        if transcript:
+            return TurnEndMemorySource(
+                content=transcript[:MAX_SOURCE_CHARS],
+                source_ref=transcript_path,
+                source_kind="transcript",
+            )
+    history = _latest_user_prompt_from_codex_history(session_id)
+    if history:
+        return TurnEndMemorySource(
+            content=history[:MAX_SOURCE_CHARS],
+            source_ref=f"codex_history:{session_id}",
+            source_kind="codex_history",
+        )
+    return None
+
+
+def observe_turn_end_memory_source(
     store: Store,
     *,
     session_id: str,
     project_id: str,
-    prompt: str,
-) -> MemoryIntentEvent | None:
-    content = " ".join(prompt.strip().split())
-    if not content:
+    payload: dict[str, Any],
+) -> MemorySourceEvent | None:
+    source = extract_turn_end_memory_source(payload, session_id=session_id)
+    if not source or not source.content.strip():
         return None
-    # Record every prompt as a pending source event. No keyword gate: whether the
-    # prompt yields durable memory is decided by the isolated judge at turn end,
-    # not by a keyword whitelist.
+    existing = _find_existing_source_event(
+        store,
+        session_id=session_id,
+        content=source.content,
+        source_ref=source.source_ref,
+    )
+    if existing:
+        return MemorySourceEvent(event_id=existing)
     event_id = store.add_trace_event(
         session_id=session_id,
         project_id=project_id,
-        event_type="memory_intent_observed",
+        event_type="memory_source_observed",
         tool_name="memassist",
         input_json={
             "source_role": "user",
-            "content": content[:MAX_SOURCE_CHARS],
+            "content": source.content,
+            "source_ref": source.source_ref,
+            "source_kind": source.source_kind,
             "status": "pending",
-            "allowed_hints": {},
         },
     )
-    return MemoryIntentEvent(event_id=event_id)
+    return MemorySourceEvent(event_id=event_id)
 
 
 def process_memory_intent_event(
@@ -172,7 +217,7 @@ def process_pending_memory_intents(
     processed = _processed_source_event_ids(store, session_id=session_id)
     results: list[StoredJudgment] = []
     for event in store.trace_events(session_id, limit=200):
-        if event["event_type"] != "memory_intent_observed" or event["id"] in processed:
+        if event["event_type"] != SOURCE_EVENT_TYPE or event["id"] in processed:
             continue
         results.append(
             process_memory_intent_event(
@@ -203,6 +248,8 @@ def build_judge_payload(
             "id": str(source_event["id"]),
             "role": "user",
             "content": content,
+            "source_ref": str(input_json.get("source_ref") or source_event["id"]),
+            "source_kind": str(input_json.get("source_kind") or source_event.get("event_type") or "unknown"),
         },
         "project_hints": {
             "recent_files": recent_files[:MAX_HINTS],
@@ -295,11 +342,11 @@ def _build_judge_instruction(payload: dict[str, object]) -> str:
         "You are an isolated memory judge. Return only one compact JSON object with fields: "
         "should_store boolean, memory_content string, source_quote string, memory_type one of "
         "fact/preference/rule/decision/lesson/workflow/open_thread/directive, enforcement one of "
-        "none/warn/block, activation one of candidate/active/auto_active/rejected, "
+        "none/warn/block, activation one of candidate/active/rejected, "
         "candidate_paths string array, meaning_preserved boolean, "
         "contamination_risk one of low/medium/high, reason string. "
         "Use only source_event and project_hints. Do not infer from assistant responses or retrieved memory. "
-        "Write memory_content as only the durable future memory in the user's source language when possible. "
+        "Write memory_content as only the persistent future memory in the user's source language when possible. "
         "Do not include one-shot current-turn instructions, output formatting requests, or commands like "
         "'respond only OK' in memory_content unless the user explicitly asks to remember that response format "
         "for future turns. Preserve the full original wording separately in source_quote. "
@@ -456,17 +503,18 @@ def store_judge_result(
     enforcement = candidate.enforcement if candidate.enforcement in ENFORCEMENTS else "none"
     normalized_paths = _normalize_project_files(candidate.candidate_paths, project.root)
     policy_like = enforcement in {"warn", "block"}
-    status = _activation_status(candidate.activation)
-    if status == "candidate" and policy_like:
-        status = "active"
+    status = _activation_status(candidate)
     content = (candidate.memory_content.strip() or candidate.source_quote.strip())[:500]
     if not content:
         return None
+    source_event = _trace_event_by_id(store, source_event_id) or {}
+    source_input = _event_input(source_event)
+    source_ref = str(source_input.get("source_ref") or source_event_id)
     existing = store.find_memory(
         project_id=project.id,
         content=content,
         type=memory_type,
-        statuses=("candidate", "draft", "auto_active", "active", "long_term", "durable"),
+        statuses=("candidate", "active", "archived"),
     )
     if existing:
         return existing.id
@@ -483,11 +531,12 @@ def store_judge_result(
         tags=_judge_tags(candidate),
         paths=normalized_paths,
         status=status,
-        importance=0.85 if status in {"active", "auto_active"} else 0.65,
+        importance=0.85 if status == "active" else 0.65,
         confidence=0.85 if candidate.contamination_risk == "low" else 0.7,
         enforcement=enforcement,
         source_kind="isolated_memory_judge",
-        source_ref=source_event_id,
+        source_ref=source_ref,
+        source_quote=candidate.source_quote,
     )
     memory = store.get_memory(memory_id)
     store.add_lifecycle_event(
@@ -497,6 +546,7 @@ def store_judge_result(
         candidate={
             "judge": candidate.as_dict(),
             "source_event_id": source_event_id,
+            "source_ref": source_ref,
             "source_quote": candidate.source_quote,
             "payload": result.payload,
         },
@@ -590,7 +640,7 @@ def _candidate_from_output(output: str) -> MemoryJudgeCandidate:
     if enforcement not in ENFORCEMENTS:
         raise ValueError(f"invalid enforcement: {enforcement}")
     activation = _required_str(raw, "activation")
-    if activation not in {"candidate", "active", "auto_active", "rejected"}:
+    if activation not in {"candidate", "active", "rejected"}:
         raise ValueError(f"invalid activation: {activation}")
     contamination_risk = _required_str(raw, "contamination_risk")
     if contamination_risk not in {"low", "medium", "high"}:
@@ -734,12 +784,115 @@ def _processed_source_event_ids(store: Store, *, session_id: str) -> set[str]:
     return processed
 
 
+def _find_existing_source_event(
+    store: Store,
+    *,
+    session_id: str,
+    content: str,
+    source_ref: str,
+) -> str | None:
+    for event in store.trace_events(session_id, limit=200):
+        if event["event_type"] != SOURCE_EVENT_TYPE:
+            continue
+        input_json = _event_input(dict(event))
+        if input_json.get("content") == content and input_json.get("source_ref") == source_ref:
+            return str(event["id"])
+    return None
+
+
 def _event_input(event: dict[str, Any]) -> dict[str, Any]:
     try:
         value = json.loads(str(event.get("input_json") or "{}"))
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _payload_prompt(payload: dict[str, Any]) -> str:
+    for key in ("prompt", "message", "content", "user_prompt", "userPrompt"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return " ".join(value.strip().split())
+    return ""
+
+
+def _latest_user_prompt_from_transcript(path: Path) -> str:
+    if not path.exists():
+        return ""
+    latest = ""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as file:
+            for line in file:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                candidate = _user_text_from_transcript_obj(obj)
+                if candidate:
+                    latest = candidate
+    except OSError:
+        return ""
+    return " ".join(latest.strip().split())
+
+
+def _user_text_from_transcript_obj(obj: object) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    payload = obj.get("payload")
+    if isinstance(payload, dict):
+        if payload.get("type") == "user_message":
+            message = payload.get("message")
+            if isinstance(message, str):
+                return message
+        message = payload.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            text = _content_text(content)
+            if text:
+                return text
+    if obj.get("role") == "user":
+        text = _content_text(obj.get("content"))
+        if text:
+            return text
+    return ""
+
+
+def _content_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def _latest_user_prompt_from_codex_history(session_id: str) -> str:
+    if not session_id:
+        return ""
+    history_path = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "history.jsonl"
+    if not history_path.exists():
+        return ""
+    latest = ""
+    try:
+        with history_path.open(encoding="utf-8", errors="replace") as file:
+            for line in file:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict) or obj.get("session_id") != session_id:
+                    continue
+                text = obj.get("text")
+                if isinstance(text, str) and text.strip():
+                    latest = text
+    except OSError:
+        return ""
+    return " ".join(latest.strip().split())
 
 
 def _recent_files(store: Store, *, session_id: str) -> list[str]:
@@ -772,9 +925,11 @@ def _memory_conflicts(store: Store, *, project_id: str, content: str) -> list[di
     return conflicts
 
 
-def _activation_status(activation: str) -> str:
-    if activation in {"active", "auto_active"}:
-        return activation
+def _activation_status(candidate: MemoryJudgeCandidate) -> str:
+    if candidate.activation == "rejected":
+        return "archived"
+    if candidate.activation == "active" and candidate.contamination_risk == "low":
+        return "active"
     return "candidate"
 
 

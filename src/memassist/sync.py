@@ -73,7 +73,7 @@ def import_memories(store: Store, *, project_id: str, path: Path, activate: bool
             reason=memory["reason"],
             tags=memory["tags"],
             paths=memory["paths"],
-            status="active" if activate else "draft",
+            status="active" if activate else "candidate",
             importance=memory["importance"],
             confidence=memory["confidence"],
             strength=memory["strength"],

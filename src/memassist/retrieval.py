@@ -9,13 +9,9 @@ from .models import Memory
 from .storage import Store
 
 
-ACTIVE_STATUSES = {"active", "auto_active", "long_term", "durable", "pinned"}
+ACTIVE_STATUSES = {"active"}
 STATUS_WEIGHT = {
-    "pinned": 1.0,
-    "durable": 0.90,
-    "long_term": 0.85,
-    "auto_active": 0.70,
-    "active": 0.65,
+    "active": 1.0,
 }
 CHANNEL_WEIGHTS = {
     "lexical": 1.00,
@@ -240,21 +236,6 @@ def fuse_retrieval_channels(
     return _dedupe_by_signature(ranked, limit=limit)
 
 
-def rerank_memories(query: str, memories: list[Memory], *, limit: int | None = None) -> list[Memory]:
-    ranked = sorted(memories, key=lambda memory: _memory_score(query, memory), reverse=True)
-    diversified: list[Memory] = []
-    seen_signatures: set[str] = set()
-    for memory in ranked:
-        signature = _signature(memory.content)
-        if signature in seen_signatures:
-            continue
-        seen_signatures.add(signature)
-        diversified.append(memory)
-        if limit and len(diversified) >= limit:
-            break
-    return diversified
-
-
 def _active_memories(store: Store, project_id: str) -> list[Memory]:
     return [
         memory
@@ -280,7 +261,6 @@ def _metadata_channel(query: str, intent: QueryIntent, memories: list[Memory]) -
         memory
         for memory in memories
         if _metadata_score(query, intent, memory) > 0
-        or memory.status in {"pinned", "long_term", "durable"}
         or memory.type in {"lesson", "decision", "open_thread"}
     ]
     return sorted(relevant, key=lambda memory: _metadata_score(query, intent, memory), reverse=True)[:20]
