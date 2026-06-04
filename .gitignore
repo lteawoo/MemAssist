@@ -58,3 +58,7 @@ htmlcov/
 .idea/
 .vscode/
 
+# Agent tooling (generated command/skill definitions)
+.claude/
+.opencode/
+
