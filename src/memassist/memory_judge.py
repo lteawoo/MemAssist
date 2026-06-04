@@ -353,6 +353,8 @@ class _SubprocessMemoryJudge:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 env=env,
                 stdin=self._stdin(),
@@ -687,7 +689,9 @@ def _write_judge_debug(project: Project, record: dict[str, object]) -> None:
     path = Path(debug).expanduser() if debug not in {"1", "true", "yes"} else project.root / ".memassist" / "judge-debug.jsonl"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as file:
+        # errors="replace" keeps debug logging from ever crashing the hook on lone
+        # surrogates that may already exist in stored payloads from earlier bad runs.
+        with path.open("a", encoding="utf-8", errors="replace") as file:
             file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError:
         return

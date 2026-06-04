@@ -891,7 +891,15 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
 
 
 def _read_json_stdin() -> dict[str, Any]:
-    text = sys.stdin.read().strip()
+    # Hook payloads from Claude Code / Codex are always UTF-8 JSON. Read raw bytes and
+    # decode as UTF-8 ourselves so a Windows locale codec (e.g. cp949) does not corrupt
+    # non-ASCII prompts into lone surrogates. Fall back to text mode when stdin has no
+    # binary buffer (e.g. a StringIO stand-in in tests).
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is not None:
+        text = buffer.read().decode("utf-8", errors="replace").strip()
+    else:
+        text = sys.stdin.read().strip()
     if not text:
         return {}
     try:

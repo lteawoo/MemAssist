@@ -257,6 +257,29 @@ class GuiReadOnlyApiTest(unittest.TestCase):
             finally:
                 client.close()
 
+    def test_api_survives_lone_surrogate_in_stored_trace_input(self) -> None:
+        # Tool input stored as JSON text with a \uXXXX lone-surrogate escape binds fine,
+        # but json.loads restores a real lone surrogate on read. The API must still respond.
+        with isolated_env():
+            project = self._seed_project()
+            with Store() as store:
+                store.add_trace_event(
+                    session_id="sess_gui_surrogate",
+                    project_id=project.id,
+                    event_type="tool",
+                    tool_name="read",
+                    input_json={"path": "src/a\udc80b.py"},
+                    files=["src/a\udc80b.py"],
+                )
+            client = GuiApiClient(self.gui)
+            try:
+                for endpoint in ("/api/summary", "/api/traces"):
+                    status, _headers, payload = client.get_json(endpoint)
+                    self.assertEqual(status, 200, endpoint)
+                    self.assertIsInstance(payload, (dict, list), endpoint)
+            finally:
+                client.close()
+
     def test_dashboard_html_exposes_localized_metric_help_without_score_label(self) -> None:
         html = self.gui._dashboard_html()
         self.assertIn('id="locale"', html)

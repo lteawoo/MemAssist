@@ -262,7 +262,7 @@ class MemassistRequestHandler(BaseHTTPRequestHandler):
         print(f"{self.address_string()} - {format % args}", file=sys.stderr)
 
     def _send_html(self, body: str, *, status: HTTPStatus = HTTPStatus.OK) -> None:
-        payload = body.encode("utf-8")
+        payload = _utf8(body)
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
@@ -270,7 +270,7 @@ class MemassistRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _send_json(self, data: Any, *, status: HTTPStatus = HTTPStatus.OK) -> None:
-        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        payload = _utf8(json.dumps(data, ensure_ascii=False, indent=2))
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
@@ -539,6 +539,14 @@ def _resolve_project(raw_project_id: str | None) -> Project:
         root=Path(str(row["root_path"])),
         git_remote=row["git_remote"],
     )
+
+
+def _utf8(text: str) -> bytes:
+    """Encode response text as UTF-8, neutralizing lone surrogates from corrupt stored bytes."""
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace")
 
 
 def _query(raw_query: str) -> dict[str, str]:
