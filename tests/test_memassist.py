@@ -2453,7 +2453,9 @@ class ClaudeMemoryJudgeTest(unittest.TestCase):
         self.assertEqual(judge.executable, "claude")
         self.assertEqual(judge._stdin(), subprocess.DEVNULL)
         command = judge._command("INSTRUCTION", project=object())
-        self.assertEqual(command, ["claude", "-p", "--output-format", "json", "INSTRUCTION"])
+        self.assertEqual(command[:2], ["claude", "-p"])
+        self.assertIn("--output-format", command)
+        self.assertEqual(command[command.index("--output-format") + 1], "json")
         # instruction stays last so _debug_command masks it
         self.assertEqual(command[-1], "INSTRUCTION")
 
@@ -2479,6 +2481,41 @@ class ClaudeMemoryJudgeTest(unittest.TestCase):
         # durable/transient separation: the one-shot instruction is not in memory_content
         self.assertNotIn("응답은 OK만 해", candidate.memory_content)
         self.assertIn("리프레시 토큰", candidate.memory_content)
+
+    def test_parses_fenced_json_from_result_envelope(self) -> None:
+        from memassist.memory_judge import _candidate_from_output
+
+        inner = {
+            "should_store": True,
+            "memory_content": "리프레시 토큰 변경 전 사용자 확인을 받는다",
+            "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
+            "memory_type": "rule",
+            "enforcement": "block",
+            "activation": "active",
+            "candidate_paths": [],
+            "meaning_preserved": True,
+            "contamination_risk": "low",
+            "reason": "durable directive; one-shot response instruction excluded",
+        }
+        fenced = "```json\n" + json.dumps(inner, ensure_ascii=False) + "\n```"
+        envelope = json.dumps({"type": "result", "subtype": "success", "result": fenced})
+        candidate = _candidate_from_output(envelope)
+        self.assertTrue(candidate.should_store)
+        self.assertEqual(candidate.memory_type, "rule")
+        self.assertNotIn("응답은 OK", candidate.memory_content)
+        self.assertIn("리프레시 토큰", candidate.memory_content)
+
+    def test_claude_judge_uses_configurable_low_cost_model(self) -> None:
+        from memassist.memory_judge import ClaudeMemoryJudge
+
+        judge = ClaudeMemoryJudge()
+        default_cmd = judge._command("INSTR", project=object())
+        self.assertIn("--model", default_cmd)
+        self.assertEqual(default_cmd[default_cmd.index("--model") + 1], "haiku")
+        self.assertEqual(default_cmd[-1], "INSTR")  # instruction stays last
+        with patch.dict(os.environ, {"MEMASSIST_MEMORY_JUDGE_MODEL": "sonnet"}):
+            override_cmd = judge._command("INSTR", project=object())
+        self.assertEqual(override_cmd[override_cmd.index("--model") + 1], "sonnet")
 
     def test_parser_still_handles_raw_and_codex_jsonl(self) -> None:
         from memassist.memory_judge import _candidate_from_output

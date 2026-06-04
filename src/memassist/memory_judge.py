@@ -402,10 +402,14 @@ class ClaudeMemoryJudge(_SubprocessMemoryJudge):
         # Keep ``instruction`` last so _debug_command masks it. stdin is closed so
         # the CLI does not block waiting for piped input. No sandbox flag: the judge
         # prompt is read-only by construction, and recursion (not file writes) is the
-        # real risk, which the guard environment covers.
+        # real risk, which the guard environment covers. The judge runs on a low-cost
+        # model by default so it is affordable per turn; override via env.
+        model = os.environ.get("MEMASSIST_MEMORY_JUDGE_MODEL", "haiku")
         return [
             "claude",
             "-p",
+            "--model",
+            model,
             "--output-format",
             "json",
             instruction,
@@ -549,6 +553,17 @@ def _candidate_from_output(output: str) -> MemoryJudgeCandidate:
     )
 
 
+def _json_candidates(value: str) -> list[str]:
+    """Parse-candidates from a string that may wrap a JSON object in a code fence
+    or surrounding prose. Greedy {...} extraction drops surrounding ``` fences
+    because they fall outside the first '{' and last '}'."""
+    out = [value]
+    match = re.search(r"\{.*\}", value, flags=re.DOTALL)
+    if match:
+        out.append(match.group(0))
+    return out
+
+
 def _extract_json_object(output: str) -> dict[str, object]:
     text = output.strip()
     if not text:
@@ -566,13 +581,13 @@ def _extract_json_object(output: str) -> dict[str, object]:
             if isinstance(item, dict):
                 item_text = item.get("text")
                 if isinstance(item_text, str):
-                    candidates.append(item_text)
+                    candidates.extend(_json_candidates(item_text))
             event_text = event.get("text")
             if isinstance(event_text, str):
-                candidates.append(event_text)
+                candidates.extend(_json_candidates(event_text))
             result_text = event.get("result")
             if isinstance(result_text, str):
-                candidates.append(result_text)
+                candidates.extend(_json_candidates(result_text))
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if match:
         candidates.append(match.group(0))
