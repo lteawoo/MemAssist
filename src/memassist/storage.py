@@ -325,6 +325,29 @@ class Store:
         self.conn.commit()
         return linked
 
+    def add_memory_link(
+        self,
+        *,
+        source_id: str,
+        target_id: str,
+        project_id: str | None,
+        relation: str,
+        strength: float,
+        reason: str,
+    ) -> bool:
+        link_id = f"link_{uuid.uuid4().hex[:12]}"
+        cursor = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO memory_links (
+              id, project_id, source_id, target_id, relation, strength, reason, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (link_id, project_id, source_id, target_id, relation, _clamp(strength), reason, now_iso()),
+        )
+        self.conn.commit()
+        return bool(cursor.rowcount)
+
     def memory_links(self, memory_id: str) -> list[dict[str, Any]]:
         if not read_memory_artifact_by_id(self.path.parent, memory_id):
             return []

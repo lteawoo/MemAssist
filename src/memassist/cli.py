@@ -643,6 +643,8 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
                 project_id=project.id,
                 payload=payload,
             )
+            # Memory ingestion runs through the judge and conflict resolver. The
+            # lifecycle pass only performs operational cleanup after ingestion.
             process_pending_memory_intents(store, project=project, session_id=session_id)
             process_session_lifecycle(store, session_id=session_id, project_id=project.id)
     return 0
@@ -1073,6 +1075,15 @@ def _print_tool_results(results: list[Any], *, as_json: bool = False) -> None:
     for result in results:
         state = "installed" if result.installed else "removed"
         print(f"{result.tool}: {state} {result.path}")
+
+
+def _run_lifecycle_cleanup(store: Store, *, session_id: str | None, project_id: str | None) -> None:
+    """Run non-heuristic lifecycle operations after judge ingestion.
+
+    cleanup_memories handles expiry-based archival and exact duplicate cleanup.
+    Heuristic candidate generation was removed; candidates come from the judge path.
+    """
+    cleanup_memories(store)
 
 
 class _store:

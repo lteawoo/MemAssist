@@ -83,6 +83,10 @@ def no_memory_fixture(*, source_integrity: str = "clean", reject_reason: str = "
     )
 
 
+def relation_fixture(*relations: dict[str, str]) -> str:
+    return json.dumps({"relations": list(relations)}, ensure_ascii=False)
+
+
 def _write_test_embedding_profiles(mem_dir: Path, *, active: str = "test-local") -> None:
     save_embedding_profile_config(
         EmbeddingProfileConfig(
@@ -3711,6 +3715,36 @@ class JudgeDuplicateReinforceTest(unittest.TestCase):
     def _fixture_response(self, content: str, memory_type: str = "directive") -> str:
         return judge_fixture(content, memory_type=memory_type, source_integrity="clean", reason="test duplicate reinforce")
 
+    def _source_event(self, store: Store, *, project_id: str, session_id: str, content: str) -> str:
+        return store.add_trace_event(
+            session_id=session_id,
+            project_id=project_id,
+            event_type="memory_source_observed",
+            tool_name="memassist",
+            input_json={
+                "content": content,
+                "source_ref": "hook_payload",
+                "source_kind": "hook_payload",
+            },
+        )
+
+    def _judge_result(
+        self,
+        content: str,
+        *,
+        memory_type: str = "directive",
+        source_integrity: str = "clean",
+    ):
+        from memassist.memory_judge import MemoryJudgeResult, _candidate_from_output
+
+        fixture = judge_fixture(
+            content,
+            memory_type=memory_type,
+            source_integrity=source_integrity,
+            reason="conflict resolver fixture",
+        )
+        return MemoryJudgeResult(_candidate_from_output(fixture), "fixture", [], {})
+
     def test_exact_duplicate_via_judge_reinforces_existing_memory(self) -> None:
         """Second judge call with same content reinforces instead of creating new row."""
         from memassist.memory_judge import store_judge_result, MemoryJudgeResult, _candidate_from_output
@@ -3939,13 +3973,25 @@ class JudgeDuplicateReinforceTest(unittest.TestCase):
                         "source_kind": "hook_payload",
                     },
                 )
-                returned_id = store_judge_result(
-                    store,
-                    project=project,
-                    session_id="sess_semantic_test",
-                    source_event_id=source_event_id,
-                    result=result,
-                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": active_id,
+                                "relation": "duplicate",
+                                "reason": "same durable instruction with different Korean wording",
+                            }
+                        )
+                    },
+                ):
+                    returned_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_semantic_test",
+                        source_event_id=source_event_id,
+                        result=result,
+                    )
 
                 # No new memory created for weak_content
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
@@ -3964,7 +4010,7 @@ class JudgeDuplicateReinforceTest(unittest.TestCase):
                         "SELECT decision FROM lifecycle_events WHERE memory_id = ?", (active_id,)
                     ).fetchall())
                     decisions = [row[0] for row in lifecycle_events]
-                    self.assertIn("suppress_semantic_duplicate", decisions)
+                    self.assertIn("reinforce_duplicate", decisions)
 
     def test_semantic_duplicate_via_judge_suppresses_across_type_labels(self) -> None:
         """P1: semantic duplicate suppression does not gate on compatible type labels."""
@@ -4001,13 +4047,25 @@ class JudgeDuplicateReinforceTest(unittest.TestCase):
                     tool_name="memassist",
                     input_json={"content": weak_content, "source_ref": "hook_payload"},
                 )
-                returned_id = store_judge_result(
-                    store,
-                    project=project,
-                    session_id="sess_cross_type_semantic",
-                    source_event_id=source_event_id,
-                    result=MemoryJudgeResult(_candidate_from_output(fixture), "fixture", [], {}),
-                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": active_id,
+                                "relation": "duplicate",
+                                "reason": "same deploy checklist meaning across type labels",
+                            }
+                        )
+                    },
+                ):
+                    returned_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_cross_type_semantic",
+                        source_event_id=source_event_id,
+                        result=MemoryJudgeResult(_candidate_from_output(fixture), "fixture", [], {}),
+                    )
 
                 self.assertEqual(returned_id, active_id)
                 self.assertFalse(
@@ -4018,6 +4076,588 @@ class JudgeDuplicateReinforceTest(unittest.TestCase):
                 )
                 active_after = store.get_memory(active_id)
                 self.assertGreater(active_after.recurrence, active_before.recurrence)  # type: ignore[union-attr]
+
+    def test_conflict_resolver_excludes_other_projects(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            content = "리프레시 토큰 변경 전 사용자에게 확인받는다"
+            with Store() as store:
+                store.upsert_project(project)
+                other_id = store.add_memory(
+                    scope_type="project",
+                    project_id="other-project",
+                    type="directive",
+                    content=content,
+                    status="active",
+                    importance=0.9,
+                    confidence=0.9,
+                )
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_project_scope",
+                    content=content,
+                )
+
+                memory_id = store_judge_result(
+                    store,
+                    project=project,
+                    session_id="sess_project_scope",
+                    source_event_id=source_event_id,
+                    result=self._judge_result(content),
+                )
+
+                self.assertNotEqual(memory_id, other_id)
+                self.assertEqual(store.get_memory(other_id).recurrence, 1)  # type: ignore[union-attr]
+                stored = store.get_memory(memory_id)
+                self.assertEqual(stored.project_id, project.id)  # type: ignore[union-attr]
+                self.assertEqual(stored.status, "active")  # type: ignore[union-attr]
+
+    def test_conflict_candidate_discovery_does_not_mark_existing_memory_used(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                existing_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="directive",
+                    content="package manager는 pnpm을 사용한다",
+                    tags=["package"],
+                    status="active",
+                    importance=0.9,
+                    confidence=0.9,
+                    retrieval_count=7,
+                    utility=0.3,
+                    strength=0.6,
+                )
+                before = store.get_memory(existing_id)
+                content = "package manager 설정은 npm을 사용한다"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_read_only_conflict",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": existing_id,
+                                "relation": "unrelated",
+                                "reason": "fixture says no policy relation",
+                            }
+                        )
+                    },
+                ):
+                    store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_read_only_conflict",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content),
+                    )
+                after = store.get_memory(existing_id)
+                self.assertEqual(after.retrieval_count, before.retrieval_count)  # type: ignore[union-attr]
+                self.assertEqual(after.utility, before.utility)  # type: ignore[union-attr]
+                self.assertEqual(after.last_used_at, before.last_used_at)  # type: ignore[union-attr]
+                self.assertEqual(after.strength, before.strength)  # type: ignore[union-attr]
+
+    def test_relation_judge_conflict_holds_clean_candidate(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                existing_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="package manager는 pnpm을 사용한다",
+                    status="active",
+                )
+                content = "package manager는 npm을 사용한다"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_conflict_hold",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": existing_id,
+                                "relation": "conflicts",
+                                "reason": "package manager choice conflicts",
+                            }
+                        )
+                    },
+                ):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_conflict_hold",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="decision"),
+                    )
+                memory = store.get_memory(memory_id)
+                self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
+                links = store.memory_links(memory_id)
+                self.assertTrue(any(link["target_id"] == existing_id and link["relation"] == "conflicts" for link in links))
+                decisions = [row["decision"] for row in store.lifecycle_events("sess_conflict_hold")]
+                self.assertIn("held_candidate_conflict", decisions)
+
+    def test_clean_candidate_supersedes_existing_project_memory(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                existing_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="테스트는 unittest discover만 실행한다",
+                    status="active",
+                )
+                content = "테스트는 unittest discover와 eval basic을 모두 실행한다"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_supersede_clean",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": existing_id,
+                                "relation": "candidate_supersedes",
+                                "reason": "new verification workflow is more complete",
+                            }
+                        )
+                    },
+                ):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_supersede_clean",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="workflow"),
+                    )
+                new_memory = store.get_memory(memory_id)
+                old_memory = store.get_memory(existing_id)
+                self.assertEqual(new_memory.status, "active")  # type: ignore[union-attr]
+                self.assertEqual(old_memory.status, "archived")  # type: ignore[union-attr]
+                self.assertEqual(old_memory.superseded_by, memory_id)  # type: ignore[union-attr]
+
+    def test_uncertain_candidate_does_not_supersede_existing_project_memory(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                existing_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="테스트는 unittest discover만 실행한다",
+                    status="active",
+                )
+                content = "테스트는 unittest discover와 eval basic을 모두 실행하는 것 같다"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_supersede_uncertain",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": existing_id,
+                                "relation": "candidate_supersedes",
+                                "reason": "possible replacement but source is uncertain",
+                            }
+                        )
+                    },
+                ):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_supersede_uncertain",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="workflow", source_integrity="uncertain"),
+                    )
+                candidate = store.get_memory(memory_id)
+                existing = store.get_memory(existing_id)
+                self.assertEqual(candidate.status, "candidate")  # type: ignore[union-attr]
+                self.assertEqual(existing.status, "active")  # type: ignore[union-attr]
+                self.assertIsNone(existing.superseded_by)  # type: ignore[union-attr]
+
+    def test_relation_judge_unavailable_holds_candidate_when_conflict_candidates_exist(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="package manager는 pnpm을 사용한다",
+                    status="active",
+                )
+                content = "package manager는 npm을 사용한다"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_relation_unavailable",
+                    content=content,
+                )
+                with patch.dict(os.environ, {"MEMASSIST_MEMORY_RELATION_JUDGE_MODE": "off"}):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_relation_unavailable",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="decision"),
+                    )
+                memory = store.get_memory(memory_id)
+                self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
+                decisions = [row["decision"] for row in store.lifecycle_events("sess_relation_unavailable")]
+                self.assertIn("held_relation_judge_unavailable", decisions)
+
+    def test_zero_overlap_korean_paraphrase_reaches_relation_judge(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                existing_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="preference",
+                    content="사용자는 짧은 한국어 답변을 선호한다",
+                    status="active",
+                )
+                content = "간결하게 한글로 답해줘"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_zero_overlap_ko",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": existing_id,
+                                "relation": "duplicate",
+                                "reason": "same durable preference despite no shared tokens",
+                            }
+                        )
+                    },
+                ):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_zero_overlap_ko",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="preference"),
+                    )
+                self.assertEqual(memory_id, existing_id)
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                self.assertFalse(any(memory.content == content for memory in memories))
+
+    def test_zero_overlap_mixed_language_conflict_reaches_relation_judge(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                existing_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Use pnpm for JS commands",
+                    status="active",
+                )
+                content = "노드 작업은 npm으로 실행해"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_zero_overlap_conflict",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": existing_id,
+                                "relation": "conflicts",
+                                "reason": "package command tool conflicts across languages",
+                            }
+                        )
+                    },
+                ):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_zero_overlap_conflict",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="decision"),
+                    )
+                memory = store.get_memory(memory_id)
+                self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
+                decisions = [row["decision"] for row in store.lifecycle_events("sess_zero_overlap_conflict")]
+                self.assertIn("held_candidate_conflict", decisions)
+
+    def test_existing_supersedes_candidate_holds_candidate_and_reinforces_existing(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                existing_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="검증은 full unittest와 eval basic을 실행한다",
+                    status="active",
+                    confidence=0.8,
+                    importance=0.8,
+                )
+                before = store.get_memory(existing_id)
+                content = "검증은 unittest만 실행한다"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_existing_supersedes",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": existing_id,
+                                "relation": "existing_supersedes",
+                                "reason": "existing workflow is more complete",
+                            }
+                        )
+                    },
+                ):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_existing_supersedes",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="workflow"),
+                    )
+                candidate = store.get_memory(memory_id)
+                existing = store.get_memory(existing_id)
+                self.assertEqual(candidate.status, "candidate")  # type: ignore[union-attr]
+                self.assertEqual(existing.status, "active")  # type: ignore[union-attr]
+                self.assertGreater(existing.recurrence, before.recurrence)  # type: ignore[union-attr]
+                decisions = [row["decision"] for row in store.lifecycle_events("sess_existing_supersedes")]
+                self.assertIn("held_existing_supersedes_candidate", decisions)
+
+    def test_complementary_relation_stores_memory_and_link(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                existing_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="검증은 unittest discover를 실행한다",
+                    status="active",
+                )
+                content = "검증 후 openspec validate도 실행한다"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_complementary",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": existing_id,
+                                "relation": "complementary",
+                                "reason": "adds another verification step",
+                            }
+                        )
+                    },
+                ):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_complementary",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="workflow"),
+                    )
+                memory = store.get_memory(memory_id)
+                self.assertEqual(memory.status, "active")  # type: ignore[union-attr]
+                links = store.memory_links(memory_id)
+                self.assertTrue(
+                    any(link["target_id"] == existing_id and link["relation"] == "complementary" for link in links)
+                )
+
+    def test_conflict_relation_priority_beats_complementary(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                conflict_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="package manager는 pnpm을 사용한다",
+                    status="active",
+                )
+                complementary_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="package manager 변경 후 lockfile을 확인한다",
+                    status="active",
+                )
+                content = "package manager는 npm을 사용하고 lockfile도 확인한다"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_priority_conflict",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": complementary_id,
+                                "relation": "complementary",
+                                "reason": "lockfile step is additive",
+                            },
+                            {
+                                "existing_memory_id": conflict_id,
+                                "relation": "conflicts",
+                                "reason": "package manager conflicts",
+                            },
+                        )
+                    },
+                ):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_priority_conflict",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="decision"),
+                    )
+                memory = store.get_memory(memory_id)
+                self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
+                links = store.memory_links(memory_id)
+                self.assertTrue(any(link["target_id"] == conflict_id and link["relation"] == "conflicts" for link in links))
+                decisions = [row["decision"] for row in store.lifecycle_events("sess_priority_conflict")]
+                self.assertIn("held_candidate_conflict", decisions)
+
+    def test_candidate_supersedes_priority_beats_duplicate(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                duplicate_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="검증은 unittest discover를 실행한다",
+                    status="active",
+                )
+                old_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="검증은 unittest만 실행한다",
+                    status="active",
+                )
+                content = "검증은 unittest discover와 openspec validate를 실행한다"
+                source_event_id = self._source_event(
+                    store,
+                    project_id=project.id,
+                    session_id="sess_priority_supersede",
+                    content=content,
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MEMASSIST_MEMORY_RELATION_JUDGE_FIXTURE_RESPONSE": relation_fixture(
+                            {
+                                "existing_memory_id": duplicate_id,
+                                "relation": "duplicate",
+                                "reason": "overlaps existing verification memory",
+                            },
+                            {
+                                "existing_memory_id": old_id,
+                                "relation": "candidate_supersedes",
+                                "reason": "candidate updates older verification rule",
+                            },
+                        )
+                    },
+                ):
+                    memory_id = store_judge_result(
+                        store,
+                        project=project,
+                        session_id="sess_priority_supersede",
+                        source_event_id=source_event_id,
+                        result=self._judge_result(content, memory_type="workflow"),
+                    )
+                new_memory = store.get_memory(memory_id)
+                old_memory = store.get_memory(old_id)
+                duplicate_memory = store.get_memory(duplicate_id)
+                self.assertEqual(new_memory.status, "active")  # type: ignore[union-attr]
+                self.assertEqual(old_memory.status, "archived")  # type: ignore[union-attr]
+                self.assertEqual(old_memory.superseded_by, memory_id)  # type: ignore[union-attr]
+                self.assertEqual(duplicate_memory.status, "active")  # type: ignore[union-attr]
 
 if __name__ == "__main__":
     unittest.main()

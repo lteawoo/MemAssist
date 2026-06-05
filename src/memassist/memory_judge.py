@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .dedupe import find_semantic_duplicate, should_suppress_candidate
+from .conflict_resolver import MemoryDraft, resolve_memory_conflicts
 from .integrations import status_tools
 from .models import MEMORY_TYPES
 from .project import Project
@@ -519,7 +519,6 @@ def store_judge_result(
     if candidate.source_integrity == "contaminated":
         return None
     memory_type = candidate.memory.type if candidate.memory.type in MEMORY_TYPES else "preference"
-    status = _activation_status(candidate)
     content = (candidate.memory.content.strip() or candidate.memory.source_quote.strip())[:500]
     if not content:
         return None
@@ -528,110 +527,27 @@ def store_judge_result(
     source_ref = str(source_input.get("source_ref") or source_event_id)
     source_id = source_input.get("source_id")
     source_ids = [str(source_id)] if isinstance(source_id, str) and source_id else []
-    existing = store.find_memory(
-        project_id=project.id,
+    draft = MemoryDraft(
         content=content,
         type=memory_type,
-        statuses=("candidate", "active", "archived"),
-    )
-    if existing:
-        reinforced = store.reinforce_memory(existing.id)
-        store.add_lifecycle_event(
-            session_id=session_id,
-            project_id=project.id,
-            memory_id=existing.id,
-            candidate={
-                "judge": candidate.as_dict(),
-                "source_event_id": source_event_id,
-                "source_id": source_id,
-                "source_ref": source_ref,
-                "source_quote": candidate.memory.source_quote,
-            },
-            decision="reinforce_duplicate",
-            risk="low",
-            reason=(
-                "Equivalent memory already exists for this project; strength and recurrence were reinforced."
-                if reinforced
-                else "Equivalent memory already exists for this project."
-            ),
-        )
-        return existing.id
-
-    # Semantic duplicate: overlapping weaker candidate suppressed → weak reinforce and skip.
-    all_memories = store.list_memories(project_id=project.id, include_global=True)
-    semantic_duplicate = find_semantic_duplicate(
-        content,
-        candidate_type=memory_type,
-        candidate_tags=_judge_tags(candidate),
-        candidate_status=status,
-        existing_memories=all_memories,
-    )
-    if semantic_duplicate and should_suppress_candidate(status, semantic_duplicate.memory):
-        reinforced = store.reinforce_memory(
-            semantic_duplicate.memory.id,
-            confidence_delta=0.02,
-            importance_delta=0.01,
-        )
-        store.add_lifecycle_event(
-            session_id=session_id,
-            project_id=project.id,
-            memory_id=semantic_duplicate.memory.id,
-            candidate={
-                "judge": candidate.as_dict(),
-                "source_event_id": source_event_id,
-                "source_id": source_id,
-                "source_ref": source_ref,
-                "source_quote": candidate.memory.source_quote,
-            },
-            decision="suppress_semantic_duplicate",
-            risk="low",
-            reason=(
-                f"Weaker candidate duplicates stronger memory {semantic_duplicate.memory.id}; "
-                f"{semantic_duplicate.reason} (score={semantic_duplicate.score})."
-                if reinforced
-                else f"Weaker candidate duplicates stronger memory {semantic_duplicate.memory.id}."
-            ),
-        )
-        return semantic_duplicate.memory.id
-
-    memory_id = store.add_memory(
-        scope_type="project",
-        project_id=project.id,
-        session_id=session_id,
-        type=memory_type,
-        content=content,
-        reason=(
-            f"Isolated memory judge: {candidate.reason} "
-            f"Normalized memory: {candidate.memory.content}."
-        ),
-        tags=_judge_tags(candidate),
-        paths=[],
-        status=status,
-        importance=0.85 if status == "active" else 0.65,
-        confidence=0.85 if candidate.source_integrity == "clean" else 0.7,
-        source_kind="isolated_memory_judge",
-        source_ref=source_ref,
+        source_integrity=candidate.source_integrity,
         source_quote=candidate.memory.source_quote,
+        reason=candidate.reason,
+        tags=_judge_tags(candidate),
+        source_ref=source_ref,
         source_ids=source_ids,
+        judge=candidate.as_dict(),
+        source_event_id=source_event_id,
+        source_id=source_id,
+        payload=result.payload,
     )
-    memory = store.get_memory(memory_id)
-    store.add_lifecycle_event(
+    resolution = resolve_memory_conflicts(
+        store,
+        project=project,
         session_id=session_id,
-        project_id=project.id,
-        memory_id=memory_id,
-        candidate={
-            "judge": candidate.as_dict(),
-            "source_event_id": source_event_id,
-            "source_id": source_id,
-            "source_ref": source_ref,
-            "source_quote": candidate.memory.source_quote,
-            "payload": result.payload,
-        },
-        decision="isolated_judge_memory_stored",
-        risk="medium" if candidate.source_integrity == "uncertain" else "low",
-        reason=memory.reason if memory else candidate.reason,
+        draft=draft,
     )
-    return memory_id
+    return resolution.memory_id
 
 
 def _record_judge_result(
@@ -968,13 +884,6 @@ def _recent_files(store: Store, *, session_id: str) -> list[str]:
             if isinstance(file, str) and file not in files:
                 files.append(file)
     return files
-
-
-def _activation_status(candidate: MemoryJudgeCandidate) -> str:
-    if candidate.source_integrity == "clean":
-        return "active"
-    return "candidate"
-
 
 def _judge_tags(candidate: MemoryJudgeCandidate) -> list[str]:
     return ["isolated_judge"]
