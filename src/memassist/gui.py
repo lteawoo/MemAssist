@@ -36,10 +36,6 @@ READ_ONLY_API_ROUTES = (
     "/api/verification-config",
     "/api/tools",
 )
-SENSITIVE_KEY_RE = re.compile(
-    r"(token|secret|password|passwd|credential|authorization|api[_-]?key|refresh[_-]?token)",
-    re.IGNORECASE,
-)
 SECRET_VALUE_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|AKIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,})"
 )
@@ -925,22 +921,11 @@ def _json_list(value: Any) -> list[Any]:
 
 def _redact_value(value: Any) -> Any:
     if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            if SENSITIVE_KEY_RE.search(str(key)):
-                redacted[str(key)] = "[redacted]"
-            else:
-                redacted[str(key)] = _redact_value(item)
-        return redacted
+        return {str(key): _redact_value(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_redact_value(item) for item in value]
     if isinstance(value, str):
-        value = SECRET_VALUE_RE.sub("[redacted]", value)
-        return re.sub(
-            r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|AUTHORIZATION)[A-Z0-9_]*)\s*=\s*([^\s]+)",
-            lambda match: f"{match.group(1)}=[redacted]",
-            value,
-        )
+        return SECRET_VALUE_RE.sub("[redacted]", value)
     return value
 
 

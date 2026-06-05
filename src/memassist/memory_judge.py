@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .directives import _instruction_tags, _normalize_project_files
+from .directives import _normalize_project_files
 from .integrations import status_tools
 from .models import CAUTION_LEVELS, MEMORY_TYPES
 from .project import Project
@@ -575,17 +575,6 @@ def store_judge_result(
     return memory_id
 
 
-def likely_distorted_or_echo_memory(content: str) -> bool:
-    lowered = content.lower()
-    assistant_echo = any(term in lowered for term in {"하겠습니다", "i will", "i'll", "앞으로"}) and any(
-        term in lowered for term in {"승인 요청", "기억", "remember", "확인하고 진행"}
-    )
-    refresh_drift = "리프레시" in lowered and "토큰" not in lowered and any(
-        term in lowered for term in {"브라우저", "페이지", "서버"}
-    )
-    return assistant_echo or refresh_drift
-
-
 def _record_judge_result(
     store: Store,
     *,
@@ -946,17 +935,15 @@ def _memory_conflicts(store: Store, *, project_id: str, content: str) -> list[di
 def _activation_status(candidate: MemoryJudgeCandidate) -> str:
     if candidate.activation == "rejected":
         return "archived"
-    if _low_risk_auto_active(candidate):
+    if _auto_active(candidate):
         return "active"
     return "candidate"
 
 
-def _low_risk_auto_active(candidate: MemoryJudgeCandidate) -> bool:
+def _auto_active(candidate: MemoryJudgeCandidate) -> bool:
     if candidate.contamination_risk != "low":
         return False
-    if candidate.caution_level != "none":
-        return False
-    if candidate.memory_type not in {"preference", "decision", "fact", "workflow"}:
+    if candidate.memory_type not in {"preference", "decision", "fact", "workflow", "directive"}:
         return False
     return candidate.activation == "active"
 
@@ -965,8 +952,6 @@ def _judge_tags(candidate: MemoryJudgeCandidate) -> list[str]:
     tags = ["isolated_judge", candidate.memory_type]
     if candidate.caution_level != "none":
         tags.append(candidate.caution_level)
-    tags.extend(_instruction_tags(candidate.source_quote))
-    tags.extend(_instruction_tags(candidate.memory_content))
     return list(dict.fromkeys(tags))
 
 

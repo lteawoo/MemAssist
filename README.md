@@ -17,8 +17,8 @@
 재생성 가능한 SQLite 검색 인덱스/텔레메트리/embedding 캐시가 함께 저장됩니다. `~/.memassist`는 아직 초기화하지 않은 경로나 명시적인 전역 사용을 위한
 fallback/global home입니다.
 
-> 현재 상태: 초기 로컬 도구입니다. CLI와 저장 구조는 사용할 수 있지만, 위험도가 높은
-> 프로젝트에서는 생성된 메모리와 정책 변경을 직접 확인한 뒤 신뢰하는 것이 좋습니다.
+> 현재 상태: 초기 로컬 도구입니다. CLI와 저장 구조는 사용할 수 있지만, 생성된 메모리는
+> 사람이 읽을 수 있는 Markdown artifact에서 직접 확인한 뒤 신뢰하는 것이 좋습니다.
 
 ## 설치 방법
 
@@ -103,7 +103,7 @@ hook 실행 중에도 같은 프로젝트 DB와 정책 파일을 사용합니다
 - 완료된 세션에서 메모리 후보를 추출합니다.
 - 낮은 위험의 workflow, preference, 검증 습관은 자동 활성화합니다.
 - 반복적으로 확인된 좋은 기억은 장기 메모리로 승격합니다.
-- 보안, 인증, 삭제, 보호 경로처럼 위험한 내용은 더 보수적으로 다룹니다.
+- 보안, 인증, 삭제, 보호 경로처럼 주의가 필요한 내용도 메모리로 저장할 수 있지만, 도구 차단 정책으로 컴파일하지 않습니다.
 - 사용자가 일반 대화 속에서 직접 남긴 지시는 turn end에서 확인한 source evidence를 바탕으로, 분리된 memory judge가 기억할 가치와 의미 보존 여부를 판단합니다.
 - `init` 때 연결한 도구가 지원하면 별도 judge 실행으로 다국어, 오탈자, 완곡 표현도 구조화된 memory 후보로 만들 수 있습니다.
 - 다음 요청에는 관련 기억을 `Relevant memassist memory`와 검증 reminder로 주입합니다.
@@ -274,16 +274,10 @@ vector 검색을 하나로 합친 mandatory hybrid retrieval입니다. vector pr
 없으면 prompt 처리는 실패하지 않지만, `vector_status` diagnostics에 `missing_dependency`,
 `missing_cache`, `disabled` 같은 degradation 이유를 명시합니다.
 
-새 요청이 들어오면 먼저 요청의 의도를 분석합니다.
-
-- 작업 유형: `bugfix`, `feature`, `refactor`, `test`, `review`, `docs`
-- 도메인: `auth`, `security`, `database`, `frontend`, `backend`, `cli`, `tests`
-- 위험도: `low`, `medium`, `high`
-- 관련 경로: 요청에 등장한 파일 경로 또는 도메인 기반 경로 힌트
-- 필요한 섹션: 일반 context, 정책 reminder, 검증 reminder
-
-그 다음 여러 검색 채널을 동시에 사용합니다. 규칙이나 주의사항처럼 보이는 memory도
-별도 정책 섹션으로 승격하지 않고 일반 context 후보로 다룹니다.
+새 요청이 들어오면 먼저 요청 텍스트와 명시 파일 경로에서 retrieval query를 만듭니다.
+도메인, 위험도, 금지/허용 의미를 로컬 키워드 목록으로 분류하지 않습니다. 그 다음 여러
+검색 채널을 동시에 사용합니다. 규칙이나 주의사항처럼 보이는 memory도 별도 정책 섹션으로
+승격하지 않고 일반 context 후보로 다룹니다.
 
 ```mermaid
 flowchart TD
@@ -382,7 +376,7 @@ memassist memory pack "login session bug" --json
 | 유용성 | 다음 작업에서 다시 쓸 가능성이 있는가 | 높으면 memory 후보가 됩니다. |
 | 반복성 | 여러 세션에서 반복되는가 | 높으면 기존 memory의 confidence/importance를 강화합니다. |
 | 명시성 | 사용자가 직접 지시했는가 | judge 후보 생성 가능성이 커집니다. |
-| 위험도 | 보안, 인증, 삭제, 배포, 정책 변경과 관련되는가 | 높으면 자동 활성화를 제한합니다. |
+| 표시 메타데이터 | judge 또는 사용자가 구조화해서 제공했는가 | retrieval/display에만 반영하며, 도구 집행 정책으로 컴파일하지 않습니다. |
 | 증거성 | trace, 파일 변경, 명령 실행, 응답 근거가 있는가 | confidence 판단에 사용합니다. |
 | 최신성 | 오래되었거나 더 이상 맞지 않는가 | `archived` 전환 판단에 사용합니다. |
 | 범위 | 전역 기억인지, 프로젝트 기억인지, 세션 한정 정보인지 | memory scope를 결정합니다. |
@@ -393,9 +387,9 @@ memassist memory pack "login session bug" --json
 flowchart TD
     A[메모리 후보] --> B{다음 작업에 유용한가?}
     B -->|아니오| C[archived]
-    B -->|예| D{위험도가 높은가?}
-    D -->|아니오| E[active]
-    D -->|예| H{사용자의 명시 지시인가?}
+    B -->|예| D{source evidence가 충분한가?}
+    D -->|예| E[active]
+    D -->|아니오| H{후보로 보존할 가치가 있는가?}
     H -->|예| I[candidate]
     H -->|아니오| M[archived]
 ```

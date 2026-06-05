@@ -20,11 +20,10 @@ from .embeddings import build_memory_embeddings
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .integrations import install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
-from .memory_judge import INTERPRETER_ACTIVE_ENV
 from .lesson import lesson_from_session
 from .lifecycle import cleanup_memories, process_session_lifecycle
 from .memory_judge import (
-    likely_distorted_or_echo_memory,
+    INTERPRETER_ACTIVE_ENV,
     observe_turn_end_memory_source,
     process_pending_memory_intents,
 )
@@ -478,25 +477,15 @@ def cmd_memory_deactivate(args: argparse.Namespace) -> int:
 
 
 def cmd_memory_cleanup(args: argparse.Namespace) -> int:
-    project = detect_project()
     with _store() as store:
         result = cleanup_memories(store)
-        suspect = [
-            memory
-            for memory in store.list_memories(project_id=project.id, include_global=True, status=None)
-            if likely_distorted_or_echo_memory(memory.content)
-        ]
     if args.json:
-        payload = result.as_dict()
-        payload["suspect_echo_or_drift"] = [memory.as_dict() for memory in suspect]
-        _print_json(payload)
+        _print_json(result.as_dict())
     else:
         for memory_id in result.archived:
             print(f"archived {memory_id}")
         for memory_id in result.duplicates:
             print(f"duplicate archived {memory_id}")
-        for memory in suspect:
-            print(f"suspect echo/drift memory: {memory.id} {memory.content}")
     return 0
 
 

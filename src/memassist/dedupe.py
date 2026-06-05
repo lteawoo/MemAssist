@@ -8,27 +8,6 @@ from .models import Memory
 
 ACTIVE_STRONG_STATUSES = {"active"}
 INACTIVE_STATUSES = {"candidate"}
-PROTECTIVE_TERMS = {
-    "확인",
-    "허락",
-    "block",
-    "forbid",
-    "protect",
-    "금지",
-    "막아",
-}
-
-SYNONYMS = {
-    "리프레시": "refresh",
-    "토큰": "token",
-    "리프레시토큰": "refresh token",
-    "정책": "policy",
-    "변경": "change",
-    "수정": "change",
-    "확인": "confirm",
-    "인증": "auth",
-    "세션": "session",
-}
 
 
 @dataclass(frozen=True)
@@ -51,7 +30,6 @@ def find_semantic_duplicate(
     candidate_tokens = _tokens(" ".join([candidate_content, " ".join(candidate_tags)]))
     if not candidate_tokens:
         return None
-    candidate_protective = _is_protective(candidate_content, candidate_caution_level)
     best: DuplicateMatch | None = None
     for memory in existing_memories:
         if memory.status == "archived":
@@ -63,14 +41,13 @@ def find_semantic_duplicate(
             continue
         overlap = len(candidate_tokens & memory_tokens) / max(len(candidate_tokens), 1)
         tag_overlap = len(set(candidate_tags) & set(memory.tags)) / max(len(set(candidate_tags)), 1)
-        protective_bonus = 0.18 if candidate_protective and _is_protective(memory.content, memory.caution_level) else 0.0
         strength_bonus = 0.12 if _is_stronger(memory.status, candidate_status) else 0.0
-        score = min(1.0, overlap * 0.70 + tag_overlap * 0.18 + protective_bonus + strength_bonus)
+        score = min(1.0, overlap * 0.76 + tag_overlap * 0.18 + strength_bonus)
         if score >= threshold and (best is None or score > best.score):
             best = DuplicateMatch(
                 memory=memory,
                 score=round(score, 4),
-                reason="semantic duplicate by overlapping intent, tags, and protection terms",
+                reason="semantic duplicate by overlapping text, tags, and memory strength",
             )
     return best
 
@@ -96,20 +73,7 @@ def _is_stronger(memory_status: str, candidate_status: str) -> bool:
     return rank.get(memory_status, 0) > rank.get(candidate_status, 0)
 
 
-def _is_protective(content: str, caution_level: str) -> bool:
-    if caution_level in {"warn", "block"}:
-        return True
-    text = content.lower()
-    return any(term in text for term in PROTECTIVE_TERMS)
-
-
 def _tokens(text: str) -> set[str]:
     normalized = text.lower()
-    for source, replacement in SYNONYMS.items():
-        normalized = normalized.replace(source, f" {replacement} ")
     raw = re.findall(r"[A-Za-z0-9_가-힣]+", normalized)
-    return {
-        token
-        for token in raw
-        if len(token) > 1 and token not in {"앞으로", "먼저", "관련", "없이", "하고", "진행", "하겠습니다"}
-    }
+    return {token for token in raw if len(token) > 1}

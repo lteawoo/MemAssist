@@ -107,7 +107,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                     if memory.source_kind == "isolated_memory_judge"
                 ]
             self.assertEqual(len(judged), 1)
-            self.assertEqual(judged[0]["status"], "candidate")
+            self.assertEqual(judged[0]["status"], "active")
             self.assertEqual(judged[0]["content"], "Do not change refresh token policy without asking first.")
 
             pretool_payload = {
@@ -122,9 +122,6 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
             with patch("sys.stdin", StringIO(json.dumps(pretool_payload))), patch("sys.stdout", pretool_out):
                 self.assertEqual(main(["hook", "pre-tool-use"]), 0)
             self.assertEqual(pretool_out.getvalue(), "")
-
-            with patch("sys.stdout", StringIO()):
-                self.assertEqual(main(["memory", "activate", judged[0]["id"]]), 0)
 
             pretool_payload = {
                 "session_id": "sess_e2e",

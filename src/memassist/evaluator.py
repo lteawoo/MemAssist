@@ -4,7 +4,7 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from .classifier import CandidateDecision, HIGH_RISK_TERMS, PROTECTION_TERMS, classify_candidate
+from .classifier import CandidateDecision, classify_candidate
 from .extraction import MemoryCandidate
 from .models import Memory
 
@@ -29,10 +29,7 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
     elif decision == "keep_candidate" and total < 0.50:
         status = "archived"
         decision = "archive_low_quality"
-        reason = "Risky candidate did not meet minimum evidence quality for inactive storage."
-    elif decision == "keep_candidate" and candidate.type in {"rule", "lesson"} and total >= 0.72:
-        caution_level = "warn"
-        reason = "Risky inferred memory is retained as a reminder with warning semantics, not a gate."
+        reason = "Candidate did not meet minimum evidence quality for inactive storage."
 
     return replace(
         base,
@@ -46,20 +43,17 @@ def evaluate_candidate(candidate: MemoryCandidate, *, existing_memories: list[Me
 
 
 def _score_candidate(candidate: MemoryCandidate, *, existing_memories: list[Memory]) -> dict[str, float]:
-    text = candidate.content.lower()
     evidence = _clamp(candidate.confidence)
     specificity = _specificity_score(candidate.content)
     repeat = _repeat_score(candidate, existing_memories)
-    risk = 1.0 - _risk_penalty(text)
-    conflict = _conflict_score(candidate, existing_memories)
     verification = 1.0 if candidate.type == "workflow" and "test" in candidate.tags else 0.6
     freshness = 1.0
     return {
         "evidence_score": evidence,
         "repeat_score": repeat,
         "specificity_score": specificity,
-        "risk_score": risk,
-        "conflict_score": conflict,
+        "risk_score": 1.0,
+        "conflict_score": 1.0,
         "verification_score": verification,
         "freshness_score": freshness,
     }
@@ -101,40 +95,8 @@ def _repeat_score(candidate: MemoryCandidate, existing_memories: list[Memory]) -
     return _clamp(best)
 
 
-def _conflict_score(candidate: MemoryCandidate, existing_memories: list[Memory]) -> float:
-    candidate_text = candidate.content.lower()
-    protective = _contains_any(candidate_text, PROTECTION_TERMS)
-    permissive = _contains_any(candidate_text, ["allow", "allowed", "can edit", "수정해도", "허용"])
-    candidate_tokens = _tokens(candidate.content)
-    for memory in existing_memories:
-        if memory.status == "archived":
-            continue
-        overlap = len(candidate_tokens & _tokens(memory.content)) / max(len(candidate_tokens), 1)
-        if overlap < 0.4:
-            continue
-        memory_text = memory.content.lower()
-        memory_protective = _contains_any(memory_text, PROTECTION_TERMS)
-        memory_permissive = _contains_any(memory_text, ["allow", "allowed", "can edit", "수정해도", "허용"])
-        if (protective and memory_permissive) or (permissive and memory_protective):
-            return 0.0
-    return 1.0
-
-
-def _risk_penalty(text: str) -> float:
-    risk = 0.0
-    if _contains_any(text, HIGH_RISK_TERMS):
-        risk += 0.35
-    if _contains_any(text, PROTECTION_TERMS):
-        risk += 0.20
-    return _clamp(risk)
-
-
 def _tokens(text: str) -> set[str]:
     return set(re.findall(r"[A-Za-z0-9_가-힣]+", text.lower()))
-
-
-def _contains_any(text: str, terms: list[str]) -> bool:
-    return any(term in text for term in terms)
 
 
 def _clamp(value: float) -> float:

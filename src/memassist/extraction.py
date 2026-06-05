@@ -98,37 +98,3 @@ def _tags_from_files(files: list[str]) -> list[str]:
             if part and len(part) > 2:
                 tags.add(part.lower())
     return sorted(tags)[:8]
-
-
-def _explicit_memory(message: str) -> MemoryCandidate | None:
-    lowered = message.lower()
-    triggers = ["remember", "기억", "앞으로", "always", "항상"]
-    if not any(trigger in lowered for trigger in triggers):
-        return None
-    explicit_line = _explicit_line(message, triggers)
-    if not explicit_line:
-        return None
-    return MemoryCandidate(
-        type="preference",
-        content=explicit_line[:300],
-        tags=["explicit", "preference"],
-        importance=0.8,
-        confidence=0.8,
-        reason="Assistant final message contained explicit memory-like wording.",
-    )
-
-
-def _explicit_line(message: str, triggers: list[str]) -> str:
-    chunks: list[str] = []
-    for line in message.splitlines():
-        cleaned = line.strip().strip("-* ")
-        if not cleaned:
-            continue
-        chunks.extend(part.strip() for part in re.split(r"(?<=[.!?。])\s+", cleaned) if part.strip())
-    if not chunks:
-        return ""
-    for chunk in chunks:
-        lowered = chunk.lower()
-        if any(trigger in lowered for trigger in triggers):
-            return chunk
-    return chunks[0]

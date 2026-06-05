@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,43 +32,9 @@ class CandidateDecision:
         }
 
 
-HIGH_RISK_TERMS = [
-    "auth",
-    "authentication",
-    "authorization",
-    "token",
-    "secret",
-    "password",
-    "billing",
-    "payment",
-    "permission",
-    "권한",
-    "인증",
-    "토큰",
-    "결제",
-    "시크릿",
-]
-
-PROTECTION_TERMS = [
-    "do not",
-    "don't",
-    "never",
-    "must not",
-    "without asking",
-    "묻지 않고",
-    "건드리지",
-    "수정하지",
-    "바꾸지",
-    "금지",
-    "막아",
-]
-
-
 def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
-    text = candidate.content.lower()
     memory_kind = _memory_kind(candidate)
-    high_risk = _contains_any(text, HIGH_RISK_TERMS)
-    protective = _contains_any(text, PROTECTION_TERMS)
+    explicit = _has_explicit_source(candidate)
     duplicate_or_weak = candidate.confidence < 0.45 or candidate.importance < 0.35
 
     if duplicate_or_weak:
@@ -105,17 +70,31 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
             reason="Touched-file facts are session evidence, not active project memory.",
         )
 
-    if candidate.type in {"rule", "lesson"} or protective or high_risk:
+    if candidate.type in {"preference", "decision", "directive"} and explicit:
+        return CandidateDecision(
+            candidate=candidate,
+            decision="activate",
+            status="active",
+            risk="low",
+            memory_kind=memory_kind,
+            caution_level="none",
+            reason=(
+                "Persistent user memory has explicit source provenance and can be remembered automatically; "
+                "memassist does not derive tool policy from memory text."
+            ),
+        )
+
+    if candidate.type in {"rule", "lesson"}:
         return CandidateDecision(
             candidate=candidate,
             decision="keep_candidate",
             status="candidate",
-            risk="high" if high_risk or protective else "medium",
+            risk="medium",
             memory_kind=memory_kind,
             caution_level="none",
             reason=(
-                "Potentially strong or risky inferred memory is kept inactive; "
-                "only direct user directives can create caution-level metadata."
+                "Inferred rule-like memory remains a candidate until stronger source evidence is available; "
+                "retrieved memories remain context and do not create tool policy."
             ),
         )
 
@@ -142,7 +121,7 @@ def classify_candidate(candidate: MemoryCandidate) -> CandidateDecision:
 
 
 def _memory_kind(candidate: MemoryCandidate) -> str:
-    if candidate.type in {"fact", "preference", "decision"}:
+    if candidate.type in {"fact", "preference", "decision", "directive"}:
         return "semantic"
     if candidate.type == "workflow":
         return "procedural"
@@ -151,5 +130,6 @@ def _memory_kind(candidate: MemoryCandidate) -> str:
     return "episodic"
 
 
-def _contains_any(text: str, terms: list[str]) -> bool:
-    return any(re.search(rf"\b{re.escape(term)}\b", text) or term in text for term in terms)
+def _has_explicit_source(candidate: MemoryCandidate) -> bool:
+    tags = set(candidate.tags)
+    return bool(tags & {"explicit", "user_prompt", "isolated_judge"})
