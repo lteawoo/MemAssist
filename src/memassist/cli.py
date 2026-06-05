@@ -90,13 +90,6 @@ def build_parser() -> argparse.ArgumentParser:
     mem_add.add_argument("--path", action="append", default=[])
     mem_add.add_argument("--importance", type=float, default=0.5)
     mem_add.add_argument("--confidence", type=float, default=0.8)
-    mem_add.add_argument(
-        "--caution-level",
-        dest="caution_level",
-        choices=["none", "warn", "block"],
-        default="none",
-        help="retrieval/display caution metadata; never blocks tools",
-    )
     mem_add.set_defaults(func=cmd_memory_add)
 
     mem_list = memory_sub.add_parser("list", help="list memories")
@@ -354,7 +347,6 @@ def cmd_memory_add(args: argparse.Namespace) -> int:
             paths=args.path,
             importance=args.importance,
             confidence=args.confidence,
-            caution_level=args.caution_level,
         )
         store.link_related_memories(memory_id, project_id=project_id)
     print(memory_id)

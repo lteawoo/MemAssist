@@ -17,7 +17,7 @@ from .memory_artifacts import (
     read_memory_artifact_by_id,
     sync_memory_artifact,
 )
-from .models import CAUTION_LEVELS, MEMORY_STATUSES, MEMORY_TYPES, Memory
+from .models import MEMORY_STATUSES, MEMORY_TYPES, Memory
 from .paths import db_path
 from .project import Project
 
@@ -72,7 +72,6 @@ class Store:
               retrieval_count INTEGER NOT NULL DEFAULT 0,
               utility REAL NOT NULL DEFAULT 0.0,
               half_life_days REAL NOT NULL DEFAULT 30.0,
-              caution_level TEXT NOT NULL,
               source_kind TEXT NOT NULL,
               source_ref TEXT,
               source_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -168,7 +167,6 @@ class Store:
             "retrieval_count": "INTEGER NOT NULL DEFAULT 0",
             "utility": "REAL NOT NULL DEFAULT 0.0",
             "half_life_days": "REAL NOT NULL DEFAULT 30.0",
-            "caution_level": "TEXT NOT NULL DEFAULT 'none'",
             "source_kind": "TEXT NOT NULL DEFAULT 'manual'",
             "source_ref": "TEXT",
             "source_ids_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -234,7 +232,6 @@ class Store:
         retrieval_count: int = 0,
         utility: float = 0.0,
         half_life_days: float | None = None,
-        caution_level: str = "none",
         source_kind: str = "manual",
         source_ref: str | None = None,
         source_quote: str | None = None,
@@ -247,14 +244,12 @@ class Store:
             raise ValueError(f"invalid memory type: {type}")
         if status not in MEMORY_STATUSES:
             raise ValueError(f"invalid memory status: {status}")
-        if caution_level not in CAUTION_LEVELS:
-            raise ValueError(f"invalid caution_level: {caution_level}")
         memory_id = f"mem_{uuid.uuid4().hex[:12]}"
         ts = now_iso()
         tags = tags or []
         paths = paths or []
         strength = _clamp(strength if strength is not None else (importance + confidence) / 2)
-        half_life_days = half_life_days if half_life_days is not None else _default_half_life_days(type, status, caution_level)
+        half_life_days = half_life_days if half_life_days is not None else _default_half_life_days(type, status, strength=strength)
         memory = Memory(
             id=memory_id,
             scope_type=scope_type,
@@ -273,7 +268,6 @@ class Store:
             retrieval_count=retrieval_count,
             utility=utility,
             half_life_days=half_life_days,
-            caution_level=caution_level,
             source_kind=source_kind,
             source_ref=source_ref,
             created_at=ts,
@@ -454,17 +448,6 @@ class Store:
         memory = self.get_memory(memory_id)
         if memory:
             updated = replace(memory, paths=paths, updated_at=now_iso())
-            sync_memory_artifact(self.path.parent, updated)
-            self._upsert_memory_index(updated)
-            self._refresh_embedding_cache(updated)
-            self.conn.commit()
-
-    def update_caution_level(self, memory_id: str, caution_level: str) -> None:
-        if caution_level not in CAUTION_LEVELS:
-            raise ValueError(f"invalid caution_level: {caution_level}")
-        memory = self.get_memory(memory_id)
-        if memory:
-            updated = replace(memory, caution_level=caution_level, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
             self._upsert_memory_index(updated)
             self._refresh_embedding_cache(updated)
@@ -856,22 +839,16 @@ class Store:
         content: str,
         tags: list[str],
         *,
-        type: str,
-        reason: str | None,
         paths: list[str],
         status: str,
-        caution_level: str,
     ) -> None:
         index_text = _memory_index_text(
             content=content,
-            type=type,
-            reason=reason,
             tags=tags,
             paths=paths,
             status=status,
-            caution_level=caution_level,
         )
-        tag_text = " ".join([*tags, *paths, type, status, caution_level])
+        tag_text = " ".join([*tags, *paths, status])
         self.conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))
         self.conn.execute(
             "INSERT INTO memory_fts (memory_id, content, tags) VALUES (?, ?, ?)",
@@ -888,11 +865,11 @@ class Store:
               id, scope_type, project_id, session_id, type, content, reason,
               tags_json, paths_json, status, importance, confidence,
               strength, recurrence, retrieval_count, utility, half_life_days,
-              caution_level, source_kind, source_ref, source_ids_json, source_quote,
+              source_kind, source_ref, source_ids_json, source_quote,
               content_hash, artifact_path, indexed_at, created_at, updated_at,
               last_used_at, expires_at, superseded_by
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               scope_type = excluded.scope_type,
               project_id = excluded.project_id,
@@ -910,7 +887,6 @@ class Store:
               retrieval_count = excluded.retrieval_count,
               utility = excluded.utility,
               half_life_days = excluded.half_life_days,
-              caution_level = excluded.caution_level,
               source_kind = excluded.source_kind,
               source_ref = excluded.source_ref,
               source_ids_json = excluded.source_ids_json,
@@ -942,7 +918,6 @@ class Store:
                 memory.retrieval_count,
                 memory.utility,
                 memory.half_life_days,
-                memory.caution_level,
                 memory.source_kind,
                 memory.source_ref,
                 json.dumps(memory.source_ids or []),
@@ -961,11 +936,8 @@ class Store:
             memory.id,
             memory.content,
             memory.tags,
-            type=memory.type,
-            reason=memory.reason,
             paths=memory.paths,
             status=memory.status,
-            caution_level=memory.caution_level,
         )
 
     def _prune_memory_index(self, artifact_ids: set[str]) -> None:
@@ -1029,12 +1001,9 @@ def _fts_query(query: str) -> str:
 def _memory_index_text(
     *,
     content: str,
-    type: str,
-    reason: str | None,
     tags: list[str],
     paths: list[str],
     status: str,
-    caution_level: str,
 ) -> str:
     section = "verifier" if type == "workflow" else "context"
     return " ".join(
@@ -1044,7 +1013,6 @@ def _memory_index_text(
             f"type {type}",
             f"section {section}",
             f"status {status}",
-            f"caution_level {caution_level}",
             "tags " + " ".join(tags) if tags else "",
             "paths " + " ".join(paths) if paths else "",
         ]
@@ -1052,16 +1020,25 @@ def _memory_index_text(
     )
 
 
-def _default_half_life_days(type: str, status: str, caution_level: str) -> float:
-    if type == "workflow":
-        return 120.0
-    if type in {"decision", "preference", "rule", "directive"}:
-        return 90.0
-    if type in {"lesson", "fact"}:
-        return 45.0
-    if type == "open_thread":
-        return 7.0
-    return 30.0
+def _default_half_life_days(type: str, status: str, *, strength: float = 0.5) -> float:
+    """D3: Compute half-life from strength signal, not from a closed type→days mapping.
+
+    Base half-life scales continuously with strength (0..1):
+    - min clamp: 7 days (floor to prevent instant expiry on weak memories)
+    - max clamp: 180 days (ceiling to prevent immortal memories)
+    - strength=0.5 (default) → 60 days (reasonable cold-start value)
+    - strength=1.0 → 120 days; strength=0.0 → 7 days
+
+    This is a continuous function applied uniformly to all memories regardless
+    of type. `expires_at` (explicit) takes precedence over this decay signal.
+    """
+    _MIN_HALF_LIFE = 7.0
+    _MAX_HALF_LIFE = 180.0
+    _BASE_HALF_LIFE = 120.0  # at full strength
+    clamped_strength = max(0.0, min(1.0, strength))
+    # Linear interpolation: min + strength * (base - min), clamped to [min, max]
+    half_life = _MIN_HALF_LIFE + clamped_strength * (_BASE_HALF_LIFE - _MIN_HALF_LIFE)
+    return max(_MIN_HALF_LIFE, min(_MAX_HALF_LIFE, half_life))
 
 
 def _with_required_timestamps(memory: Memory) -> Memory:

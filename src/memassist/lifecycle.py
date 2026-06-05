@@ -186,7 +186,6 @@ def cleanup_memories(store: Store) -> CleanupResult:
             candidate_type=candidate.type,
             candidate_tags=candidate.tags,
             candidate_status=candidate.status,
-            candidate_caution_level=candidate.caution_level,
             existing_memories=existing,
         )
         if duplicate and should_suppress_candidate(candidate.status, duplicate.memory):

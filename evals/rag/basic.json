@@ -38,7 +38,6 @@
           "content": "Ask before editing refresh token behavior; this is agent context, not a tool block.",
           "tags": ["auth", "security", "refresh", "token", "directive"],
           "paths": ["src/auth/refresh-token-policy.ts"],
-          "caution_level": "none",
           "source_quote": "Ask before editing refresh token behavior.",
           "source_ref": "evals/rag/basic.json#case-2-context"
         }

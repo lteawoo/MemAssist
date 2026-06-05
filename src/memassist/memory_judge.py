@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .directives import _normalize_project_files
+from .dedupe import find_semantic_duplicate, should_suppress_candidate
 from .integrations import status_tools
-from .models import CAUTION_LEVELS, MEMORY_TYPES
+from .models import MEMORY_TYPES
 from .project import Project
 from .source_ledger import append_source_record
 from .storage import Store
@@ -31,6 +31,7 @@ MAX_HINTS = 8
 MAX_DEBUG_CHARS = 4000
 MAX_JUDGE_ATTEMPTS = 3
 SOURCE_EVENT_TYPE = "memory_source_observed"
+SOURCE_INTEGRITY_LEVELS = {"clean", "uncertain", "contaminated"}
 
 
 @dataclass(frozen=True)
@@ -40,30 +41,32 @@ class MemorySourceEvent:
 
 
 @dataclass(frozen=True)
-class MemoryJudgeCandidate:
-    should_store: bool
-    memory_content: str
+class ExtractedMemory:
+    content: str
+    type: str
     source_quote: str
-    memory_type: str
-    caution_level: str
-    activation: str
-    candidate_paths: list[str]
-    meaning_preserved: bool
-    contamination_risk: str
-    reason: str
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "should_store": self.should_store,
-            "memory_content": self.memory_content,
+            "content": self.content,
+            "type": self.type,
             "source_quote": self.source_quote,
-            "memory_type": self.memory_type,
-            "caution_level": self.caution_level,
-            "activation": self.activation,
-            "candidate_paths": self.candidate_paths,
-            "meaning_preserved": self.meaning_preserved,
-            "contamination_risk": self.contamination_risk,
+        }
+
+
+@dataclass(frozen=True)
+class MemoryJudgeCandidate:
+    memory: ExtractedMemory | None
+    source_integrity: str
+    reason: str
+    reject_reason: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "memory": self.memory.as_dict() if self.memory else None,
+            "source_integrity": self.source_integrity,
             "reason": self.reason,
+            "reject_reason": self.reject_reason,
         }
 
 
@@ -254,7 +257,7 @@ def build_judge_payload(
     content = str(input_json.get("content") or "")[:MAX_SOURCE_CHARS]
     session_id = str(source_event.get("session_id") or "")
     recent_files = _recent_files(store, session_id=session_id)
-    conflicts = _memory_conflicts(store, project_id=project.id, content=content)
+    trace_signals = _session_trace_signals(store, session_id=session_id)
     return {
         "source_event": {
             "id": str(source_event["id"]),
@@ -269,7 +272,7 @@ def build_judge_payload(
             "recent_files": recent_files[:MAX_HINTS],
             "project_root_name": project.root.name,
         },
-        "existing_conflicts": conflicts[:MAX_HINTS],
+        "session_trace": trace_signals,
         "exclusions": [
             "assistant_responses",
             "retrieved_memory_context",
@@ -353,16 +356,18 @@ class FixtureMemoryJudge:
 
 def _build_judge_instruction(payload: dict[str, object]) -> str:
     return (
-        "You are an isolated memory judge. Return only one compact JSON object with fields: "
-        "should_store boolean, memory_content string, source_quote string, memory_type one of "
-        "fact/preference/rule/decision/lesson/workflow/open_thread/directive, caution_level one of "
-        "none/warn/block, activation one of candidate/active/rejected, "
-        "candidate_paths string array, meaning_preserved boolean, "
-        "contamination_risk one of low/medium/high, reason string. "
-        "Use only source_event and project_hints. Do not infer from assistant responses or retrieved memory. "
-        "Write memory_content as only the persistent future memory in the user's source language when possible. "
+        "You are an isolated memory extraction judge. Return only one compact JSON object. "
+        "If the source contains a durable future memory, return fields: "
+        "memory object with content string, type one of "
+        "fact/preference/rule/decision/lesson/workflow/open_thread/directive, "
+        "and source_quote string; source_integrity one of clean/uncertain/contaminated; "
+        "reason string. If there is no durable memory, return memory null, "
+        "source_integrity, reject_reason string, and reason string. "
+        "Do not return file path predictions. Use only source_event, project_hints, and session_trace. "
+        "Do not infer from assistant responses or retrieved memory. "
+        "Write memory.content as only the persistent future memory in the user's source language when possible. "
         "Do not include one-shot current-turn instructions, output formatting requests, or commands like "
-        "'respond only OK' in memory_content unless the user explicitly asks to remember that response format "
+        "'respond only OK' in memory.content unless the user explicitly asks to remember that response format "
         "for future turns. Preserve the full original wording separately in source_quote. "
         "Judge payload: "
         + json.dumps(payload, ensure_ascii=False)
@@ -509,16 +514,13 @@ def store_judge_result(
     result: MemoryJudgeResult,
 ) -> str | None:
     candidate = result.candidate
-    if not candidate or not candidate.should_store or not candidate.meaning_preserved:
+    if not candidate or not candidate.memory:
         return None
-    if candidate.contamination_risk == "high":
+    if candidate.source_integrity == "contaminated":
         return None
-    memory_type = candidate.memory_type if candidate.memory_type in MEMORY_TYPES else "preference"
-    caution_level = candidate.caution_level if candidate.caution_level in CAUTION_LEVELS else "none"
-    normalized_paths = _normalize_project_files(candidate.candidate_paths, project.root)
-    gate_like = caution_level in {"warn", "block"}
+    memory_type = candidate.memory.type if candidate.memory.type in MEMORY_TYPES else "preference"
     status = _activation_status(candidate)
-    content = (candidate.memory_content.strip() or candidate.source_quote.strip())[:500]
+    content = (candidate.memory.content.strip() or candidate.memory.source_quote.strip())[:500]
     if not content:
         return None
     source_event = _trace_event_by_id(store, source_event_id) or {}
@@ -533,7 +535,65 @@ def store_judge_result(
         statuses=("candidate", "active", "archived"),
     )
     if existing:
+        reinforced = store.reinforce_memory(existing.id)
+        store.add_lifecycle_event(
+            session_id=session_id,
+            project_id=project.id,
+            memory_id=existing.id,
+            candidate={
+                "judge": candidate.as_dict(),
+                "source_event_id": source_event_id,
+                "source_id": source_id,
+                "source_ref": source_ref,
+                "source_quote": candidate.memory.source_quote,
+            },
+            decision="reinforce_duplicate",
+            risk="low",
+            reason=(
+                "Equivalent memory already exists for this project; strength and recurrence were reinforced."
+                if reinforced
+                else "Equivalent memory already exists for this project."
+            ),
+        )
         return existing.id
+
+    # Semantic duplicate: overlapping weaker candidate suppressed → weak reinforce and skip.
+    all_memories = store.list_memories(project_id=project.id, include_global=True)
+    semantic_duplicate = find_semantic_duplicate(
+        content,
+        candidate_type=memory_type,
+        candidate_tags=_judge_tags(candidate),
+        candidate_status=status,
+        existing_memories=all_memories,
+    )
+    if semantic_duplicate and should_suppress_candidate(status, semantic_duplicate.memory):
+        reinforced = store.reinforce_memory(
+            semantic_duplicate.memory.id,
+            confidence_delta=0.02,
+            importance_delta=0.01,
+        )
+        store.add_lifecycle_event(
+            session_id=session_id,
+            project_id=project.id,
+            memory_id=semantic_duplicate.memory.id,
+            candidate={
+                "judge": candidate.as_dict(),
+                "source_event_id": source_event_id,
+                "source_id": source_id,
+                "source_ref": source_ref,
+                "source_quote": candidate.memory.source_quote,
+            },
+            decision="suppress_semantic_duplicate",
+            risk="low",
+            reason=(
+                f"Weaker candidate duplicates stronger memory {semantic_duplicate.memory.id}; "
+                f"{semantic_duplicate.reason} (score={semantic_duplicate.score})."
+                if reinforced
+                else f"Weaker candidate duplicates stronger memory {semantic_duplicate.memory.id}."
+            ),
+        )
+        return semantic_duplicate.memory.id
+
     memory_id = store.add_memory(
         scope_type="project",
         project_id=project.id,
@@ -542,17 +602,16 @@ def store_judge_result(
         content=content,
         reason=(
             f"Isolated memory judge: {candidate.reason} "
-            f"Normalized memory: {candidate.memory_content}."
+            f"Normalized memory: {candidate.memory.content}."
         ),
         tags=_judge_tags(candidate),
-        paths=normalized_paths,
+        paths=[],
         status=status,
         importance=0.85 if status == "active" else 0.65,
-        confidence=0.85 if candidate.contamination_risk == "low" else 0.7,
-        caution_level=caution_level,
+        confidence=0.85 if candidate.source_integrity == "clean" else 0.7,
         source_kind="isolated_memory_judge",
         source_ref=source_ref,
-        source_quote=candidate.source_quote,
+        source_quote=candidate.memory.source_quote,
         source_ids=source_ids,
     )
     memory = store.get_memory(memory_id)
@@ -565,11 +624,11 @@ def store_judge_result(
             "source_event_id": source_event_id,
             "source_id": source_id,
             "source_ref": source_ref,
-            "source_quote": candidate.source_quote,
+            "source_quote": candidate.memory.source_quote,
             "payload": result.payload,
         },
         decision="isolated_judge_memory_stored",
-        risk="medium" if gate_like else "low",
+        risk="medium" if candidate.source_integrity == "uncertain" else "low",
         reason=memory.reason if memory else candidate.reason,
     )
     return memory_id
@@ -584,9 +643,6 @@ def _record_judge_result(
     result: MemoryJudgeResult,
     gave_up: bool = False,
 ) -> str:
-    files: list[str] = []
-    if result.candidate:
-        files = list(result.candidate.candidate_paths)
     input_json: dict[str, object] = {
         "source_event_id": source_event_id,
         **result.as_dict(),
@@ -599,8 +655,8 @@ def _record_judge_result(
         event_type="memory_judged",
         tool_name="memassist",
         input_json=input_json,
-        tool_decision="store" if result.candidate and result.candidate.should_store else "skip",
-        files=files,
+        tool_decision="store" if result.candidate and result.candidate.memory else "skip",
+        files=[],
     )
 
 
@@ -638,31 +694,30 @@ def _failed_attempt_count(store: Store, *, session_id: str, source_event_id: str
 
 def _candidate_from_output(output: str) -> MemoryJudgeCandidate:
     raw = _extract_json_object(output)
-    should_store = _required_bool(raw, "should_store")
-    meaning_preserved = _required_bool(raw, "meaning_preserved")
-    memory_type = _required_str(raw, "memory_type")
-    if memory_type not in MEMORY_TYPES:
-        raise ValueError(f"invalid memory_type: {memory_type}")
-    caution_level = _required_str(raw, "caution_level")
-    if caution_level not in CAUTION_LEVELS:
-        raise ValueError(f"invalid caution_level: {caution_level}")
-    activation = _required_str(raw, "activation")
-    if activation not in {"candidate", "active", "rejected"}:
-        raise ValueError(f"invalid activation: {activation}")
-    contamination_risk = _required_str(raw, "contamination_risk")
-    if contamination_risk not in {"low", "medium", "high"}:
-        raise ValueError(f"invalid contamination_risk: {contamination_risk}")
+    source_integrity = _required_str(raw, "source_integrity")
+    if source_integrity not in SOURCE_INTEGRITY_LEVELS:
+        raise ValueError(f"invalid source_integrity: {source_integrity}")
+    memory_value = raw.get("memory")
+    memory: ExtractedMemory | None = None
+    reject_reason: str | None = None
+    if memory_value is None:
+        reject_reason = _required_str(raw, "reject_reason")
+    elif isinstance(memory_value, dict):
+        memory_type = _required_str(memory_value, "type")
+        if memory_type not in MEMORY_TYPES:
+            raise ValueError(f"invalid memory type: {memory_type}")
+        memory = ExtractedMemory(
+            content=_required_str(memory_value, "content"),
+            type=memory_type,
+            source_quote=_required_str(memory_value, "source_quote"),
+        )
+    else:
+        raise ValueError("memory must be an object or null")
     return MemoryJudgeCandidate(
-        should_store=should_store,
-        memory_content=_required_str(raw, "memory_content"),
-        source_quote=_required_str(raw, "source_quote"),
-        memory_type=memory_type,
-        caution_level=caution_level,
-        activation=activation,
-        candidate_paths=_string_list(raw.get("candidate_paths")),
-        meaning_preserved=meaning_preserved,
-        contamination_risk=contamination_risk,
+        memory=memory,
+        source_integrity=source_integrity,
         reason=_required_str(raw, "reason"),
+        reject_reason=reject_reason,
     )
 
 
@@ -688,7 +743,7 @@ def _extract_json_object(output: str) -> dict[str, object]:
         except json.JSONDecodeError:
             continue
         if isinstance(event, dict):
-            if "should_store" in event:
+            if "source_integrity" in event and "memory" in event:
                 return event
             item = event.get("item")
             if isinstance(item, dict):
@@ -715,7 +770,7 @@ def _extract_json_object(output: str) -> dict[str, object]:
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
-            if "should_store" in value:
+            if "source_integrity" in value and "memory" in value:
                 return value
             if fallback is None:
                 fallback = value
@@ -915,51 +970,14 @@ def _recent_files(store: Store, *, session_id: str) -> list[str]:
     return files
 
 
-def _memory_conflicts(store: Store, *, project_id: str, content: str) -> list[dict[str, object]]:
-    tokens = {token for token in re.findall(r"[A-Za-z0-9_가-힣]+", content.lower()) if len(token) > 2}
-    conflicts: list[dict[str, object]] = []
-    for memory in store.list_memories(project_id=project_id, include_global=True):
-        haystack = " ".join([memory.content, " ".join(memory.tags), " ".join(memory.paths)]).lower()
-        if tokens and tokens & set(re.findall(r"[A-Za-z0-9_가-힣]+", haystack)):
-            conflicts.append(
-                {
-                    "id": memory.id,
-                    "type": memory.type,
-                    "status": memory.status,
-                    "caution_level": memory.caution_level,
-                }
-            )
-    return conflicts
-
-
 def _activation_status(candidate: MemoryJudgeCandidate) -> str:
-    if candidate.activation == "rejected":
-        return "archived"
-    if _auto_active(candidate):
+    if candidate.source_integrity == "clean":
         return "active"
     return "candidate"
 
 
-def _auto_active(candidate: MemoryJudgeCandidate) -> bool:
-    if candidate.contamination_risk != "low":
-        return False
-    if candidate.memory_type not in {"preference", "decision", "fact", "workflow", "directive"}:
-        return False
-    return candidate.activation == "active"
-
-
 def _judge_tags(candidate: MemoryJudgeCandidate) -> list[str]:
-    tags = ["isolated_judge", candidate.memory_type]
-    if candidate.caution_level != "none":
-        tags.append(candidate.caution_level)
-    return list(dict.fromkeys(tags))
-
-
-def _required_bool(raw: dict[str, object], key: str) -> bool:
-    value = raw.get(key)
-    if not isinstance(value, bool):
-        raise ValueError(f"{key} must be boolean")
-    return value
+    return ["isolated_judge"]
 
 
 def _required_str(raw: dict[str, object], key: str) -> str:
@@ -967,17 +985,3 @@ def _required_str(raw: dict[str, object], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")
     return value.strip()
-
-
-def _string_list(value: object) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError("expected string list")
-    strings: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            raise ValueError("expected string list")
-        if item.strip():
-            strings.append(item.strip())
-    return strings

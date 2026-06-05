@@ -410,7 +410,6 @@ def _metadata_terms(memory: Memory) -> set[str]:
             [
                 memory.type,
                 memory.status,
-                memory.caution_level,
                 " ".join(memory.tags),
                 " ".join(memory.paths),
             ]

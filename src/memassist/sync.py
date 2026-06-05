@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .models import CAUTION_LEVELS, MEMORY_TYPES, Memory
+from .models import MEMORY_TYPES, Memory
 from .storage import Store
 
 
@@ -81,7 +81,6 @@ def import_memories(store: Store, *, project_id: str, path: Path, activate: bool
             retrieval_count=memory["retrieval_count"],
             utility=memory["utility"],
             half_life_days=memory["half_life_days"],
-            caution_level=memory["caution_level"],
             source_kind="import",
             source_ref=str(path),
             source_quote=memory["source_quote"],
@@ -108,7 +107,6 @@ def _exportable(memory: Memory) -> dict[str, object]:
         "retrieval_count",
         "utility",
         "half_life_days",
-        "caution_level",
         "source_kind",
         "source_ref",
         "source_quote",
@@ -126,7 +124,6 @@ def _dedupe_key(memory: Memory) -> tuple[str, str, tuple[str, ...], tuple[str, .
 
 def _normalize_import(raw: dict[str, object]) -> dict[str, object]:
     memory_type = _string(raw.get("type"), "fact")
-    caution_level = _string(raw.get("caution_level"), "none")
     return {
         "type": memory_type if memory_type in MEMORY_TYPES else "fact",
         "content": _string(raw.get("content"), ""),
@@ -140,7 +137,6 @@ def _normalize_import(raw: dict[str, object]) -> dict[str, object]:
         "retrieval_count": int(_float(raw.get("retrieval_count"), 0)),
         "utility": _float(raw.get("utility"), 0.0),
         "half_life_days": _float(raw.get("half_life_days"), 30.0),
-        "caution_level": caution_level if caution_level in CAUTION_LEVELS else "none",
         "source_quote": raw.get("source_quote") if isinstance(raw.get("source_quote"), str) else None,
         "source_ids": _string_list(raw.get("source_ids")),
         "content_hash": raw.get("content_hash") if isinstance(raw.get("content_hash"), str) else None,

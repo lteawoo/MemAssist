@@ -66,7 +66,6 @@ GUI_I18N = {
         "lifecycleEvents": "Lifecycle events",
         "verification": "Verification",
         "rawVerificationConfig": "Raw verification config",
-        "cautionLevel": "Caution",
         "toolDecision": "Tool decision",
         "tools": "Tools",
         "type": "Type",
@@ -136,7 +135,6 @@ GUI_I18N = {
         "lifecycleEvents": "라이프사이클 이벤트",
         "verification": "검증",
         "rawVerificationConfig": "원본 검증 설정",
-        "cautionLevel": "주의",
         "toolDecision": "도구 결정",
         "tools": "도구",
         "type": "유형",
@@ -649,7 +647,6 @@ def _init_empty_schema(conn: sqlite3.Connection) -> None:
           retrieval_count INTEGER,
           utility REAL,
           half_life_days REAL,
-          caution_level TEXT,
           source_kind TEXT,
           source_ref TEXT,
           source_ids_json TEXT,
@@ -750,7 +747,6 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         retrieval_count=_int(_row_value(row, "retrieval_count")),
         utility=_float(_row_value(row, "utility")),
         half_life_days=float(_row_value(row, "half_life_days", 30.0) or 30.0),
-        caution_level=str(_row_value(row, "caution_level", "none")),
         source_kind=str(_row_value(row, "source_kind", "manual")),
         source_ref=_row_value(row, "source_ref"),
         created_at=str(row["created_at"]),
@@ -778,7 +774,6 @@ def _memory_dict(record: Memory | sqlite3.Row, *, search: str | None = None) -> 
     memory["metrics"] = metrics
     memory["priority"] = metrics["priority"]
     memory["relevance"] = metrics["relevance"]
-    memory["caution_level"] = memory.get("caution_level") or "none"
     return memory
 
 
@@ -1347,7 +1342,7 @@ def _dashboard_html() -> str:
         <td style="width: 12%">${{esc(m.type)}}<br><span class="muted">${{esc(m.status)}}</span></td>
         <td class="content">${{esc(m.content)}}<div>${{(m.tags || []).map(tag => `<span class="pill">${{esc(tag)}}</span>`).join("")}}</div></td>
         <td style="width: 18%">${{(m.paths || []).map(path => `<span class="pill">${{esc(path)}}</span>`).join("")}}</td>
-        <td style="width: 14%">${{metricCell(m, metricKey)}}<br><span class="muted">${{esc(t("cautionLevel"))}}: ${{esc(m.caution_level || "none")}}</span></td>
+        <td style="width: 14%">${{metricCell(m, metricKey)}}</td>
         <td style="width: 16%"><span class="muted">${{esc(m.updated_at)}}</span><br>${{esc(m.id)}}</td>
       </tr>`).join("");
       el("memories").innerHTML = table([th("type"), th("content"), th("paths"), th(metricLabel, metricTip, metricDetails), th("updated")], rows);

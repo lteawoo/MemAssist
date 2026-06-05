@@ -7,7 +7,7 @@ from typing import Any
 import uuid
 
 from .eval_seed import remove_seed_memories_by_source
-from .models import CAUTION_LEVELS, MEMORY_STATUSES
+from .models import MEMORY_STATUSES
 from .retrieval import MemoryPack, build_memory_pack
 from .storage import Store
 
@@ -40,7 +40,6 @@ class RagSeedMemory:
     status: str
     importance: float
     confidence: float
-    caution_level: str
     source_quote: str | None = None
     source_ref: str | None = None
 
@@ -48,7 +47,6 @@ class RagSeedMemory:
     def from_dict(cls, value: dict[str, Any]) -> "RagSeedMemory":
         section = _normalized_section(str(value.get("section", "context")))
         status = str(value.get("status") or _default_status(section))
-        caution_level = str(value.get("caution_level") or _default_caution_level(section))
         return cls(
             type=str(value.get("type") or _default_type(section)),
             content=str(value.get("content", "")),
@@ -58,7 +56,6 @@ class RagSeedMemory:
             status=status if status in MEMORY_STATUSES else "archived",
             importance=float(value.get("importance", 0.8)),
             confidence=float(value.get("confidence", 0.85)),
-            caution_level=caution_level if caution_level in CAUTION_LEVELS else "none",
             source_quote=value.get("source_quote") if isinstance(value.get("source_quote"), str) else None,
             source_ref=value.get("source_ref") if isinstance(value.get("source_ref"), str) else None,
         )
@@ -251,10 +248,6 @@ def _default_status(section: str) -> str:
     return "active"
 
 
-def _default_caution_level(section: str) -> str:
-    return "none"
-
-
 def _normalized_section(section: str) -> str:
     return "verifier" if section == "verifier" else "context"
 
@@ -275,7 +268,6 @@ def _insert_seed_memories(store: Store, *, project_id: str, seed: list[RagSeedMe
             status=memory.status,
             importance=memory.importance,
             confidence=memory.confidence,
-            caution_level=memory.caution_level,
             source_kind="rag_eval_seed",
             source_ref=memory.source_ref or f"rag_eval:{uuid.uuid4().hex[:12]}",
             source_quote=memory.source_quote,

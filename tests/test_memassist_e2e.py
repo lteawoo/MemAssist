@@ -17,6 +17,28 @@ from memassist.project import detect_project
 from memassist.storage import Store
 
 
+def judge_fixture(
+    content: str,
+    *,
+    source_quote: str | None = None,
+    memory_type: str = "directive",
+    source_integrity: str = "clean",
+    reason: str = "test fixture",
+) -> str:
+    return json.dumps(
+        {
+            "memory": {
+                "content": content,
+                "type": memory_type,
+                "source_quote": source_quote or content,
+            },
+            "source_integrity": source_integrity,
+            "reason": reason,
+        },
+        ensure_ascii=False,
+    )
+
+
 @contextmanager
 def temp_project():
     # ignore_cleanup_errors: on Windows a just-finished tool subprocess (e.g. the
@@ -61,19 +83,12 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
             target.parent.mkdir(parents=True)
             target.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
             self.assertEqual(main(["init", "--tools", "codex", "--mode", "full"]), 0)
-            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "Do not change refresh token policy without asking first.",
-                    "source_quote": "리프레쉬 토큰 정책은 담부터 묻지 않고 고치지마",
-                    "memory_type": "directive",
-                    "caution_level": "block",
-                    "activation": "active",
-                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "User explicitly forbids changing this area without asking.",
-                }
+            os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = judge_fixture(
+                "Do not change refresh token policy without asking first.",
+                source_quote="리프레쉬 토큰 정책은 담부터 묻지 않고 고치지마",
+                memory_type="directive",
+                source_integrity="clean",
+                reason="User explicitly forbids changing this area without asking.",
             )
 
             prompt_payload = {
@@ -109,6 +124,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
             self.assertEqual(len(judged), 1)
             self.assertEqual(judged[0]["status"], "active")
             self.assertEqual(judged[0]["content"], "Do not change refresh token policy without asking first.")
+            self.assertEqual(judged[0]["paths"], [])
 
             pretool_payload = {
                 "session_id": "sess_e2e",

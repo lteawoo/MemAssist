@@ -251,7 +251,6 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                 for memory in memories:
                     metrics = memory.get("metrics") or {}
                     evidence = metrics.get("evidence") or {}
-                    self.assertIn("caution_level", memory)
                     self.assertIsInstance(metrics.get("priority"), int)
                     self.assertGreaterEqual(metrics["priority"], 0)
                     self.assertLessEqual(metrics["priority"], 100)
@@ -363,7 +362,6 @@ class GuiReadOnlyApiTest(unittest.TestCase):
             "utility",
             "uses",
             "recurrence",
-            "cautionLevel",
             "toolDecision",
             "priorityTooltip",
             "relevanceTooltip",
@@ -398,7 +396,6 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                 tags=["policy"],
                 paths=["src/locked.py"],
                 status="active",
-                caution_level="block",
             )
             store.add_trace_event(
                 session_id="sess_gui_readonly",

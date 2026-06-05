@@ -21,8 +21,6 @@ MEMORY_STATUSES = {
     "archived",
 }
 
-CAUTION_LEVELS = {"none", "warn", "block"}
-
 
 @dataclass(frozen=True)
 class Memory:
@@ -43,7 +41,6 @@ class Memory:
     retrieval_count: int
     utility: float
     half_life_days: float
-    caution_level: str
     source_kind: str
     source_ref: str | None
     created_at: str
@@ -74,7 +71,6 @@ class Memory:
             "retrieval_count": self.retrieval_count,
             "utility": self.utility,
             "half_life_days": self.half_life_days,
-            "caution_level": self.caution_level,
             "source_kind": self.source_kind,
             "source_ref": self.source_ref,
             "created_at": self.created_at,

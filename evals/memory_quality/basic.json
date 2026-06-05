@@ -40,7 +40,6 @@
           "tags": ["auth", "security", "refresh", "token", "directive"],
           "paths": ["src/auth/refresh-token-policy.ts"],
           "status": "active",
-          "caution_level": "none",
           "importance": 0.9,
           "source_quote": "Ask before editing refresh token behavior.",
           "source_ref": "evals/memory_quality/basic.json#case-2-directive"

@@ -23,7 +23,6 @@ def find_semantic_duplicate(
     candidate_type: str,
     candidate_tags: list[str],
     candidate_status: str,
-    candidate_caution_level: str,
     existing_memories: list[Memory],
     threshold: float = 0.65,
 ) -> DuplicateMatch | None:

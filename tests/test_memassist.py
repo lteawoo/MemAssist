@@ -22,6 +22,7 @@ from memassist.embeddings import register_embedding_provider
 from memassist.evaluator import evaluate_candidate
 from memassist.extraction import MemoryCandidate, extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
+from memassist.memory_artifacts import find_memory_artifact
 from memassist.memory_judge import INTERPRETER_ACTIVE_ENV
 from memassist.models import MEMORY_STATUSES, Memory
 from memassist.verification_config import default_verification_config_yaml, load_verification_config
@@ -46,6 +47,40 @@ class _TestEmbeddingProvider:
 
 
 register_embedding_provider("test", _TestEmbeddingProvider)
+
+
+def judge_fixture(
+    content: str,
+    *,
+    source_quote: str | None = None,
+    memory_type: str = "directive",
+    source_integrity: str = "clean",
+    reason: str = "test fixture",
+) -> str:
+    return json.dumps(
+        {
+            "memory": {
+                "content": content,
+                "type": memory_type,
+                "source_quote": source_quote or content,
+            },
+            "source_integrity": source_integrity,
+            "reason": reason,
+        },
+        ensure_ascii=False,
+    )
+
+
+def no_memory_fixture(*, source_integrity: str = "clean", reject_reason: str = "not_durable", reason: str = "test fixture") -> str:
+    return json.dumps(
+        {
+            "memory": None,
+            "source_integrity": source_integrity,
+            "reject_reason": reject_reason,
+            "reason": reason,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _write_test_embedding_profiles(mem_dir: Path, *, active: str = "test-local") -> None:
@@ -292,19 +327,12 @@ class MemassistTest(unittest.TestCase):
                 self.assertEqual(main(["init", "--tools", "codex"]), 0)
                 local_home = project / ".memassist"
                 os.environ["MEMASSIST_HOME"] = str(local_home)
-                os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = json.dumps(
-                    {
-                        "should_store": True,
-                        "memory_content": "Confirm before changing refresh token behavior.",
-                        "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해",
-                        "memory_type": "directive",
-                        "caution_level": "warn",
-                        "activation": "candidate",
-                        "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                        "meaning_preserved": True,
-                        "contamination_risk": "low",
-                        "reason": "User asked to confirm before future refresh token changes.",
-                    }
+                os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = judge_fixture(
+                    "Confirm before changing refresh token behavior.",
+                    source_quote="앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해",
+                    memory_type="directive",
+                    source_integrity="clean",
+                    reason="User asked to confirm before future refresh token changes.",
                 )
                 payload = {
                     "session_id": "sess_project_local_home",
@@ -320,7 +348,9 @@ class MemassistTest(unittest.TestCase):
                     events = store.trace_events("sess_project_local_home")
                 self.assertTrue(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
                 judged_memory = next(memory for memory in memories if memory.source_kind == "isolated_memory_judge")
-                artifact = local_home / "memories" / "candidates" / f"{judged_memory.id}.md"
+                artifact = find_memory_artifact(local_home, judged_memory.id)
+                self.assertIsNotNone(artifact)
+                assert artifact is not None
                 self.assertTrue(artifact.exists())
                 artifact_text = artifact.read_text(encoding="utf-8")
                 self.assertIn("Confirm before changing refresh token behavior.", artifact_text)
@@ -498,7 +528,6 @@ class MemassistTest(unittest.TestCase):
                     type="lesson",
                     content="Do not change refresh token policy for session timeout fixes.",
                     tags=["auth", "session"],
-                    caution_level="block",
                     importance=0.9,
                 )
                 store.add_memory(
@@ -513,7 +542,7 @@ class MemassistTest(unittest.TestCase):
                 self.assertGreaterEqual(len(results), 1)
                 pack = build_memory_pack(store, query="session timeout", project_id=project.id)
                 self.assertTrue(pack.context)
-                self.assertTrue(any(memory.caution_level == "block" for memory in pack.context))
+                self.assertTrue(any("refresh token policy" in memory.content for memory in pack.context))
                 self.assertTrue(pack.verifier)
             finally:
                 store.close()
@@ -558,7 +587,6 @@ class MemassistTest(unittest.TestCase):
                     type="rule",
                     content="Block active retrieval policy behavior changes unless the directive changes.",
                     tags=["policy", "retrieval"],
-                    caution_level="block",
                     importance=0.9,
                 )
                 store.add_memory(
@@ -576,7 +604,7 @@ class MemassistTest(unittest.TestCase):
                 )
                 self.assertEqual(pack.intent.task_type if pack.intent else None, "general")
                 self.assertTrue(any("retrieval module" in memory.content for memory in pack.context))
-                self.assertTrue(any(memory.caution_level == "block" for memory in pack.context))
+                self.assertTrue(any("policy behavior changes" in memory.content for memory in pack.context))
                 self.assertTrue(any(memory.type == "workflow" for memory in pack.verifier))
             finally:
                 store.close()
@@ -596,7 +624,6 @@ class MemassistTest(unittest.TestCase):
                     tags=["auth", "token", "refresh", "directive"],
                     paths=["src/auth/refresh-token-policy.ts"],
                     status="active",
-                    caution_level="warn",
                     source_kind="isolated_memory_judge",
                 )
                 for query in [
@@ -741,7 +768,6 @@ class MemassistTest(unittest.TestCase):
                     content="Ask before editing refresh token behavior; this is agent context, not a tool block.",
                     tags=["refresh", "token", "directive"],
                     status="active",
-                    caution_level="none",
                     importance=0.9,
                     confidence=0.9,
                 )
@@ -1437,18 +1463,14 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(stdout.getvalue(), "")
 
     def test_stop_hook_records_project_local_source_ledger_and_links_judged_memory(self) -> None:
-        fixture = {
-            "should_store": True,
-            "memory_content": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해.",
-            "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해.",
-            "memory_type": "preference",
-            "caution_level": "none",
-            "activation": "active",
-            "candidate_paths": ["src/auth/session.py"],
-            "meaning_preserved": True,
-            "contamination_risk": "low",
-            "reason": "Persistent user preference.",
-        }
+        fixture = json.loads(
+            judge_fixture(
+                "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해.",
+                memory_type="preference",
+                source_integrity="clean",
+                reason="Persistent user preference.",
+            )
+        )
         with isolated_env() as (_root, project_dir, _home):
             self.assertEqual(main(["init"]), 0)
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
@@ -1477,7 +1499,7 @@ class MemassistTest(unittest.TestCase):
             stored = [memory for memory in memories if "리프레시 토큰" in memory.content]
             self.assertEqual(1, len(stored))
             self.assertEqual([records[0].id], stored[0].source_ids)
-            self.assertEqual(fixture["source_quote"], stored[0].source_quote)
+            self.assertEqual(fixture["memory"]["source_quote"], stored[0].source_quote)
 
     def test_export_import_preserves_source_evidence_fields(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -1923,7 +1945,6 @@ class MemassistTest(unittest.TestCase):
                     status="candidate",
                     importance=0.8,
                     confidence=0.8,
-                    caution_level="none",
                 )
 
             payload = {
@@ -2003,19 +2024,12 @@ class MemassistTest(unittest.TestCase):
                     event_type="stop",
                     input_json={"last_assistant_message": "앞으로 페이지 리프레시는 승인 요청하겠습니다."},
                 )
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "refresh token 관련 변경 전 사용자에게 먼저 확인한다.",
-                    "source_quote": "앞으로 refresh token 쪽은 고치기 전에 나한테 먼저 물어봐",
-                    "memory_type": "directive",
-                    "caution_level": "warn",
-                    "activation": "candidate",
-                    "candidate_paths": [],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "Payload isolation test.",
-                }
+            fixture = judge_fixture(
+                "refresh token 관련 변경 전 사용자에게 먼저 확인한다.",
+                source_quote="앞으로 refresh token 쪽은 고치기 전에 나한테 먼저 물어봐",
+                memory_type="directive",
+                source_integrity="clean",
+                reason="Payload isolation test.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2048,22 +2062,15 @@ class MemassistTest(unittest.TestCase):
             self.assertNotIn("앞으로 페이지 리프레시는 승인 요청하겠습니다.", serialized)
             self.assertIn("assistant_responses", serialized)
 
-    def test_low_risk_judge_preference_auto_activates(self) -> None:
+    def test_clean_source_judge_preference_auto_activates(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "사용자는 한국어로 간결한 답변을 선호한다.",
-                    "source_quote": "앞으로 답변은 한국어로 짧게 해줘",
-                    "memory_type": "preference",
-                    "caution_level": "none",
-                    "activation": "active",
-                    "candidate_paths": [],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "Low-risk user preference.",
-                }
+            fixture = judge_fixture(
+                "사용자는 한국어로 간결한 답변을 선호한다.",
+                source_quote="앞으로 답변은 한국어로 짧게 해줘",
+                memory_type="preference",
+                source_integrity="clean",
+                reason="Clean source user preference.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2089,7 +2096,6 @@ class MemassistTest(unittest.TestCase):
                 any(
                     memory.source_kind == "isolated_memory_judge"
                     and memory.status == "active"
-                    and memory.caution_level == "none"
                     for memory in memories
                 )
             )
@@ -2111,7 +2117,6 @@ class MemassistTest(unittest.TestCase):
                     content=content,
                     tags=["explicit", "auth", "token"],
                     status="candidate",
-                    caution_level="none",
                 )
 
             payload = {
@@ -2128,7 +2133,6 @@ class MemassistTest(unittest.TestCase):
                 memory = store.get_memory(memory_id)
                 traces = store.trace_events("sess_direct_policy_upgrade_candidate")
                 self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
-                self.assertEqual(memory.caution_level, "none")  # type: ignore[union-attr]
             self.assertFalse(any(event["event_type"] == "memory_intent_observed" for event in traces))
             self.assertNotIn(
                 "src/auth/refresh-token-policy.ts",
@@ -2141,19 +2145,12 @@ class MemassistTest(unittest.TestCase):
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
             protected.parent.mkdir(parents=True)
             protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "리프레시 토큰 관련 변경은 사용자 확인 전 수정하지 않는다.",
-                    "source_quote": "리프레시 토큰 관련 변경은 절대 묻지 않고 수정하지마",
-                    "memory_type": "directive",
-                    "caution_level": "block",
-                    "activation": "active",
-                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "User explicitly set a future edit gate for refresh token changes.",
-                }
+            fixture = judge_fixture(
+                "리프레시 토큰 관련 변경은 사용자 확인 전 수정하지 않는다.",
+                source_quote="리프레시 토큰 관련 변경은 절대 묻지 않고 수정하지마",
+                memory_type="directive",
+                source_integrity="clean",
+                reason="User explicitly set a future edit gate for refresh token changes.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2191,7 +2188,7 @@ class MemassistTest(unittest.TestCase):
             ]
             self.assertEqual(len(direct_memories), 1)
             self.assertEqual(direct_memories[0].status, "active")
-            self.assertEqual(direct_memories[0].caution_level, "block")
+            self.assertEqual(direct_memories[0].paths, [])
             self.assertTrue(any(event["event_type"] == "memory_source_observed" for event in traces))
             self.assertTrue(any(event["event_type"] == "memory_judged" for event in traces))
             self.assertNotIn(
@@ -2229,7 +2226,6 @@ class MemassistTest(unittest.TestCase):
                     content="Remember temporary branch cleanup note.",
                     tags=["explicit"],
                     status="candidate",
-                    caution_level="none",
                 )
 
             payload = {
@@ -2248,19 +2244,12 @@ class MemassistTest(unittest.TestCase):
     def test_non_keyword_directive_is_captured_at_stop_not_inline(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init", "--tools", "codex"])
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "리프레시 토큰 변경 시 사용자 확인을 받는다.",
-                    "source_quote": "리프레시토큰 변경에 승인확인하라",
-                    "memory_type": "directive",
-                    "caution_level": "warn",
-                    "activation": "active",
-                    "candidate_paths": [],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "Directive without any trigger keyword.",
-                }
+            fixture = judge_fixture(
+                "리프레시 토큰 변경 시 사용자 확인을 받는다.",
+                source_quote="리프레시토큰 변경에 승인확인하라",
+                memory_type="directive",
+                source_integrity="clean",
+                reason="Directive without any trigger keyword.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2303,19 +2292,10 @@ class MemassistTest(unittest.TestCase):
     def test_trivial_task_prompt_stores_no_durable_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init", "--tools", "codex"])
-            fixture = json.dumps(
-                {
-                    "should_store": False,
-                    "memory_content": "n/a",
-                    "source_quote": "이 함수 typo 좀 고쳐줘",
-                    "memory_type": "fact",
-                    "caution_level": "none",
-                    "activation": "rejected",
-                    "candidate_paths": [],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "One-off task; nothing durable to remember.",
-                }
+            fixture = no_memory_fixture(
+                source_integrity="clean",
+                reject_reason="one_shot_task",
+                reason="One-off task; nothing durable to remember.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2339,7 +2319,7 @@ class MemassistTest(unittest.TestCase):
                     os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
             self.assertIn("memory_source_observed", events)  # recorded at Stop
             self.assertIn("memory_judged", events)  # judged at Stop
-            self.assertEqual(mem, [])  # but nothing durable stored (should_store=false)
+            self.assertEqual(mem, [])
 
     def test_typo_directive_is_judged_to_active_source_language_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -2347,19 +2327,12 @@ class MemassistTest(unittest.TestCase):
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
             protected.parent.mkdir(parents=True)
             protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "리프레시 토큰 관련 변경 전 사용자에게 먼저 확인한다.",
-                    "source_quote": "리프레쉬 토큰 쪽은 담부터 고치기 전에 꼭 나한테 먼저 말해줘",
-                    "memory_type": "directive",
-                    "caution_level": "warn",
-                    "activation": "active",
-                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "User asked for confirmation before refresh token changes.",
-                }
+            fixture = judge_fixture(
+                "리프레시 토큰 관련 변경 전 사용자에게 먼저 확인한다.",
+                source_quote="리프레쉬 토큰 쪽은 담부터 고치기 전에 꼭 나한테 먼저 말해줘",
+                memory_type="directive",
+                source_integrity="clean",
+                reason="User asked for confirmation before refresh token changes.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2391,7 +2364,6 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue(
                 any(
                     memory.status == "active"
-                    and memory.caution_level == "warn"
                     and memory.content == "리프레시 토큰 관련 변경 전 사용자에게 먼저 확인한다."
                     for memory in memories
                 )
@@ -2404,19 +2376,12 @@ class MemassistTest(unittest.TestCase):
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
             protected.parent.mkdir(parents=True)
             protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다.",
-                    "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
-                    "memory_type": "directive",
-                    "caution_level": "warn",
-                    "activation": "active",
-                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "Durable refresh token edit gate separated from the current response-format instruction.",
-                }
+            fixture = judge_fixture(
+                "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다.",
+                source_quote="앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
+                memory_type="directive",
+                source_integrity="clean",
+                reason="Durable refresh token edit gate separated from the current response-format instruction.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2475,19 +2440,12 @@ class MemassistTest(unittest.TestCase):
     def test_english_mixed_prompt_excludes_transient_response_text_from_search(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init", "--tools", "codex"])
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "Ask before changing refresh token settings.",
-                    "source_quote": "Always ask before changing refresh token settings. Reply only OK.",
-                    "memory_type": "directive",
-                    "caution_level": "warn",
-                    "activation": "active",
-                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "Durable edit gate separated from a current-turn response format.",
-                }
+            fixture = judge_fixture(
+                "Ask before changing refresh token settings.",
+                source_quote="Always ask before changing refresh token settings. Reply only OK.",
+                memory_type="directive",
+                source_integrity="clean",
+                reason="Durable edit gate separated from a current-turn response format.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2524,19 +2482,12 @@ class MemassistTest(unittest.TestCase):
             protected = project_dir / "src" / "auth" / "refresh-token-policy.ts"
             protected.parent.mkdir(parents=True)
             protected.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "Do not change refresh token policy without asking first.",
-                    "source_quote": "refresh token policy 변경은 묻지 않고 하지마",
-                    "memory_type": "directive",
-                    "caution_level": "block",
-                    "activation": "active",
-                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "Explicit future change gate.",
-                }
+            fixture = judge_fixture(
+                "Do not change refresh token policy without asking first.",
+                source_quote="refresh token policy 변경은 묻지 않고 하지마",
+                memory_type="directive",
+                source_integrity="clean",
+                reason="Explicit future change gate.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2564,7 +2515,6 @@ class MemassistTest(unittest.TestCase):
             self.assertTrue(
                 any(
                     memory.status == "active"
-                    and memory.caution_level == "block"
                     and memory.content == "Do not change refresh token policy without asking first."
                     for memory in memories
                 )
@@ -2573,22 +2523,15 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(len(judged), 1)
             self.assertIn('"adapter_name": "fixture"', judged[0]["input_json"])
 
-    def test_medium_risk_judge_candidate_does_not_mutate_policy(self) -> None:
+    def test_uncertain_source_judge_candidate_does_not_mutate_policy(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init", "--tools", "codex"])
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "Maybe mention refresh token changes later.",
-                    "source_quote": "앞으로 refresh token changes tell me later",
-                    "memory_type": "directive",
-                    "caution_level": "warn",
-                    "activation": "candidate",
-                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "meaning_preserved": True,
-                    "contamination_risk": "medium",
-                    "reason": "Ambiguous but potentially useful.",
-                }
+            fixture = judge_fixture(
+                "Maybe mention refresh token changes later.",
+                source_quote="앞으로 refresh token changes tell me later",
+                memory_type="directive",
+                source_integrity="uncertain",
+                reason="Ambiguous but potentially useful.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2613,22 +2556,15 @@ class MemassistTest(unittest.TestCase):
                 (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
             )
 
-    def test_external_judge_candidate_paths_do_not_compile_policy(self) -> None:
+    def test_judge_created_memory_is_path_independent(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init", "--tools", "codex"])
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "Do not change external path.",
-                    "source_quote": "외부 경로 건드리지마",
-                    "memory_type": "directive",
-                    "caution_level": "block",
-                    "activation": "active",
-                    "candidate_paths": ["../outside.txt", "/etc/passwd"],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "External paths must not be normalized into project verification config.",
-                }
+            fixture = judge_fixture(
+                "Do not change external path.",
+                source_quote="외부 경로 건드리지마",
+                memory_type="directive",
+                source_integrity="clean",
+                reason="Memory content is path-independent.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2652,25 +2588,18 @@ class MemassistTest(unittest.TestCase):
             self.assertNotIn("outside.txt", (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"))
             self.assertNotIn("/etc/passwd", (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"))
 
-    def test_weak_single_term_path_match_does_not_compile_policy(self) -> None:
+    def test_uncertain_source_without_paths_does_not_compile_policy(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init", "--tools", "codex"])
             target = project_dir / "src" / "auth" / "session.py"
             target.parent.mkdir(parents=True)
             target.write_text("SESSION = True\n", encoding="utf-8")
-            fixture = json.dumps(
-                {
-                    "should_store": True,
-                    "memory_content": "Tell me before auth changes.",
-                    "source_quote": "auth 변경 전에 알려줘",
-                    "memory_type": "directive",
-                    "caution_level": "warn",
-                    "activation": "candidate",
-                    "candidate_paths": [],
-                    "meaning_preserved": True,
-                    "contamination_risk": "medium",
-                    "reason": "No reliable path was provided.",
-                }
+            fixture = judge_fixture(
+                "Tell me before auth changes.",
+                source_quote="auth 변경 전에 알려줘",
+                memory_type="directive",
+                source_integrity="uncertain",
+                reason="Source is not clean enough for auto-activation.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -2697,15 +2626,12 @@ class MemassistTest(unittest.TestCase):
             main(["init", "--tools", "codex"])
             fixture = json.dumps(
                 {
-                    "is_directive": "false",
-                    "intent": "none",
-                    "subject": "refresh token policy",
-                    "caution_level": "block",
-                    "scope_terms": ["refresh", "token"],
-                    "candidate_paths": ["src/auth/refresh-token-policy.ts"],
-                    "confidence": 0.99,
-                    "rationale": "malformed boolean should be rejected",
-                    "normalized_prompt": "앞으로 refresh token policy 관련 내용은 기억해줘",
+                    "memory": {
+                        "content": "앞으로 refresh token policy 관련 내용은 기억해줘",
+                        "type": "directive",
+                    },
+                    "source_integrity": "clean",
+                    "reason": "missing source_quote should be rejected",
                 }
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
@@ -2904,7 +2830,6 @@ class MemassistTest(unittest.TestCase):
                     content="Warn before changing src/auth/session.py.",
                     paths=["src/auth/session.py"],
                     status="active",
-                    caution_level="warn",
                     source_kind="test",
                 )
 
@@ -2933,8 +2858,6 @@ class MemassistTest(unittest.TestCase):
                         "billing",
                         "--importance",
                         "0.9",
-                        "--caution-level",
-                        "block",
                     ]
                 )
             export_path = project_dir / ".memassist" / "memories.json"
@@ -3045,7 +2968,6 @@ class MemassistTest(unittest.TestCase):
                     status="active",
                     importance=0.9,
                     confidence=0.95,
-                    caution_level="block",
                     source_kind="user_prompt_directive",
                 )
                 store.add_trace_event(
@@ -3144,19 +3066,10 @@ class MemassistTest(unittest.TestCase):
     def test_genuine_skip_is_terminal_not_retried(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init", "--tools", "codex"])
-            fixture = json.dumps(
-                {
-                    "should_store": False,
-                    "memory_content": "n/a",
-                    "source_quote": "isolated skip terminal test",
-                    "memory_type": "fact",
-                    "caution_level": "none",
-                    "activation": "rejected",
-                    "candidate_paths": [],
-                    "meaning_preserved": True,
-                    "contamination_risk": "low",
-                    "reason": "One-off task; nothing durable.",
-                }
+            fixture = no_memory_fixture(
+                source_integrity="clean",
+                reject_reason="one_shot_task",
+                reason="One-off task; nothing durable.",
             )
             old_fixture = os.environ.get("MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE")
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = fixture
@@ -3222,7 +3135,6 @@ class MemassistTest(unittest.TestCase):
                     status="active",
                     importance=0.9,
                     confidence=0.95,
-                    caution_level="block",
                     source_kind="user_prompt_directive",
                 )
                 candidate_id = store.add_memory(
@@ -3234,7 +3146,6 @@ class MemassistTest(unittest.TestCase):
                     status="candidate",
                     importance=0.7,
                     confidence=0.8,
-                    caution_level="none",
                     source_kind="lifecycle",
                 )
 
@@ -3249,6 +3160,353 @@ class MemassistTest(unittest.TestCase):
                 self.assertEqual(candidate.status, "candidate")  # type: ignore[union-attr]
                 self.assertIsNone(candidate.superseded_by)  # type: ignore[union-attr]
 
+
+class AdaptiveSignalTest(unittest.TestCase):
+    """Task 6.3: Unit tests for signal normalization, cold-start, and lifetime decay."""
+
+    def test_normalize_retrieval_count_log1p_scale(self) -> None:
+        from memassist.retrieval import _normalize_retrieval_count
+        # Cold-start: 0 retrievals → 0.0
+        self.assertEqual(_normalize_retrieval_count(0), 0.0)
+        # 100 retrievals → saturates close to 1.0
+        self.assertAlmostEqual(_normalize_retrieval_count(100), 1.0, places=5)
+        # Monotonic: more retrievals → higher score
+        self.assertGreater(_normalize_retrieval_count(10), _normalize_retrieval_count(5))
+        self.assertGreater(_normalize_retrieval_count(50), _normalize_retrieval_count(10))
+        # Clamped to [0, 1]
+        self.assertLessEqual(_normalize_retrieval_count(1000), 1.0)
+        self.assertGreaterEqual(_normalize_retrieval_count(0), 0.0)
+
+    def test_recency_decay_cold_start_returns_zero(self) -> None:
+        from memassist.retrieval import _recency_decay
+        # No timestamp → neutral (0.0)
+        self.assertEqual(_recency_decay(None), 0.0)
+        self.assertEqual(_recency_decay(""), 0.0)
+
+    def test_recency_decay_recent_timestamp_returns_high_score(self) -> None:
+        from datetime import datetime, timezone, timedelta
+        from memassist.retrieval import _recency_decay
+        now = datetime.now(timezone.utc)
+        recent = (now - timedelta(hours=1)).isoformat()
+        score = _recency_decay(recent)
+        self.assertGreater(score, 0.95)  # Very recent → close to 1.0
+
+    def test_recency_decay_old_timestamp_returns_low_score(self) -> None:
+        from datetime import datetime, timezone, timedelta
+        from memassist.retrieval import _recency_decay
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=365)).isoformat()
+        score = _recency_decay(old)
+        self.assertLess(score, 0.05)  # Very old → close to 0.0
+
+    def test_usage_score_cold_start_is_zero(self) -> None:
+        from memassist.retrieval import _usage_score
+        from memassist.models import Memory
+        # A cold-start memory with all signals at defaults
+        memory = Memory(
+            id="mem_cold",
+            scope_type="project",
+            project_id="proj",
+            session_id=None,
+            type="fact",
+            content="cold start",
+            reason=None,
+            tags=[],
+            paths=[],
+            status="active",
+            importance=0.5,
+            confidence=0.8,
+            strength=0.0,
+            recurrence=1,
+            retrieval_count=0,
+            utility=0.0,
+            half_life_days=60.0,
+            source_kind="manual",
+            source_ref=None,
+            created_at="2024-01-01T00:00:00+00:00",
+            updated_at="2024-01-01T00:00:00+00:00",
+            last_used_at=None,
+            expires_at=None,
+            superseded_by=None,
+        )
+        score = _usage_score(memory)
+        # Cold-start: retrieval_count=0, utility=0, strength=0, last_used_at=None
+        # Expected: 0.0 (neutral contribution)
+        self.assertEqual(score, 0.0)
+
+    def test_usage_score_high_signals_returns_positive_score(self) -> None:
+        from datetime import datetime, timezone, timedelta
+        from memassist.retrieval import _usage_score
+        from memassist.models import Memory
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        memory = Memory(
+            id="mem_rich",
+            scope_type="project",
+            project_id="proj",
+            session_id=None,
+            type="fact",
+            content="frequently used",
+            reason=None,
+            tags=[],
+            paths=[],
+            status="active",
+            importance=0.9,
+            confidence=0.9,
+            strength=0.9,
+            recurrence=10,
+            retrieval_count=50,
+            utility=0.8,
+            half_life_days=90.0,
+            source_kind="manual",
+            source_ref=None,
+            created_at="2024-01-01T00:00:00+00:00",
+            updated_at="2024-01-01T00:00:00+00:00",
+            last_used_at=recent,
+            expires_at=None,
+            superseded_by=None,
+        )
+        score = _usage_score(memory)
+        self.assertGreater(score, 0.5)
+        self.assertLessEqual(score, 1.0)
+
+    def test_usage_score_higher_signals_ranks_higher(self) -> None:
+        """D2: Memory with higher retrieval_count and more recent last_used_at ranks higher."""
+        from datetime import datetime, timezone, timedelta
+        from memassist.retrieval import _usage_score
+        from memassist.models import Memory
+
+        def make_memory(retrieval_count: int, days_ago: int | None, strength: float) -> Memory:
+            last_used = None if days_ago is None else (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+            return Memory(
+                id=f"mem_{retrieval_count}",
+                scope_type="project",
+                project_id="proj",
+                session_id=None,
+                type="fact",
+                content="test",
+                reason=None,
+                tags=[],
+                paths=[],
+                status="active",
+                importance=0.5,
+                confidence=0.5,
+                strength=strength,
+                recurrence=1,
+                retrieval_count=retrieval_count,
+                utility=0.0,
+                half_life_days=60.0,
+                source_kind="manual",
+                source_ref=None,
+                created_at="2024-01-01T00:00:00+00:00",
+                updated_at="2024-01-01T00:00:00+00:00",
+                last_used_at=last_used,
+                expires_at=None,
+                superseded_by=None,
+            )
+
+        memory_a = make_memory(retrieval_count=50, days_ago=1, strength=0.8)
+        memory_b = make_memory(retrieval_count=5, days_ago=60, strength=0.3)
+        self.assertGreater(_usage_score(memory_a), _usage_score(memory_b))
+
+    def test_half_life_signal_based_not_type_mapped(self) -> None:
+        """D3: half-life is based on strength, not type→fixed-days mapping."""
+        from memassist.storage import _default_half_life_days
+        # All types should return the same value for the same strength
+        types = ["workflow", "fact", "preference", "rule", "decision", "lesson", "directive", "open_thread"]
+        strength = 0.5
+        half_lives = [_default_half_life_days(t, "active", strength=strength) for t in types]
+        # All types with same strength should have same half-life (type-agnostic)
+        self.assertEqual(len(set(half_lives)), 1, f"Expected uniform half-life for strength={strength}, got: {set(half_lives)}")
+
+    def test_half_life_scales_with_strength(self) -> None:
+        """D3: Higher strength → longer half-life."""
+        from memassist.storage import _default_half_life_days
+        low_hl = _default_half_life_days("fact", "active", strength=0.1)
+        mid_hl = _default_half_life_days("fact", "active", strength=0.5)
+        high_hl = _default_half_life_days("fact", "active", strength=1.0)
+        self.assertLess(low_hl, mid_hl)
+        self.assertLess(mid_hl, high_hl)
+
+    def test_half_life_respects_min_max_clamps(self) -> None:
+        """D3: Half-life has continuous min/max clamps, not type-specific values."""
+        from memassist.storage import _default_half_life_days
+        min_hl = _default_half_life_days("fact", "active", strength=0.0)
+        max_hl = _default_half_life_days("fact", "active", strength=1.0)
+        self.assertGreaterEqual(min_hl, 7.0)   # min clamp
+        self.assertLessEqual(max_hl, 180.0)    # max clamp
+
+    def test_section_score_no_type_based_boost(self) -> None:
+        """D1: _section_score no longer adds type-specific boosts."""
+        from memassist.retrieval import _section_score, analyze_query_intent
+        from memassist.models import Memory
+
+        def make_memory(memory_type: str) -> Memory:
+            return Memory(
+                id=f"mem_{memory_type}",
+                scope_type="project",
+                project_id="proj",
+                session_id=None,
+                type=memory_type,
+                content="test verification memory",
+                reason=None,
+                tags=["verification"],
+                paths=[],
+                status="active",
+                importance=0.5,
+                confidence=0.5,
+                strength=0.5,
+                recurrence=1,
+                retrieval_count=0,
+                utility=0.0,
+                half_life_days=60.0,
+                source_kind="manual",
+                source_ref=None,
+                created_at="2024-01-01T00:00:00+00:00",
+                updated_at="2024-01-01T00:00:00+00:00",
+                last_used_at=None,
+                expires_at=None,
+                superseded_by=None,
+            )
+
+        intent = analyze_query_intent("test verification")
+        workflow_mem = make_memory("workflow")
+        fact_mem = make_memory("fact")
+        # Same content, same signals, different types → same score (no type boost)
+        workflow_score = _section_score("test verification", intent, workflow_mem, "verifier")
+        fact_score = _section_score("test verification", intent, fact_mem, "verifier")
+        self.assertAlmostEqual(workflow_score, fact_score, places=5)
+
+    def test_type_label_is_not_search_signal(self) -> None:
+        """P0: type is display metadata, not lexical/vector/metadata search text."""
+        from memassist.embeddings import memory_embedding_text
+        from memassist.models import Memory
+        from memassist.retrieval import _metadata_terms
+
+        memory = Memory(
+            id="mem_type_signal",
+            scope_type="project",
+            project_id="proj",
+            session_id=None,
+            type="workflow",
+            content="Use the blue deployment checklist before release.",
+            reason=None,
+            tags=["deploy"],
+            paths=[],
+            status="active",
+            importance=0.5,
+            confidence=0.5,
+            strength=0.5,
+            recurrence=1,
+            retrieval_count=0,
+            utility=0.0,
+            half_life_days=60.0,
+            source_kind="manual",
+            source_ref=None,
+            created_at="2024-01-01T00:00:00+00:00",
+            updated_at="2024-01-01T00:00:00+00:00",
+            last_used_at=None,
+            expires_at=None,
+            superseded_by=None,
+        )
+        self.assertNotIn("workflow", memory_embedding_text(memory).split())
+        self.assertNotIn("workflow", _metadata_terms(memory))
+
+    def test_fts_search_does_not_match_type_only(self) -> None:
+        """P0: a memory is not retrievable solely because its type label matches."""
+        with isolated_env():
+            main(["init"])
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content="Use the blue deployment checklist before release.",
+                    tags=[],
+                    paths=[],
+                    status="active",
+                )
+                self.assertEqual(store.search_memories("workflow", project_id=project.id), [])
+
+    def test_session_summary_has_commands_not_test_commands(self) -> None:
+        """D4: SessionSummary has 'commands' (all raw commands), not 'test_commands'."""
+        from memassist.session import SessionSummary
+        import inspect
+        fields = [f for f in inspect.fields(SessionSummary)] if hasattr(inspect, "fields") else []
+        # Check that 'commands' field exists and 'test_commands' does not
+        summary = SessionSummary(
+            session_id="test",
+            event_count=0,
+            tools=[],
+            files=[],
+            commands=["npm test", "git commit"],
+            denied_events=0,
+            last_message=None,
+        )
+        self.assertEqual(summary.commands, ["npm test", "git commit"])
+        as_dict = summary.as_dict()
+        self.assertIn("commands", as_dict)
+        self.assertNotIn("test_commands", as_dict)
+
+    def test_build_judge_payload_includes_session_trace_signals(self) -> None:
+        """D4/D5: build_judge_payload includes raw_commands, touched_files, denied_tool_events."""
+        from memassist.memory_judge import build_judge_payload
+        from memassist.project import Project
+        from pathlib import Path
+        import tempfile
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            from memassist.project import detect_project
+            project = detect_project()
+            with Store() as store:
+                store.upsert_project(project)
+                store.add_trace_event(
+                    session_id="sess_judge_signals",
+                    project_id=project.id,
+                    event_type="pre_tool_use",
+                    tool_name="Bash",
+                    input_json={"command": "jest --testPathPattern=auth"},
+                    files=["src/auth/auth.test.ts"],
+                )
+                store.add_trace_event(
+                    session_id="sess_judge_signals",
+                    project_id=project.id,
+                    event_type="pre_tool_use",
+                    tool_name="apply_patch",
+                    input_json={"command": "*** Update File: src/auth/session.py"},
+                    files=["src/auth/session.py"],
+                    tool_decision="deny",
+                )
+                # Create a fake source event to build payload from
+                source_event_id = store.add_trace_event(
+                    session_id="sess_judge_signals",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={
+                        "content": "always ask before auth changes",
+                        "source_ref": "hook_payload",
+                        "source_kind": "hook_payload",
+                    },
+                )
+                source_event = dict(store.conn.execute(
+                    "SELECT * FROM trace_events WHERE id = ?", (source_event_id,)
+                ).fetchone())
+                payload = build_judge_payload(store, project=project, source_event=source_event)
+
+            # Must include session_trace with raw signals
+            self.assertIn("session_trace", payload)
+            trace = payload["session_trace"]
+            self.assertIn("raw_commands", trace)
+            self.assertIn("touched_files", trace)
+            self.assertIn("denied_tool_events", trace)
+            # The jest command should be in raw_commands
+            raw_cmds = trace["raw_commands"]
+            self.assertTrue(any("jest" in cmd for cmd in raw_cmds))
+            # The denial should be in denied_tool_events
+            denied = trace["denied_tool_events"]
+            self.assertTrue(any(ev.get("tool_decision") in {"deny", "block"} for ev in denied))
 
 class ClaudeMemoryJudgeTest(unittest.TestCase):
     @staticmethod
@@ -3336,48 +3594,41 @@ class ClaudeMemoryJudgeTest(unittest.TestCase):
     def test_parses_judge_json_from_claude_result_envelope(self) -> None:
         from memassist.memory_judge import _candidate_from_output
 
-        inner = {
-            "should_store": True,
-            "memory_content": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다",
-            "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
-            "memory_type": "rule",
-            "caution_level": "block",
-            "activation": "active",
-            "candidate_paths": [],
-            "meaning_preserved": True,
-            "contamination_risk": "low",
-            "reason": "durable directive",
-        }
+        inner = json.loads(
+            judge_fixture(
+                "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정한다",
+                source_quote="앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
+                memory_type="rule",
+                source_integrity="clean",
+                reason="durable directive",
+            )
+        )
         envelope = json.dumps({"type": "result", "subtype": "success", "result": json.dumps(inner, ensure_ascii=False)})
         candidate = _candidate_from_output(envelope)
-        self.assertTrue(candidate.should_store)
-        self.assertEqual(candidate.memory_type, "rule")
-        # durable/transient separation: the one-shot instruction is not in memory_content
-        self.assertNotIn("응답은 OK만 해", candidate.memory_content)
-        self.assertIn("리프레시 토큰", candidate.memory_content)
+        self.assertIsNotNone(candidate.memory)
+        self.assertEqual(candidate.memory.type, "rule")  # type: ignore[union-attr]
+        self.assertNotIn("응답은 OK만 해", candidate.memory.content)  # type: ignore[union-attr]
+        self.assertIn("리프레시 토큰", candidate.memory.content)  # type: ignore[union-attr]
 
     def test_parses_fenced_json_from_result_envelope(self) -> None:
         from memassist.memory_judge import _candidate_from_output
 
-        inner = {
-            "should_store": True,
-            "memory_content": "리프레시 토큰 변경 전 사용자 확인을 받는다",
-            "source_quote": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
-            "memory_type": "rule",
-            "caution_level": "block",
-            "activation": "active",
-            "candidate_paths": [],
-            "meaning_preserved": True,
-            "contamination_risk": "low",
-            "reason": "durable directive; one-shot response instruction excluded",
-        }
+        inner = json.loads(
+            judge_fixture(
+                "리프레시 토큰 변경 전 사용자 확인을 받는다",
+                source_quote="앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해. 응답은 OK만 해.",
+                memory_type="rule",
+                source_integrity="clean",
+                reason="durable directive; one-shot response instruction excluded",
+            )
+        )
         fenced = "```json\n" + json.dumps(inner, ensure_ascii=False) + "\n```"
         envelope = json.dumps({"type": "result", "subtype": "success", "result": fenced})
         candidate = _candidate_from_output(envelope)
-        self.assertTrue(candidate.should_store)
-        self.assertEqual(candidate.memory_type, "rule")
-        self.assertNotIn("응답은 OK", candidate.memory_content)
-        self.assertIn("리프레시 토큰", candidate.memory_content)
+        self.assertIsNotNone(candidate.memory)
+        self.assertEqual(candidate.memory.type, "rule")  # type: ignore[union-attr]
+        self.assertNotIn("응답은 OK", candidate.memory.content)  # type: ignore[union-attr]
+        self.assertIn("리프레시 토큰", candidate.memory.content)  # type: ignore[union-attr]
 
     def test_claude_judge_uses_configurable_low_cost_model(self) -> None:
         from memassist.memory_judge import ClaudeMemoryJudge
@@ -3394,21 +3645,10 @@ class ClaudeMemoryJudgeTest(unittest.TestCase):
     def test_parser_still_handles_raw_and_codex_jsonl(self) -> None:
         from memassist.memory_judge import _candidate_from_output
 
-        raw = {
-            "should_store": False,
-            "memory_content": "x",
-            "source_quote": "y",
-            "memory_type": "fact",
-            "caution_level": "none",
-            "activation": "rejected",
-            "candidate_paths": [],
-            "meaning_preserved": True,
-            "contamination_risk": "low",
-            "reason": "r",
-        }
-        self.assertFalse(_candidate_from_output(json.dumps(raw)).should_store)
+        raw = json.loads(no_memory_fixture(reason="r"))
+        self.assertIsNone(_candidate_from_output(json.dumps(raw)).memory)
         jsonl = json.dumps({"type": "item", "item": {"text": json.dumps(raw, ensure_ascii=False)}})
-        self.assertEqual(_candidate_from_output(jsonl).memory_type, "fact")
+        self.assertIsNone(_candidate_from_output(jsonl).memory)
 
 
 def tmpfile_root() -> Path:
@@ -3448,7 +3688,6 @@ def _insert_legacy_sqlite_only_memory(store: Store, *, project_id: str, status: 
         retrieval_count=0,
         utility=0.0,
         half_life_days=30.0,
-        caution_level="none",
         source_kind="legacy_sqlite_row",
         source_ref=None,
         created_at=ts,
@@ -3461,6 +3700,324 @@ def _insert_legacy_sqlite_only_memory(store: Store, *, project_id: str, status: 
     store.conn.commit()
     return memory_id
 
+
+class JudgeDuplicateReinforceTest(unittest.TestCase):
+    """D5: Judge path absorbs duplicate detection and reinforce_memory calls.
+
+    When the same content arrives via the judge a second time, it must not create
+    a new memory row but must call reinforce_memory so strength/recurrence rise.
+    """
+
+    def _fixture_response(self, content: str, memory_type: str = "directive") -> str:
+        return judge_fixture(content, memory_type=memory_type, source_integrity="clean", reason="test duplicate reinforce")
+
+    def test_exact_duplicate_via_judge_reinforces_existing_memory(self) -> None:
+        """Second judge call with same content reinforces instead of creating new row."""
+        from memassist.memory_judge import store_judge_result, MemoryJudgeResult, _candidate_from_output
+
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            content = "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해"
+
+            with Store() as store:
+                store.upsert_project(project)
+                # First call: stores the memory fresh
+                fixture = self._fixture_response(content)
+                candidate = _candidate_from_output(fixture)
+                result = MemoryJudgeResult(candidate, "fixture", [], {})
+                # Need a source event
+                source_event_id = store.add_trace_event(
+                    session_id="sess_reinforce_test",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={
+                        "content": content,
+                        "source_ref": "hook_payload",
+                        "source_kind": "hook_payload",
+                    },
+                )
+                first_id = store_judge_result(
+                    store,
+                    project=project,
+                    session_id="sess_reinforce_test",
+                    source_event_id=source_event_id,
+                    result=result,
+                )
+                self.assertIsNotNone(first_id)
+                first_memory = store.get_memory(first_id)
+                self.assertIsNotNone(first_memory)
+                initial_strength = first_memory.strength
+                initial_recurrence = first_memory.recurrence
+
+                # Second call: same content → should reinforce, not create new
+                source_event_id2 = store.add_trace_event(
+                    session_id="sess_reinforce_test",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={
+                        "content": content,
+                        "source_ref": "hook_payload",
+                        "source_kind": "hook_payload",
+                    },
+                )
+                second_id = store_judge_result(
+                    store,
+                    project=project,
+                    session_id="sess_reinforce_test",
+                    source_event_id=source_event_id2,
+                    result=result,
+                )
+                # Same memory ID returned (not a new one)
+                self.assertEqual(first_id, second_id)
+
+                # Only one memory row with this content
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                matching = [m for m in memories if m.content == content]
+                self.assertEqual(len(matching), 1)
+
+                # strength and recurrence must have increased
+                reinforced = store.get_memory(first_id)
+                self.assertIsNotNone(reinforced)
+                self.assertGreater(reinforced.strength, initial_strength,
+                    "strength should increase on reinforce")
+                self.assertGreater(reinforced.recurrence, initial_recurrence,
+                    "recurrence should increase on reinforce")
+
+                # lifecycle events should include a reinforce_duplicate decision
+                lifecycle_events = list(store.conn.execute(
+                    "SELECT decision FROM lifecycle_events WHERE memory_id = ?", (first_id,)
+                ).fetchall())
+                decisions = [row[0] for row in lifecycle_events]
+                self.assertIn("reinforce_duplicate", decisions)
+
+    def test_exact_duplicate_via_judge_reinforces_across_type_labels(self) -> None:
+        """P1: LLM-assigned type labels do not split exact duplicate memories."""
+        from memassist.memory_judge import store_judge_result, MemoryJudgeResult, _candidate_from_output
+
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            content = "배포 전에는 항상 블루 체크리스트를 확인한다"
+
+            with Store() as store:
+                store.upsert_project(project)
+                source_event_id = store.add_trace_event(
+                    session_id="sess_cross_type_exact",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={"content": content, "source_ref": "hook_payload"},
+                )
+                first = MemoryJudgeResult(
+                    _candidate_from_output(self._fixture_response(content, memory_type="directive")),
+                    "fixture",
+                    [],
+                    {},
+                )
+                first_id = store_judge_result(
+                    store,
+                    project=project,
+                    session_id="sess_cross_type_exact",
+                    source_event_id=source_event_id,
+                    result=first,
+                )
+                self.assertIsNotNone(first_id)
+                initial = store.get_memory(first_id)
+                self.assertIsNotNone(initial)
+
+                source_event_id2 = store.add_trace_event(
+                    session_id="sess_cross_type_exact",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={"content": content, "source_ref": "hook_payload"},
+                )
+                second = MemoryJudgeResult(
+                    _candidate_from_output(self._fixture_response(content, memory_type="fact")),
+                    "fixture",
+                    [],
+                    {},
+                )
+                second_id = store_judge_result(
+                    store,
+                    project=project,
+                    session_id="sess_cross_type_exact",
+                    source_event_id=source_event_id2,
+                    result=second,
+                )
+
+                self.assertEqual(first_id, second_id)
+                matching = [
+                    memory
+                    for memory in store.list_memories(project_id=project.id, include_global=False, status=None)
+                    if memory.content == content
+                ]
+                self.assertEqual(len(matching), 1)
+                reinforced = store.get_memory(first_id)
+                self.assertGreater(reinforced.recurrence, initial.recurrence)  # type: ignore[union-attr]
+
+    def test_judge_active_decision_is_not_type_whitelisted(self) -> None:
+        """P0: active status follows judge/risk signals, not a memory_type whitelist."""
+        from memassist.memory_judge import store_judge_result, MemoryJudgeResult, _candidate_from_output
+
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            project = detect_project()
+            content = "규칙 메모리도 judge가 active로 판단하면 active로 저장한다"
+
+            with Store() as store:
+                store.upsert_project(project)
+                source_event_id = store.add_trace_event(
+                    session_id="sess_rule_active",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={"content": content, "source_ref": "hook_payload"},
+                )
+                result = MemoryJudgeResult(
+                    _candidate_from_output(self._fixture_response(content, memory_type="rule")),
+                    "fixture",
+                    [],
+                    {},
+                )
+                memory_id = store_judge_result(
+                    store,
+                    project=project,
+                    session_id="sess_rule_active",
+                    source_event_id=source_event_id,
+                    result=result,
+                )
+                memory = store.get_memory(memory_id)
+                self.assertEqual(memory.status, "active")  # type: ignore[union-attr]
+
+    def test_semantic_duplicate_via_judge_suppresses_weak_candidate(self) -> None:
+        """Weaker candidate with overlapping content is suppressed and existing memory reinforced."""
+        from memassist.memory_judge import store_judge_result, MemoryJudgeResult, _candidate_from_output
+
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            project = detect_project()
+
+            with Store() as store:
+                store.upsert_project(project)
+                # Pre-existing strong active memory
+                active_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="directive",
+                    content="리프레시 토큰 변경 전에 항상 사용자에게 확인받는다",
+                    tags=["isolated_judge", "directive"],
+                    status="active",
+                    importance=0.85,
+                    confidence=0.85,
+                )
+                active_before = store.get_memory(active_id)
+                strength_before = active_before.strength
+                recurrence_before = active_before.recurrence
+
+                # Weaker candidate content that overlaps semantically
+                weak_content = "리프레시 토큰 변경 전에 사용자에게 확인받아야 한다"
+                fixture = judge_fixture(
+                    weak_content,
+                    memory_type="directive",
+                    source_integrity="uncertain",
+                    reason="weaker overlapping candidate",
+                )
+                candidate = _candidate_from_output(fixture)
+                result = MemoryJudgeResult(candidate, "fixture", [], {})
+                source_event_id = store.add_trace_event(
+                    session_id="sess_semantic_test",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={
+                        "content": weak_content,
+                        "source_ref": "hook_payload",
+                        "source_kind": "hook_payload",
+                    },
+                )
+                returned_id = store_judge_result(
+                    store,
+                    project=project,
+                    session_id="sess_semantic_test",
+                    source_event_id=source_event_id,
+                    result=result,
+                )
+
+                # No new memory created for weak_content
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                self.assertFalse(
+                    any(m.content == weak_content for m in memories),
+                    "Weak semantic duplicate should not create a new memory row",
+                )
+
+                # If suppression fired, returned_id points to existing active memory
+                # and strength/recurrence went up (or a new memory was stored if threshold not met)
+                if returned_id == active_id:
+                    active_after = store.get_memory(active_id)
+                    # strength should be >= before (reinforce was called)
+                    self.assertGreaterEqual(active_after.strength, strength_before)
+                    lifecycle_events = list(store.conn.execute(
+                        "SELECT decision FROM lifecycle_events WHERE memory_id = ?", (active_id,)
+                    ).fetchall())
+                    decisions = [row[0] for row in lifecycle_events]
+                    self.assertIn("suppress_semantic_duplicate", decisions)
+
+    def test_semantic_duplicate_via_judge_suppresses_across_type_labels(self) -> None:
+        """P1: semantic duplicate suppression does not gate on compatible type labels."""
+        from memassist.memory_judge import store_judge_result, MemoryJudgeResult, _candidate_from_output
+
+        with isolated_env() as (_root, project_dir, _home):
+            main(["init"])
+            project = detect_project()
+
+            with Store() as store:
+                store.upsert_project(project)
+                active_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="directive",
+                    content="배포 전에는 블루 체크리스트를 확인하고 릴리스한다",
+                    tags=["deploy", "checklist"],
+                    status="active",
+                    importance=0.85,
+                    confidence=0.85,
+                )
+                active_before = store.get_memory(active_id)
+                weak_content = "배포 전에는 블루 체크리스트를 확인하고 릴리스해야"
+                fixture = judge_fixture(
+                    weak_content,
+                    memory_type="fact",
+                    source_integrity="uncertain",
+                    reason="weaker overlapping candidate",
+                )
+                source_event_id = store.add_trace_event(
+                    session_id="sess_cross_type_semantic",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={"content": weak_content, "source_ref": "hook_payload"},
+                )
+                returned_id = store_judge_result(
+                    store,
+                    project=project,
+                    session_id="sess_cross_type_semantic",
+                    source_event_id=source_event_id,
+                    result=MemoryJudgeResult(_candidate_from_output(fixture), "fixture", [], {}),
+                )
+
+                self.assertEqual(returned_id, active_id)
+                self.assertFalse(
+                    any(
+                        memory.content == weak_content
+                        for memory in store.list_memories(project_id=project.id, include_global=False, status=None)
+                    )
+                )
+                active_after = store.get_memory(active_id)
+                self.assertGreater(active_after.recurrence, active_before.recurrence)  # type: ignore[union-attr]
 
 if __name__ == "__main__":
     unittest.main()
