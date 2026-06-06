@@ -87,9 +87,10 @@ def cleanup_memories(store: Store) -> CleanupResult:
 
     duplicates: list[str] = []
     active = [memory for memory in memories if memory.status == "active" and memory.id not in archived]
-    by_key: dict[tuple[str | None, str, str], Any] = {}
-    for memory in sorted(active, key=lambda item: item.updated_at or ""):
-        key = (memory.project_id, memory.type, memory.content.lower())
+    insertion_order = _memory_insertion_order(store)
+    by_key: dict[tuple[str | None, str], Any] = {}
+    for memory in sorted(active, key=lambda item: (item.updated_at or "", item.created_at or "", insertion_order.get(item.id, 0))):
+        key = (memory.project_id, memory.content.lower())
         newer = by_key.get(key)
         if newer is None:
             by_key[key] = memory
@@ -101,26 +102,9 @@ def cleanup_memories(store: Store) -> CleanupResult:
     return CleanupResult(archived=archived, duplicates=duplicates)
 
 
-def _store_decision(
-    store: Store,
-    decision: CandidateDecision,
-    *,
-    session_id: str | None,
-    project_id: str | None,
-) -> str:
-    candidate = decision.candidate
-    return store.add_memory(
-        scope_type="project" if project_id else "global",
-        project_id=project_id,
-        session_id=session_id,
-        type=candidate.type,
-        content=candidate.content,
-        reason=f"{candidate.reason} Lifecycle: {decision.reason}",
-        tags=[*candidate.tags, decision.memory_kind, decision.risk],
-        status=decision.status,
-        importance=candidate.importance,
-        confidence=candidate.confidence,
-        caution_level=decision.caution_level,
-        source_kind="lifecycle",
-        source_ref=session_id,
-    )
+def _memory_insertion_order(store: Store) -> dict[str, int]:
+    try:
+        rows = store.conn.execute("SELECT id FROM memories ORDER BY rowid ASC").fetchall()
+    except Exception:
+        return {}
+    return {str(row["id"]): index for index, row in enumerate(rows)}

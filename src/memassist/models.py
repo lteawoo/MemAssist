@@ -21,6 +21,13 @@ MEMORY_STATUSES = {
     "archived",
 }
 
+MEMORY_CHUNK_KINDS = {
+    "content",
+    "source_quote",
+    "reason",
+    "raw_source",
+}
+
 
 @dataclass(frozen=True)
 class Memory:
@@ -81,4 +88,46 @@ class Memory:
             "source_quote": self.source_quote,
             "source_ids": self.source_ids or [],
             "content_hash": self.content_hash,
+        }
+
+
+@dataclass(frozen=True)
+class MemoryChunk:
+    id: str
+    memory_id: str
+    project_id: str | None
+    scope_type: str
+    status: str
+    chunk_index: int
+    chunk_kind: str
+    content: str
+    content_hash: str
+    tags: list[str]
+    paths: list[str]
+    source_ids: list[str]
+    source_ref: str | None
+    start_offset: int | None
+    end_offset: int | None
+    created_at: str
+    indexed_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "memory_id": self.memory_id,
+            "project_id": self.project_id,
+            "scope_type": self.scope_type,
+            "status": self.status,
+            "chunk_index": self.chunk_index,
+            "chunk_kind": self.chunk_kind,
+            "content": self.content,
+            "content_hash": self.content_hash,
+            "tags": self.tags,
+            "paths": self.paths,
+            "source_ids": self.source_ids,
+            "source_ref": self.source_ref,
+            "start_offset": self.start_offset,
+            "end_offset": self.end_offset,
+            "created_at": self.created_at,
+            "indexed_at": self.indexed_at,
         }

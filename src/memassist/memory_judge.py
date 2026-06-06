@@ -26,7 +26,8 @@ JUDGE_ACTIVE_ENV = "MEMASSIST_MEMORY_JUDGE_ACTIVE"
 JUDGE_DEBUG_ENV = "MEMASSIST_MEMORY_JUDGE_DEBUG"
 JUDGE_FIXTURE_ENV = "MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"
 JUDGE_TIMEOUT_ENV = "MEMASSIST_MEMORY_JUDGE_TIMEOUT"
-MAX_SOURCE_CHARS = 600
+MAX_JUDGE_SOURCE_CHARS = 600
+MAX_JUDGE_SOURCE_CHUNK_CHARS = 1200
 MAX_HINTS = 8
 MAX_DEBUG_CHARS = 4000
 MAX_JUDGE_ATTEMPTS = 3
@@ -115,7 +116,7 @@ def extract_turn_end_memory_source(
     direct = _payload_prompt(payload)
     if direct:
         return TurnEndMemorySource(
-            content=direct[:MAX_SOURCE_CHARS],
+            content=direct,
             source_ref="hook_payload",
             source_kind="hook_payload",
         )
@@ -124,14 +125,14 @@ def extract_turn_end_memory_source(
         transcript = _latest_user_prompt_from_transcript(Path(transcript_path))
         if transcript:
             return TurnEndMemorySource(
-                content=transcript[:MAX_SOURCE_CHARS],
+                content=transcript,
                 source_ref=transcript_path,
                 source_kind="transcript",
             )
     history = _latest_user_prompt_from_codex_history(session_id)
     if history:
         return TurnEndMemorySource(
-            content=history[:MAX_SOURCE_CHARS],
+            content=history,
             source_ref=f"codex_history:{session_id}",
             source_kind="codex_history",
         )
@@ -254,7 +255,8 @@ def build_judge_payload(
     source_event: dict[str, Any],
 ) -> dict[str, object]:
     input_json = _event_input(source_event)
-    content = str(input_json.get("content") or "")[:MAX_SOURCE_CHARS]
+    full_content = str(input_json.get("content") or "")
+    content = full_content[:MAX_JUDGE_SOURCE_CHARS]
     session_id = str(source_event.get("session_id") or "")
     recent_files = _recent_files(store, session_id=session_id)
     trace_signals = _session_trace_signals(store, session_id=session_id)
@@ -265,6 +267,9 @@ def build_judge_payload(
             "source_hash": str(input_json.get("source_hash") or ""),
             "role": "user",
             "content": content,
+            "content_chunks": _judge_source_chunks(full_content),
+            "content_chars": len(full_content),
+            "content_truncated": len(full_content) > len(content),
             "source_ref": str(input_json.get("source_ref") or source_event["id"]),
             "source_kind": str(input_json.get("source_kind") or source_event.get("event_type") or "unknown"),
         },
@@ -365,6 +370,8 @@ def _build_judge_instruction(payload: dict[str, object]) -> str:
         "source_integrity, reject_reason string, and reason string. "
         "Do not return file path predictions. Use only source_event, project_hints, and session_trace. "
         "Do not infer from assistant responses or retrieved memory. "
+        "source_event.content is a preview; when source_event.content_chunks exists, scan all chunks in order "
+        "before deciding whether durable memory exists. "
         "Write memory.content as only the persistent future memory in the user's source language when possible. "
         "Do not include one-shot current-turn instructions, output formatting requests, or commands like "
         "'respond only OK' in memory.content unless the user explicitly asks to remember that response format "
@@ -519,7 +526,7 @@ def store_judge_result(
     if candidate.source_integrity == "contaminated":
         return None
     memory_type = candidate.memory.type if candidate.memory.type in MEMORY_TYPES else "preference"
-    content = (candidate.memory.content.strip() or candidate.memory.source_quote.strip())[:500]
+    content = candidate.memory.content.strip() or candidate.memory.source_quote.strip()
     if not content:
         return None
     source_event = _trace_event_by_id(store, source_event_id) or {}
@@ -790,7 +797,7 @@ def _payload_prompt(payload: dict[str, Any]) -> str:
     for key in ("prompt", "message", "content", "user_prompt", "userPrompt"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
-            return " ".join(value.strip().split())
+            return value
     return ""
 
 
@@ -810,7 +817,7 @@ def _latest_user_prompt_from_transcript(path: Path) -> str:
                     latest = candidate
     except OSError:
         return ""
-    return " ".join(latest.strip().split())
+    return latest
 
 
 def _user_text_from_transcript_obj(obj: object) -> str:
@@ -870,7 +877,72 @@ def _latest_user_prompt_from_codex_history(session_id: str) -> str:
                     latest = text
     except OSError:
         return ""
-    return " ".join(latest.strip().split())
+    return latest
+
+
+def _session_trace_signals(store: Store, *, session_id: str) -> dict[str, object]:
+    raw_commands: list[str] = []
+    touched_files: list[str] = []
+    denied_tool_events: list[dict[str, object]] = []
+    seen_commands: set[str] = set()
+    seen_files: set[str] = set()
+    for event in store.trace_events(session_id, limit=100):
+        try:
+            payload = json.loads(event["input_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        command = payload.get("command")
+        if not isinstance(command, str):
+            tool_input = payload.get("tool_input") or payload.get("toolInput")
+            if isinstance(tool_input, dict):
+                command = tool_input.get("command")
+        if isinstance(command, str) and command.strip() and command not in seen_commands:
+            seen_commands.add(command)
+            raw_commands.append(command[:300])
+
+        try:
+            files = json.loads(event["files_json"] or "[]")
+        except json.JSONDecodeError:
+            files = []
+        for file in files:
+            if isinstance(file, str) and file not in seen_files:
+                seen_files.add(file)
+                touched_files.append(file)
+
+        if event["tool_decision"] in {"block", "deny"}:
+            denied_tool_events.append(
+                {
+                    "tool_name": event["tool_name"] or "",
+                    "tool_decision": event["tool_decision"],
+                }
+            )
+    return {
+        "raw_commands": raw_commands[:MAX_HINTS],
+        "touched_files": touched_files[:MAX_HINTS],
+        "denied_tool_events": denied_tool_events[:MAX_HINTS],
+    }
+
+
+def _judge_source_chunks(text: str) -> list[dict[str, object]]:
+    if not text:
+        return []
+    chunks: list[dict[str, object]] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + MAX_JUDGE_SOURCE_CHUNK_CHARS)
+        chunks.append(
+            {
+                "index": len(chunks),
+                "start": start,
+                "end": end,
+                "text": text[start:end],
+            }
+        )
+        start = end
+    return chunks
 
 
 def _recent_files(store: Store, *, session_id: str) -> list[str]:

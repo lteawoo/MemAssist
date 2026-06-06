@@ -6,6 +6,7 @@ from sqlite3 import Row
 from typing import Any
 
 from .session import summarize_session
+from .trace import command_is_test
 
 
 @dataclass(frozen=True)
@@ -31,8 +32,9 @@ class MemoryCandidate:
 def extract_candidates(events: list[Row]) -> list[MemoryCandidate]:
     summary = summarize_session(events)
     candidates: list[MemoryCandidate] = []
-    if summary.test_commands:
-        commands = ", ".join(sorted(set(summary.test_commands)))
+    test_commands = [command for command in summary.commands if command_is_test(command)]
+    if test_commands:
+        commands = ", ".join(sorted(set(test_commands)))
         candidates.append(
             MemoryCandidate(
                 type="workflow",

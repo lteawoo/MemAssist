@@ -104,6 +104,14 @@ Injected memory context SHALL be derived from stored memory records and their so
 - **AND** memassist SHALL keep the source quote or source reference available in the memory pack or storage record for audit
 - **AND** memassist SHALL NOT require a compact summary file to satisfy retrieval
 
+#### Scenario: Source quote can recall without being injected
+- **GIVEN** an active memory has normalized `content` and original-language `source_quote`
+- **AND** the current prompt matches only the `source_quote`
+- **WHEN** memassist retrieves memory context
+- **THEN** memassist SHALL be allowed to use the `source_quote` as retrieval evidence
+- **AND** memassist SHALL inject the normalized memory `content`
+- **AND** memassist SHALL NOT inject the `source_quote` as default prompt context
+
 ### Requirement: memassist SHALL retrieve from source-grounded Markdown-backed records
 Prompt-time retrieval MAY use SQLite for speed, but each injected memory SHALL represent an active Markdown-backed record whose content and source evidence can be audited from the authoritative artifact.
 
@@ -119,6 +127,13 @@ Prompt-time retrieval MAY use SQLite for speed, but each injected memory SHALL r
 - **AND** SQLite index state is missing or stale
 - **WHEN** memassist rebuilds the memory index
 - **THEN** later prompt retrieval SHALL find the active memory through the rebuilt index
+
+#### Scenario: Long memory content is retrieved through chunks
+- **GIVEN** an active Markdown memory artifact has content longer than the prompt context budget
+- **AND** a relevant phrase appears only in a later chunk
+- **WHEN** a prompt matches that later phrase
+- **THEN** memassist SHALL retrieve the parent memory through its chunk index
+- **AND** memassist SHALL inject a budgeted excerpt or normalized content without dropping the parent memory
 
 ### Requirement: memassist SHALL use hybrid retrieval as the default memory retrieval engine
 
@@ -219,4 +234,3 @@ Embedding profiles, vector rankings, and retrieval diagnostics SHALL affect only
 - **WHEN** a `PreToolUse` hook observes a tool call touching that path
 - **THEN** memassist SHALL NOT warn or block because of embedding retrieval
 - **AND** memassist SHALL record the event as trace data only
-

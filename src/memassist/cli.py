@@ -103,7 +103,6 @@ def build_parser() -> argparse.ArgumentParser:
     mem_search.set_defaults(func=cmd_memory_search)
 
     mem_rebuild = memory_sub.add_parser("rebuild-index", help="rebuild SQLite search index from Markdown memories")
-    mem_rebuild.add_argument("--profile")
     mem_rebuild.add_argument("--json", action="store_true")
     mem_rebuild.set_defaults(func=cmd_memory_rebuild_index)
 
@@ -381,9 +380,9 @@ def cmd_memory_search(args: argparse.Namespace) -> int:
 
 def cmd_memory_rebuild_index(args: argparse.Namespace) -> int:
     with _store() as store:
-        indexed = store.rebuild_memory_index_from_artifacts(embedding_profile_id=args.profile)
+        indexed = store.rebuild_memory_index_from_artifacts()
     if args.json:
-        _print_json({"indexed": indexed, "count": len(indexed), "profile_id": args.profile})
+        _print_json({"indexed": indexed, "count": len(indexed)})
     else:
         print(f"Indexed {len(indexed)} memories from Markdown.")
     return 0
@@ -677,7 +676,7 @@ def cmd_session(args: argparse.Namespace) -> int:
         print(f"Events: {summary.event_count}")
         print("Tools: " + (", ".join(summary.tools) if summary.tools else "-"))
         print("Files: " + (", ".join(summary.files) if summary.files else "-"))
-        print("Tests: " + (", ".join(summary.test_commands) if summary.test_commands else "-"))
+        print("Commands: " + (", ".join(summary.commands) if summary.commands else "-"))
         print(f"Denied events: {summary.denied_events}")
     return 0
 
@@ -915,7 +914,15 @@ def cmd_embedding_build(args: argparse.Namespace) -> int:
         except EmbeddingProfileError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        result = build_memory_embeddings(store, project_id=project.id, profile=profile)
+        previous_allow_download = os.environ.get("MEMASSIST_EMBEDDING_ALLOW_DOWNLOAD")
+        os.environ["MEMASSIST_EMBEDDING_ALLOW_DOWNLOAD"] = "1"
+        try:
+            result = build_memory_embeddings(store, project_id=project.id, profile=profile)
+        finally:
+            if previous_allow_download is None:
+                os.environ.pop("MEMASSIST_EMBEDDING_ALLOW_DOWNLOAD", None)
+            else:
+                os.environ["MEMASSIST_EMBEDDING_ALLOW_DOWNLOAD"] = previous_allow_download
     if args.json:
         _print_json(result)
     else:
@@ -923,6 +930,8 @@ def cmd_embedding_build(args: argparse.Namespace) -> int:
         print(f"status: {result['status']}")
         print(f"built: {len(result['built'])}")
         print(f"skipped: {len(result['skipped'])}")
+        print(f"chunk built: {len(result.get('chunk_built', []))}")
+        print(f"chunk skipped: {len(result.get('chunk_skipped', []))}")
     return 0 if result.get("status") in {"ok", "partial"} else 1
 
 

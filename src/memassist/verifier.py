@@ -7,6 +7,7 @@ from typing import Any
 from .models import Memory
 from .verification_config import VerificationConfig
 from .session import summarize_session
+from .trace import command_is_test
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,8 @@ def verify_session(
         if memory.type == "workflow" or "verification" in memory.tags or "test" in memory.tags
     ]
     requires_tests = bool(verifier_memories or verification_config.verification_commands)
-    if requires_tests and not summary.test_commands and not summary.denied_events:
+    test_commands = [command for command in summary.commands if command_is_test(command)]
+    if requires_tests and not test_commands and not summary.denied_events:
         issues.append("Verification workflow is configured but no test command was recorded.")
 
     return VerificationResult(

@@ -18,16 +18,16 @@ from memassist.embedding_profiles import (
     load_embedding_profile_config,
     save_embedding_profile_config,
 )
-from memassist.embeddings import register_embedding_provider
+from memassist.embeddings import build_memory_embeddings, register_embedding_provider
 from memassist.evaluator import evaluate_candidate
 from memassist.extraction import MemoryCandidate, extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from memassist.memory_artifacts import find_memory_artifact
-from memassist.memory_judge import INTERPRETER_ACTIVE_ENV
+from memassist.memory_judge import INTERPRETER_ACTIVE_ENV, build_judge_payload, observe_turn_end_memory_source
 from memassist.models import MEMORY_STATUSES, Memory
 from memassist.verification_config import default_verification_config_yaml, load_verification_config
 from memassist.project import detect_project, detect_project_for_init
-from memassist.retrieval import analyze_query_intent, build_memory_pack
+from memassist.retrieval import analyze_query_intent, build_memory_pack, render_prompt_context
 from memassist.source_ledger import load_source_records
 from memassist.storage import Store, now_iso
 from memassist.trace import extract_files
@@ -1583,6 +1583,10 @@ class MemassistTest(unittest.TestCase):
                 memory = store.get_memory(memory_id)
                 self.assertIsNotNone(memory)
                 profile = load_embedding_profile_config(store.path.parent).active_profile
+                summary = store.embedding_cache_summary(profile_id="test-local")
+                self.assertEqual(0, summary["row_count"])
+                self.assertEqual(0, summary["chunk_row_count"])
+                build_memory_embeddings(store, project_id=project.id, profile=profile)
                 rows, stats = store.memory_embedding_rows_for_profile(
                     project_id=project.id,
                     profile=profile,
@@ -1619,6 +1623,8 @@ class MemassistTest(unittest.TestCase):
                     tags=["verification", "retrieval"],
                     status="active",
                 )
+                profile = load_embedding_profile_config(store.path.parent).active_profile
+                build_memory_embeddings(store, project_id=project.id, profile=profile)
                 pack = build_memory_pack(store, query="hybrid retrieval verification", project_id=project.id)
             payload = pack.as_dict()
             diagnostics = payload["diagnostics"]
@@ -1681,6 +1687,22 @@ class MemassistTest(unittest.TestCase):
             payload = pack.as_dict()
             self.assertEqual("missing_dependency", payload["diagnostics"]["vector_status"])
             self.assertTrue(payload["context"])
+
+    def test_embedding_download_allowed_only_by_explicit_build_env(self) -> None:
+        from memassist.embeddings import _embedding_download_allowed
+
+        profile = EmbeddingProfile(
+            id="download-option",
+            provider="model2vec",
+            model="example/model",
+            quantization="int8",
+            dimension=256,
+            options={"allow_download": True},
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(_embedding_download_allowed(profile))
+            os.environ["MEMASSIST_EMBEDDING_ALLOW_DOWNLOAD"] = "1"
+            self.assertTrue(_embedding_download_allowed(profile))
 
     def test_none_profile_reports_disabled_vector_status(self) -> None:
         with isolated_env():
@@ -1747,7 +1769,126 @@ class MemassistTest(unittest.TestCase):
                 self.assertEqual("test-local", compare["profiles"][0]["profile_id"])
             with patch("sys.stdout", StringIO()) as out:
                 self.assertEqual(main(["embedding", "cleanup", "--profile", "test-local", "--json"]), 0)
-                self.assertEqual(1, json.loads(out.getvalue())["removed"])
+                self.assertEqual(2, json.loads(out.getvalue())["removed"])
+
+    def test_source_ledger_preserves_full_text_and_judge_gets_preview(self) -> None:
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            late_memory = "후반부에만 있는 지속 메모리: 리프레시 토큰 변경 전에는 반드시 사용자에게 물어본다."
+            content = ("  앞부분은 일회성 작업 설명이며 지속 메모리가 아니다. " * 80) + late_memory + "\n\t"
+            with Store() as store:
+                source_event = observe_turn_end_memory_source(
+                    store,
+                    session_id="sess_full_source",
+                    project_id=project.id,
+                    payload={"prompt": content},
+                )
+                self.assertIsNotNone(source_event)
+                row = store.trace_events("sess_full_source")[0]
+                payload = build_judge_payload(store, project=project, source_event=dict(row))
+
+            records = load_source_records(project_dir / ".memassist")
+            self.assertEqual(1, len(records))
+            self.assertEqual(content, records[0].text)
+            self.assertGreater(len(records[0].text), 1000)
+            source_payload = payload["source_event"]  # type: ignore[index]
+            self.assertTrue(source_payload["content_truncated"])  # type: ignore[index]
+            self.assertLessEqual(len(source_payload["content"]), 600)  # type: ignore[index]
+            self.assertNotIn(late_memory, source_payload["content"])  # type: ignore[index]
+            chunks = source_payload["content_chunks"]  # type: ignore[index]
+            self.assertGreater(len(chunks), 1)
+            self.assertEqual(content, "".join(str(chunk["text"]) for chunk in chunks))  # type: ignore[index]
+            self.assertTrue(any(late_memory in str(chunk["text"]) for chunk in chunks))  # type: ignore[index]
+
+    def test_memory_chunks_retrieve_long_memory_and_budget_prompt_context(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with patch("sys.stdout", StringIO()):
+                main(["embedding", "activate", "none"])
+            early = "초기 정책은 데이터베이스 마이그레이션을 먼저 검토한다. " * 30
+            late = "후반 정책은 벡터 검색 전에 chunk FTS recall을 반드시 확인한다."
+            long_content = early + late
+            with Store() as store:
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="workflow",
+                    content=long_content,
+                    tags=["retrieval"],
+                    status="active",
+                )
+                chunks = store.search_memory_chunks("chunk FTS recall", project_id=project.id)
+                self.assertTrue(any(chunk.memory_id == memory_id for chunk in chunks))
+                pack = build_memory_pack(store, query="chunk FTS recall", project_id=project.id)
+                rendered = render_prompt_context(pack, max_chars=520)
+
+            self.assertTrue(any(memory.id == memory_id for memory in pack.context))
+            self.assertLessEqual(len(rendered), 520)
+            self.assertIn("chunk FTS recall", rendered)
+            self.assertNotEqual(long_content, rendered)
+
+    def test_raw_source_chunks_are_evidence_not_default_retrieval_context(self) -> None:
+        from memassist.source_ledger import append_source_record
+
+        with isolated_env() as (_root, project_dir, _home):
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with patch("sys.stdout", StringIO()):
+                main(["embedding", "activate", "none"])
+            with Store() as store:
+                record = append_source_record(
+                    project_dir / ".memassist",
+                    kind="hook_payload",
+                    text="raw-only sentinel should remain evidence, not automatic context",
+                    session_id="sess_raw_source",
+                    project_id=project.id,
+                    source_ref="hook_payload",
+                )
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Store normalized durable memories as the primary recall target.",
+                    tags=["memory"],
+                    status="active",
+                    source_ids=[record.id],
+                )
+                default_chunks = store.search_memory_chunks("raw-only sentinel", project_id=project.id)
+                evidence_chunks = store.search_memory_chunks("raw-only sentinel", project_id=project.id, include_raw=True)
+                pack = build_memory_pack(store, query="raw-only sentinel", project_id=project.id)
+
+            self.assertEqual([], default_chunks)
+            self.assertTrue(any(chunk.memory_id == memory_id and chunk.chunk_kind == "raw_source" for chunk in evidence_chunks))
+            self.assertFalse(any(memory.id == memory_id for memory in pack.context))
+
+    def test_source_quote_recall_does_not_inject_source_quote(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with patch("sys.stdout", StringIO()):
+                main(["embedding", "activate", "none"])
+            source_quote = "리프레쉬 토큰 정책은 담부터 묻지 않고 고치지마"
+            content = "Do not change refresh token policy without asking first."
+            with Store() as store:
+                memory_id = store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="directive",
+                    content=content,
+                    source_quote=source_quote,
+                    status="active",
+                )
+                chunks = store.search_memory_chunks("리프레시 토큰 15분", project_id=project.id)
+                pack = build_memory_pack(store, query="리프레시 토큰 15분으로 변경해줘", project_id=project.id)
+                rendered = render_prompt_context(pack)
+
+            self.assertTrue(any(chunk.memory_id == memory_id and chunk.chunk_kind == "source_quote" for chunk in chunks))
+            self.assertTrue(any(memory.id == memory_id for memory in pack.context))
+            self.assertIn(content, rendered)
+            self.assertNotIn(source_quote, rendered)
+            self.assertFalse(any(snippet.chunk_kind == "source_quote" for snippet in pack.snippets))
 
     def test_embedding_profile_diagnostics_do_not_create_pretool_policy(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -1903,14 +2044,19 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(code, 0)
             result = json.loads(out.getvalue())
             lifecycle = result["lifecycle"]
-            self.assertGreaterEqual(len(lifecycle["candidates"]), 1)
-            self.assertTrue(any(decision["risk"] == "medium" for decision in lifecycle["decisions"]))
+            self.assertEqual(len(lifecycle["candidates"]), 0)
+            self.assertEqual(len(lifecycle["decisions"]), 0)
 
             out = StringIO()
             with patch("sys.stdout", out):
                 main(["memory", "list", "--all", "--json"])
             memories = json.loads(out.getvalue())
-            self.assertTrue(any(memory["status"] == "candidate" for memory in memories))
+            heuristic_candidates = [
+                memory
+                for memory in memories
+                if memory.get("source_kind") in {"lifecycle", "extracted"} and memory.get("status") == "candidate"
+            ]
+            self.assertEqual(len(heuristic_candidates), 0)
 
     def test_extract_candidates_ignores_assistant_echo_memory_wording(self) -> None:
         with isolated_env():
@@ -2917,8 +3063,8 @@ class MemassistTest(unittest.TestCase):
             result = json.loads(out.getvalue())
             self.assertEqual(result["session_id"], "sess_daemon")
             self.assertTrue(result["eval"]["passed"])
-            self.assertGreaterEqual(len(result["stored_candidates"]), 1)
-            self.assertGreaterEqual(len(result["lifecycle"]["active"]), 1)
+            self.assertEqual(len(result["stored_candidates"]), 0)
+            self.assertEqual(len(result["lifecycle"]["active"]), 0)
 
             with Store() as store:
                 self.assertEqual(store.get_memory(expired_id).status, "archived")  # type: ignore[union-attr]
@@ -2952,7 +3098,7 @@ class MemassistTest(unittest.TestCase):
                 code = main(["daemon", "once", "--session", "sess_repeat", "--json"])
             self.assertEqual(code, 0)
             result = json.loads(out.getvalue())
-            self.assertEqual(result["lifecycle"]["duplicates"], 1)
+            self.assertEqual(result["lifecycle"]["duplicates"], 0)
             with Store() as store:
                 memory = store.get_memory(memory_id)
                 self.assertEqual(memory.status, "active")  # type: ignore[union-attr]
@@ -3926,6 +4072,45 @@ class JudgeDuplicateReinforceTest(unittest.TestCase):
                 )
                 memory = store.get_memory(memory_id)
                 self.assertEqual(memory.status, "active")  # type: ignore[union-attr]
+
+    def test_judge_result_preserves_long_memory_content_without_truncation(self) -> None:
+        from memassist.memory_judge import store_judge_result
+
+        with isolated_env() as (_root, _project_dir, _home):
+            main(["init"])
+            with patch("sys.stdout", StringIO()):
+                main(["embedding", "activate", "none"])
+            project = detect_project()
+            content = " ".join(
+                [
+                    "앞으로 인증 정책 변경 시에는 사용자 확인을 먼저 받고,",
+                    "변경 이유와 영향 범위를 기록하고,",
+                    "릴리스 전 회귀 테스트와 보안 체크리스트를 함께 실행한다.",
+                ]
+                * 20
+            )
+
+            with Store() as store:
+                store.upsert_project(project)
+                source_event_id = store.add_trace_event(
+                    session_id="sess_long_memory",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={"content": content, "source_ref": "hook_payload"},
+                )
+                memory_id = store_judge_result(
+                    store,
+                    project=project,
+                    session_id="sess_long_memory",
+                    source_event_id=source_event_id,
+                    result=self._judge_result(content, memory_type="workflow"),
+                )
+
+                memory = store.get_memory(memory_id)
+                self.assertIsNotNone(memory)
+                self.assertEqual(content, memory.content)  # type: ignore[union-attr]
+                self.assertGreater(len(memory.content), 500)  # type: ignore[union-attr]
 
     def test_semantic_duplicate_via_judge_suppresses_weak_candidate(self) -> None:
         """Weaker candidate with overlapping content is suppressed and existing memory reinforced."""

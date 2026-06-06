@@ -8,10 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
-MAX_SOURCE_TEXT_CHARS = 1000
-
-
 @dataclass(frozen=True)
 class SourceRecord:
     id: str
@@ -60,8 +56,8 @@ def append_source_record(
     source_ref: str | None = None,
     summary: str | None = None,
 ) -> SourceRecord:
-    compact_text = " ".join(text.split())[:MAX_SOURCE_TEXT_CHARS]
-    source_hash = hash_source(kind=kind, text=compact_text, source_ref=source_ref)
+    full_text = text
+    source_hash = hash_source(kind=kind, text=full_text, source_ref=source_ref)
     existing = find_source_record(memassist_dir, source_hash=source_hash)
     if existing:
         return existing
@@ -72,7 +68,7 @@ def append_source_record(
         project_id=project_id,
         source_ref=source_ref,
         source_hash=source_hash,
-        text=compact_text,
+        text=full_text,
         summary=summary,
         created_at=now_iso(),
     )
@@ -113,7 +109,7 @@ def find_source_record(memassist_dir: Path, *, source_hash: str) -> SourceRecord
 
 def hash_source(*, kind: str, text: str, source_ref: str | None = None) -> str:
     payload = json.dumps(
-        {"kind": kind, "source_ref": source_ref, "text": " ".join(text.split())},
+        {"kind": kind, "source_ref": source_ref, "text": text},
         ensure_ascii=False,
         sort_keys=True,
     )

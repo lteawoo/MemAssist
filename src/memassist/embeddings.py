@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import math
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from pathlib import Path
+from typing import Callable, Iterator, Protocol
 
+from .chunks import chunk_embedding_text
 from .embedding_profiles import EmbeddingProfile, get_embedding_profile
-from .models import Memory
+from .models import Memory, MemoryChunk
 from .storage import Store
 
 
@@ -68,6 +72,30 @@ class VectorSearchResult:
         }
 
 
+@dataclass(frozen=True)
+class ChunkVectorSearchResult:
+    chunks: list[MemoryChunk]
+    status: str
+    profile: EmbeddingProfile
+    row_count: int = 0
+    stale_count: int = 0
+    error: str | None = None
+
+    def diagnostics(self) -> dict[str, object]:
+        return {
+            "profile_id": self.profile.id,
+            "profile_fingerprint": self.profile.fingerprint,
+            "provider": self.profile.provider,
+            "model": self.profile.model,
+            "quantization": self.profile.quantization,
+            "dimension": self.profile.dimension,
+            "status": self.status,
+            "row_count": self.row_count,
+            "stale_count": self.stale_count,
+            "error": self.error,
+        }
+
+
 class EmbeddingProvider(Protocol):
     profile: EmbeddingProfile
     dimension: int
@@ -107,7 +135,6 @@ def memory_embedding_text(memory: Memory) -> str:
         part
         for part in [
             memory.content,
-            memory.type,
             " ".join(memory.tags),
             " ".join(memory.paths),
         ]
@@ -151,6 +178,42 @@ def ensure_memory_embedding(
     )
 
 
+def ensure_memory_chunk_embedding(
+    store: Store,
+    chunk: MemoryChunk,
+    profile: EmbeddingProfile | None = None,
+) -> EmbeddingResult | None:
+    profile = profile or selected_embedding_profile(store=store)
+    if profile.disabled:
+        return None
+    try:
+        provider = instantiate_embedding_provider(profile)
+        vector = provider.embed(profile.document_text(chunk_embedding_text(chunk)))
+    except EmbeddingProviderError:
+        return None
+    except Exception:
+        return None
+    if not vector:
+        return None
+    dimension = len(vector)
+    if profile.dimension is not None and profile.dimension > 0 and profile.dimension != dimension:
+        return None
+    store.upsert_memory_chunk_embedding(
+        chunk,
+        profile=profile,
+        embedding=vector,
+    )
+    return EmbeddingResult(
+        profile_id=profile.id,
+        profile_fingerprint=profile.fingerprint,
+        provider=profile.provider,
+        model=profile.model,
+        quantization=profile.quantization,
+        dimension=dimension,
+        vector=vector,
+    )
+
+
 def build_memory_embeddings(
     store: Store,
     *,
@@ -177,11 +240,22 @@ def build_memory_embeddings(
         else:
             skipped.append(memory.id)
             errors.append({"memory_id": memory.id, "error": "embedding_not_created"})
+    chunk_built: list[str] = []
+    chunk_skipped: list[str] = []
+    for chunk in store.list_memory_chunks(project_id=project_id, include_global=True, status="active"):
+        result = ensure_memory_chunk_embedding(store, chunk, profile=profile)
+        if result:
+            chunk_built.append(chunk.id)
+        else:
+            chunk_skipped.append(chunk.id)
+            errors.append({"chunk_id": chunk.id, "error": "chunk_embedding_not_created"})
     return {
         "profile_id": profile.id,
         "status": "ok" if not errors else "partial",
         "built": built,
         "skipped": skipped,
+        "chunk_built": chunk_built,
+        "chunk_skipped": chunk_skipped,
         "errors": errors,
     }
 
@@ -232,6 +306,54 @@ def vector_search(
     )
 
 
+def vector_search_chunks(
+    store: Store,
+    *,
+    query: str,
+    project_id: str,
+    profile: EmbeddingProfile | None = None,
+    limit: int = 10,
+    include_raw: bool = False,
+) -> ChunkVectorSearchResult:
+    profile = profile or selected_embedding_profile(store=store)
+    if profile.disabled:
+        return ChunkVectorSearchResult([], "disabled", profile)
+    try:
+        provider = instantiate_embedding_provider(profile)
+        query_vector = provider.embed(profile.query_text(query))
+    except EmbeddingProviderError as exc:
+        return ChunkVectorSearchResult([], exc.status, profile, error=str(exc))
+    except Exception as exc:
+        return ChunkVectorSearchResult([], "encode_error", profile, error=str(exc))
+    if not query_vector:
+        return ChunkVectorSearchResult([], "encode_error", profile, error="query embedding is empty")
+    dimension = len(query_vector)
+    if profile.dimension is not None and profile.dimension > 0 and profile.dimension != dimension:
+        return ChunkVectorSearchResult([], "incompatible_dimension", profile, error=f"expected {profile.dimension}, got {dimension}")
+    rows, stats = store.memory_chunk_embedding_rows_for_profile(
+        project_id=project_id,
+        profile=profile,
+        dimension=dimension,
+        include_raw=include_raw,
+    )
+    if not rows:
+        status = "stale_cache" if stats.get("stale_count", 0) else "missing_cache"
+        return ChunkVectorSearchResult([], status, profile, row_count=int(stats.get("row_count", 0)), stale_count=int(stats.get("stale_count", 0)))
+    scored: list[tuple[float, MemoryChunk]] = []
+    for row in rows:
+        score = cosine_similarity(query_vector, row["embedding"])
+        if score > 0:
+            scored.append((score, row["chunk"]))
+    chunks = [chunk for _score, chunk in sorted(scored, key=lambda item: item[0], reverse=True)[:limit]]
+    return ChunkVectorSearchResult(
+        chunks,
+        "ok",
+        profile,
+        row_count=int(stats.get("row_count", len(rows))),
+        stale_count=int(stats.get("stale_count", 0)),
+    )
+
+
 def cosine_similarity(left: list[float], right: list[float]) -> float:
     if len(left) != len(right) or not left:
         return 0.0
@@ -250,8 +372,21 @@ class Model2VecEmbeddingProvider:
             from model2vec import StaticModel  # type: ignore[import-not-found]
         except ImportError as exc:
             raise EmbeddingMissingDependencyError("model2vec is not installed") from exc
+        allow_download = _embedding_download_allowed(profile)
+        if not allow_download and not _model2vec_model_available(profile.model):
+            raise EmbeddingMissingModelError(
+                f"embedding model is not installed locally: {profile.model}; run `memassist embedding build --profile {profile.id}`"
+            )
         try:
-            self.model = StaticModel.from_pretrained(profile.model)
+            quantize_to = profile.quantization if profile.quantization not in {"", "none"} else None
+            with _hf_offline_unless_download_allowed(profile):
+                self.model = StaticModel.from_pretrained(
+                    profile.model,
+                    normalize=profile.normalize,
+                    quantize_to=quantize_to,
+                    dimensionality=profile.dimension,
+                    force_download=False,
+                )
         except Exception as exc:
             raise EmbeddingMissingModelError(str(exc)) from exc
         self.dimension = int(profile.dimension or getattr(self.model, "dim", 0) or 0)
@@ -272,8 +407,13 @@ class SentenceTransformersEmbeddingProvider:
             from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
         except ImportError as exc:
             raise EmbeddingMissingDependencyError("sentence-transformers is not installed") from exc
+        if not _embedding_download_allowed(profile) and not _hf_model_available(profile.model, ("modules.json", "config.json")):
+            raise EmbeddingMissingModelError(
+                f"embedding model is not installed locally: {profile.model}; run `memassist embedding build --profile {profile.id}`"
+            )
         try:
-            self.model = SentenceTransformer(profile.model)
+            with _hf_offline_unless_download_allowed(profile):
+                self.model = SentenceTransformer(profile.model)
         except Exception as exc:
             raise EmbeddingMissingModelError(str(exc)) from exc
         self.dimension = int(profile.dimension or 0)
@@ -293,8 +433,13 @@ class FlagEmbeddingProvider:
             from FlagEmbedding import BGEM3FlagModel  # type: ignore[import-not-found]
         except ImportError as exc:
             raise EmbeddingMissingDependencyError("FlagEmbedding is not installed") from exc
+        if not _embedding_download_allowed(profile) and not _hf_model_available(profile.model, ("config.json",)):
+            raise EmbeddingMissingModelError(
+                f"embedding model is not installed locally: {profile.model}; run `memassist embedding build --profile {profile.id}`"
+            )
         try:
-            self.model = BGEM3FlagModel(profile.model, use_fp16=False)
+            with _hf_offline_unless_download_allowed(profile):
+                self.model = BGEM3FlagModel(profile.model, use_fp16=False)
         except Exception as exc:
             raise EmbeddingMissingModelError(str(exc)) from exc
         self.dimension = int(profile.dimension or 0)
@@ -324,6 +469,53 @@ def _normalize(vector: list[float]) -> list[float]:
     return [round(value / norm, 8) for value in vector]
 
 
+def _embedding_download_allowed(_profile: EmbeddingProfile) -> bool:
+    return os.environ.get("MEMASSIST_EMBEDDING_ALLOW_DOWNLOAD") == "1"
+
+
+@contextmanager
+def _hf_offline_unless_download_allowed(profile: EmbeddingProfile) -> Iterator[None]:
+    if _embedding_download_allowed(profile):
+        yield
+        return
+    keys = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    previous = {key: os.environ.get(key) for key in keys}
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 register_embedding_provider("model2vec", Model2VecEmbeddingProvider)
 register_embedding_provider("sentence-transformers", SentenceTransformersEmbeddingProvider)
 register_embedding_provider("flagembedding", FlagEmbeddingProvider)
+
+
+def _model2vec_model_available(model: str) -> bool:
+    return _hf_model_available(model, ("config.json",))
+
+
+def _hf_model_available(model: str, filenames: tuple[str, ...]) -> bool:
+    path = Path(model).expanduser()
+    if path.exists():
+        return True
+    if "/" not in model:
+        return False
+    try:
+        from huggingface_hub import try_to_load_from_cache  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+    for filename in filenames:
+        try:
+            cached = try_to_load_from_cache(model, filename)
+        except Exception:
+            continue
+        if isinstance(cached, str) and bool(cached):
+            return True
+    return False

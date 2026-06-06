@@ -10,8 +10,15 @@ memassist SHALL maintain a lightweight project-local source ledger for prompt-de
 #### Scenario: Stop records prompt source evidence
 - **WHEN** a Stop hook observes a user prompt source that may contain persistent memory
 - **THEN** memassist SHALL append a source ledger record with a stable source id
-- **AND** the record SHALL include source kind, session id when available, source reference when available, source hash, observed timestamp, and compact source text or summary
+- **AND** the record SHALL include source kind, session id when available, source reference when available, source hash, observed timestamp, and the full observed source text
 - **AND** memassist SHALL NOT create or update project policy from that source record
+
+#### Scenario: Long source remains available to the judge
+- **GIVEN** a user prompt source is longer than the judge preview budget
+- **WHEN** memassist builds an isolated memory judge payload for that source
+- **THEN** the payload SHALL include a bounded preview for diagnostics
+- **AND** the payload SHALL include ordered source chunks that reconstruct the full observed source text
+- **AND** the judge SHALL NOT be limited to only the preview when deciding whether a durable memory exists
 
 #### Scenario: Source ledger is project-local
 - **WHEN** memassist is initialized for a project
@@ -43,4 +50,3 @@ Source ledger records SHALL support future re-extraction or audit workflows, but
 - **WHEN** memassist reprocesses that source record with a newer judge or extractor
 - **THEN** memassist SHALL create a candidate or lifecycle event for any changed interpretation
 - **AND** memassist SHALL NOT silently rewrite the active memory content without recording the lifecycle change
-

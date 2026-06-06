@@ -17,9 +17,12 @@ from .memory_artifacts import (
     read_memory_artifact_by_id,
     sync_memory_artifact,
 )
-from .models import MEMORY_STATUSES, MEMORY_TYPES, Memory
+from .models import MEMORY_STATUSES, MEMORY_TYPES, Memory, MemoryChunk
 from .paths import db_path
 from .project import Project
+from .source_ledger import load_source_records
+
+DEFAULT_RETRIEVAL_CHUNK_KINDS = ("content", "source_quote")
 
 
 def now_iso() -> str:
@@ -136,6 +139,41 @@ class Store:
               indexed_at TEXT NOT NULL,
               PRIMARY KEY(memory_id, content_hash, profile_id, profile_fingerprint, provider, model, quantization, dimension)
             );
+
+            CREATE TABLE IF NOT EXISTS memory_chunks (
+              id TEXT PRIMARY KEY,
+              memory_id TEXT NOT NULL,
+              project_id TEXT,
+              scope_type TEXT NOT NULL,
+              status TEXT NOT NULL,
+              chunk_index INTEGER NOT NULL,
+              chunk_kind TEXT NOT NULL,
+              content TEXT NOT NULL,
+              content_hash TEXT NOT NULL,
+              tags_json TEXT NOT NULL,
+              paths_json TEXT NOT NULL,
+              source_ids_json TEXT NOT NULL DEFAULT '[]',
+              source_ref TEXT,
+              start_offset INTEGER,
+              end_offset INTEGER,
+              created_at TEXT NOT NULL,
+              indexed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_chunk_embeddings (
+              chunk_id TEXT NOT NULL,
+              memory_id TEXT NOT NULL,
+              content_hash TEXT NOT NULL,
+              profile_id TEXT NOT NULL DEFAULT 'legacy',
+              profile_fingerprint TEXT NOT NULL DEFAULT '',
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              quantization TEXT NOT NULL DEFAULT 'none',
+              dimension INTEGER NOT NULL,
+              embedding_json TEXT NOT NULL,
+              indexed_at TEXT NOT NULL,
+              PRIMARY KEY(chunk_id, content_hash, profile_id, profile_fingerprint, provider, model, quantization, dimension)
+            );
             """
         )
         self._ensure_memory_lifecycle_columns()
@@ -152,6 +190,23 @@ class Store:
                 """
                 CREATE TABLE IF NOT EXISTS memory_fts (
                   memory_id TEXT PRIMARY KEY,
+                  content TEXT,
+                  tags TEXT
+                );
+                """
+            )
+        try:
+            self.conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunk_fts
+                USING fts5(chunk_id UNINDEXED, content, tags);
+                """
+            )
+        except sqlite3.OperationalError:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_chunk_fts (
+                  chunk_id TEXT PRIMARY KEY,
                   content TEXT,
                   tags TEXT
                 );
@@ -281,7 +336,6 @@ class Store:
         )
         sync_memory_artifact(self.path.parent, memory, source_quote=source_quote)
         self._upsert_memory_index(memory)
-        self._refresh_embedding_cache(memory)
         self.conn.commit()
         return memory_id
 
@@ -398,6 +452,157 @@ class Store:
         project_id: str | None,
         limit: int = 10,
     ) -> list[Memory]:
+        chunks = self.search_memory_chunks(query, project_id=project_id, limit=limit * 3)
+        if chunks:
+            memories = self._memories_from_chunks(chunks, limit=limit)
+            for memory in memories:
+                self.touch_memory(memory.id)
+            return memories
+        return self._search_memories_legacy(query, project_id=project_id, limit=limit)
+
+    def search_memory_chunks(
+        self,
+        query: str,
+        *,
+        project_id: str | None,
+        limit: int = 20,
+        include_raw: bool = False,
+    ) -> list[MemoryChunk]:
+        chunk_kinds = ("content", "source_quote", "reason", "raw_source") if include_raw else DEFAULT_RETRIEVAL_CHUNK_KINDS
+        kind_placeholders = ", ".join("?" for _ in chunk_kinds)
+        scope_clause = "(m.scope_type = 'global' OR m.project_id = ?)"
+        params: list[Any] = [_fts_query(query), project_id, *chunk_kinds, limit]
+        try:
+            rows = self.conn.execute(
+                f"""
+                SELECT c.*, bm25(memory_chunk_fts) AS text_score
+                FROM memory_chunk_fts
+                JOIN memory_chunks c ON c.id = memory_chunk_fts.chunk_id
+                JOIN memories m ON m.id = c.memory_id
+                WHERE memory_chunk_fts MATCH ?
+                  AND {scope_clause}
+                  AND m.status = 'active'
+                  AND c.status = 'active'
+                  AND c.chunk_kind IN ({kind_placeholders})
+                ORDER BY
+                  text_score ASC,
+                  CASE c.chunk_kind
+                    WHEN 'content' THEN 0
+                    WHEN 'source_quote' THEN 1
+                    WHEN 'reason' THEN 2
+                    ELSE 9
+                  END ASC,
+                  m.strength DESC,
+                  m.utility DESC,
+                  m.confidence DESC,
+                  m.importance DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            like = f"%{query}%"
+            rows = self.conn.execute(
+                f"""
+                SELECT c.*
+                FROM memory_chunks c
+                JOIN memories m ON m.id = c.memory_id
+                WHERE c.content LIKE ?
+                  AND {scope_clause}
+                  AND m.status = 'active'
+                  AND c.status = 'active'
+                  AND c.chunk_kind IN ({kind_placeholders})
+                ORDER BY
+                  CASE c.chunk_kind
+                    WHEN 'content' THEN 0
+                    WHEN 'source_quote' THEN 1
+                    WHEN 'reason' THEN 2
+                    ELSE 9
+                  END ASC,
+                  m.strength DESC,
+                  m.utility DESC,
+                  m.confidence DESC,
+                  m.importance DESC
+                LIMIT ?
+                """,
+                [like, project_id, *chunk_kinds, limit],
+            ).fetchall()
+        chunks: list[MemoryChunk] = []
+        stale_ids: list[str] = []
+        for row in rows:
+            chunk = _chunk_from_row(row)
+            memory = read_memory_artifact_by_id(self.path.parent, chunk.memory_id)
+            if not memory or memory.status != "active":
+                stale_ids.append(chunk.memory_id)
+                continue
+            if chunk.chunk_kind == "source_quote" and _source_quote_query_is_transient_response(query):
+                continue
+            chunks.append(chunk)
+        for memory_id in set(stale_ids):
+            self._delete_memory_index(memory_id)
+        if stale_ids:
+            self.conn.commit()
+        return chunks
+
+    def list_memory_chunks(
+        self,
+        *,
+        project_id: str | None,
+        include_global: bool = True,
+        status: str | None = "active",
+        include_raw: bool = False,
+    ) -> list[MemoryChunk]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id and include_global:
+            clauses.append("(scope_type = 'global' OR project_id = ?)")
+            params.append(project_id)
+        elif project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        elif include_global:
+            clauses.append("scope_type = 'global'")
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if not include_raw:
+            placeholders = ", ".join("?" for _ in DEFAULT_RETRIEVAL_CHUNK_KINDS)
+            clauses.append(f"chunk_kind IN ({placeholders})")
+            params.extend(DEFAULT_RETRIEVAL_CHUNK_KINDS)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM memory_chunks
+            {where}
+            ORDER BY memory_id, chunk_kind, chunk_index
+            """,
+            params,
+        ).fetchall()
+        return [_chunk_from_row(row) for row in rows]
+
+    def _memories_from_chunks(self, chunks: list[MemoryChunk], *, limit: int) -> list[Memory]:
+        memories: list[Memory] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            if chunk.memory_id in seen:
+                continue
+            memory = self.get_memory(chunk.memory_id)
+            if not memory or memory.status != "active":
+                continue
+            seen.add(memory.id)
+            memories.append(memory)
+            if len(memories) >= limit:
+                break
+        return memories
+
+    def _search_memories_legacy(
+        self,
+        query: str,
+        *,
+        project_id: str | None,
+        limit: int = 10,
+    ) -> list[Memory]:
         active_statuses = ("active",)
         scope_clause = "(m.scope_type = 'global' OR m.project_id = ?)"
         params: list[Any] = [_fts_query(query), project_id, *active_statuses]
@@ -464,7 +669,6 @@ class Store:
             updated = replace(memory, status=status, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
             self._upsert_memory_index(updated)
-            self._refresh_embedding_cache(updated)
             self.conn.commit()
 
     def update_paths(self, memory_id: str, paths: list[str]) -> None:
@@ -473,7 +677,6 @@ class Store:
             updated = replace(memory, paths=paths, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
             self._upsert_memory_index(updated)
-            self._refresh_embedding_cache(updated)
             self.conn.commit()
 
     def supersede(self, old_id: str, new_id: str) -> None:
@@ -482,7 +685,6 @@ class Store:
             updated = replace(memory, status="archived", superseded_by=new_id, updated_at=now_iso())
             sync_memory_artifact(self.path.parent, updated)
             self._upsert_memory_index(updated)
-            self._refresh_embedding_cache(updated)
             self.conn.commit()
 
     def delete_memory(self, memory_id: str) -> bool:
@@ -601,14 +803,14 @@ class Store:
         *,
         project_id: str | None,
         content: str,
-        type: str,
+        type: str | None = None,
         statuses: tuple[str, ...] | None = None,
     ) -> Memory | None:
         candidates = [
             memory
             for memory in self.list_memories(project_id=project_id, include_global=False, status=None)
             if memory.content == content
-            and memory.type == type
+            and (type is None or memory.type == type)
             and (statuses is None or memory.status in statuses)
         ]
         return sorted(candidates, key=lambda memory: memory.updated_at, reverse=True)[0] if candidates else None
@@ -639,16 +841,14 @@ class Store:
         )
         sync_memory_artifact(self.path.parent, updated)
         self._upsert_memory_index(updated)
-        self._refresh_embedding_cache(updated)
         self.conn.commit()
         return updated
 
-    def rebuild_memory_index_from_artifacts(self, *, prune_missing: bool = True, embedding_profile_id: str | None = None) -> list[str]:
+    def rebuild_memory_index_from_artifacts(self, *, prune_missing: bool = True) -> list[str]:
         indexed: list[str] = []
         for memory in load_memory_artifacts(self.path.parent):
             normalized = _with_required_timestamps(memory)
             self._upsert_memory_index(normalized)
-            self._refresh_embedding_cache(normalized, profile_id=embedding_profile_id)
             indexed.append(normalized.id)
         if prune_missing:
             self._prune_memory_index(set(indexed))
@@ -676,6 +876,39 @@ class Store:
             (
                 memory.id,
                 content_hash,
+                profile.id,
+                profile.fingerprint,
+                profile.provider,
+                profile.model,
+                profile.quantization,
+                len(embedding),
+                json.dumps(embedding),
+                now_iso(),
+            ),
+        )
+        self.conn.commit()
+
+    def upsert_memory_chunk_embedding(
+        self,
+        chunk: MemoryChunk,
+        *,
+        profile: Any,
+        embedding: list[float],
+    ) -> None:
+        if not embedding:
+            return
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_chunk_embeddings (
+              chunk_id, memory_id, content_hash, profile_id, profile_fingerprint,
+              provider, model, quantization, dimension, embedding_json, indexed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chunk.id,
+                chunk.memory_id,
+                chunk.content_hash,
                 profile.id,
                 profile.fingerprint,
                 profile.provider,
@@ -732,6 +965,61 @@ class Store:
             results.append({"memory": memory, "embedding": [float(value) for value in embedding]})
         return results, {"row_count": len(rows), "stale_count": stale_count}
 
+    def memory_chunk_embedding_rows_for_profile(
+        self,
+        *,
+        project_id: str,
+        profile: Any,
+        dimension: int,
+        include_raw: bool = False,
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        chunk_kinds = ("content", "source_quote", "reason", "raw_source") if include_raw else DEFAULT_RETRIEVAL_CHUNK_KINDS
+        kind_placeholders = ", ".join("?" for _ in chunk_kinds)
+        rows = self.conn.execute(
+            f"""
+            SELECT e.*
+            FROM memory_chunk_embeddings e
+            JOIN memory_chunks c ON c.id = e.chunk_id
+            JOIN memories m ON m.id = e.memory_id
+            WHERE e.profile_id = ?
+              AND e.profile_fingerprint = ?
+              AND e.provider = ?
+              AND e.model = ?
+              AND e.quantization = ?
+              AND e.dimension = ?
+              AND (m.scope_type = 'global' OR m.project_id = ?)
+              AND m.status = 'active'
+              AND c.status = 'active'
+              AND c.chunk_kind IN ({kind_placeholders})
+            """,
+            (profile.id, profile.fingerprint, profile.provider, profile.model, profile.quantization, dimension, project_id, *chunk_kinds),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        stale_count = 0
+        for row in rows:
+            chunk_row = self.conn.execute("SELECT * FROM memory_chunks WHERE id = ?", (row["chunk_id"],)).fetchone()
+            if not chunk_row:
+                stale_count += 1
+                continue
+            chunk = _chunk_from_row(chunk_row)
+            memory = self.get_memory(chunk.memory_id)
+            if not memory or memory.status != "active":
+                stale_count += 1
+                continue
+            if row["content_hash"] != chunk.content_hash:
+                stale_count += 1
+                continue
+            try:
+                embedding = json.loads(row["embedding_json"])
+            except json.JSONDecodeError:
+                stale_count += 1
+                continue
+            if not isinstance(embedding, list):
+                stale_count += 1
+                continue
+            results.append({"memory": memory, "chunk": chunk, "embedding": [float(value) for value in embedding]})
+        return results, {"row_count": len(rows), "stale_count": stale_count}
+
     def memory_embedding_rows(
         self,
         *,
@@ -772,10 +1060,12 @@ class Store:
     def cleanup_embedding_cache(self, *, profile_id: str | None = None) -> int:
         if profile_id:
             cursor = self.conn.execute("DELETE FROM memory_embeddings WHERE profile_id = ?", (profile_id,))
+            chunk_cursor = self.conn.execute("DELETE FROM memory_chunk_embeddings WHERE profile_id = ?", (profile_id,))
         else:
             cursor = self.conn.execute("DELETE FROM memory_embeddings")
+            chunk_cursor = self.conn.execute("DELETE FROM memory_chunk_embeddings")
         self.conn.commit()
-        return int(cursor.rowcount or 0)
+        return int(cursor.rowcount or 0) + int(chunk_cursor.rowcount or 0)
 
     def embedding_cache_summary(self, *, profile_id: str | None = None) -> dict[str, Any]:
         if profile_id:
@@ -783,8 +1073,13 @@ class Store:
                 "SELECT profile_id, embedding_json FROM memory_embeddings WHERE profile_id = ?",
                 (profile_id,),
             ).fetchall()
+            chunk_rows = self.conn.execute(
+                "SELECT profile_id, embedding_json FROM memory_chunk_embeddings WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchall()
         else:
             rows = self.conn.execute("SELECT profile_id, embedding_json FROM memory_embeddings").fetchall()
+            chunk_rows = self.conn.execute("SELECT profile_id, embedding_json FROM memory_chunk_embeddings").fetchall()
         by_profile: dict[str, int] = {}
         bytes_by_profile: dict[str, int] = {}
         for row in rows:
@@ -794,6 +1089,8 @@ class Store:
         return {
             "row_count": len(rows),
             "bytes": sum(bytes_by_profile.values()),
+            "chunk_row_count": len(chunk_rows),
+            "chunk_bytes": sum(len(str(row["embedding_json"]).encode("utf-8")) for row in chunk_rows),
             "profiles": {
                 key: {"row_count": by_profile[key], "bytes": bytes_by_profile.get(key, 0)}
                 for key in sorted(by_profile)
@@ -876,6 +1173,93 @@ class Store:
         self.conn.execute(
             "INSERT INTO memory_fts (memory_id, content, tags) VALUES (?, ?, ?)",
             (memory_id, index_text, tag_text),
+        )
+
+    def _upsert_memory_chunks(self, memory: Memory) -> None:
+        from .chunks import build_memory_chunks
+
+        indexed_at = now_iso()
+        source_ids = set(memory.source_ids or [])
+        source_records = [record for record in load_source_records(self.path.parent) if record.id in source_ids] if source_ids else []
+        chunks = build_memory_chunks(
+            memory,
+            source_records=source_records,
+            created_at=memory.created_at or indexed_at,
+            indexed_at=indexed_at,
+        )
+        existing = {
+            str(row["id"])
+            for row in self.conn.execute("SELECT id FROM memory_chunks WHERE memory_id = ?", (memory.id,)).fetchall()
+        }
+        next_ids = {chunk.id for chunk in chunks}
+        stale_ids = existing - next_ids
+        if stale_ids:
+            placeholders = ", ".join("?" for _ in stale_ids)
+            stale = list(stale_ids)
+            self.conn.execute(f"DELETE FROM memory_chunk_fts WHERE chunk_id IN ({placeholders})", stale)
+            self.conn.execute(f"DELETE FROM memory_chunk_embeddings WHERE chunk_id IN ({placeholders})", stale)
+            self.conn.execute(f"DELETE FROM memory_chunks WHERE id IN ({placeholders})", stale)
+        for chunk in chunks:
+            self.conn.execute(
+                """
+                INSERT INTO memory_chunks (
+                  id, memory_id, project_id, scope_type, status, chunk_index,
+                  chunk_kind, content, content_hash, tags_json, paths_json,
+                  source_ids_json, source_ref, start_offset, end_offset,
+                  created_at, indexed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  memory_id = excluded.memory_id,
+                  project_id = excluded.project_id,
+                  scope_type = excluded.scope_type,
+                  status = excluded.status,
+                  chunk_index = excluded.chunk_index,
+                  chunk_kind = excluded.chunk_kind,
+                  content = excluded.content,
+                  content_hash = excluded.content_hash,
+                  tags_json = excluded.tags_json,
+                  paths_json = excluded.paths_json,
+                  source_ids_json = excluded.source_ids_json,
+                  source_ref = excluded.source_ref,
+                  start_offset = excluded.start_offset,
+                  end_offset = excluded.end_offset,
+                  indexed_at = excluded.indexed_at
+                """,
+                (
+                    chunk.id,
+                    chunk.memory_id,
+                    chunk.project_id,
+                    chunk.scope_type,
+                    chunk.status,
+                    chunk.chunk_index,
+                    chunk.chunk_kind,
+                    chunk.content,
+                    chunk.content_hash,
+                    json.dumps(chunk.tags),
+                    json.dumps(chunk.paths),
+                    json.dumps(chunk.source_ids),
+                    chunk.source_ref,
+                    chunk.start_offset,
+                    chunk.end_offset,
+                    chunk.created_at,
+                    chunk.indexed_at,
+                ),
+            )
+            self._upsert_chunk_fts(chunk)
+
+    def _upsert_chunk_fts(self, chunk: MemoryChunk) -> None:
+        tag_text = " ".join([*chunk.tags, *chunk.paths, chunk.status])
+        index_text = _memory_index_text(
+            content=chunk.content,
+            tags=chunk.tags,
+            paths=chunk.paths,
+            status=chunk.status,
+        )
+        self.conn.execute("DELETE FROM memory_chunk_fts WHERE chunk_id = ?", (chunk.id,))
+        self.conn.execute(
+            "INSERT INTO memory_chunk_fts (chunk_id, content, tags) VALUES (?, ?, ?)",
+            (chunk.id, index_text, tag_text),
         )
 
     def _upsert_memory_index(self, memory: Memory) -> None:
@@ -962,6 +1346,7 @@ class Store:
             paths=memory.paths,
             status=memory.status,
         )
+        self._upsert_memory_chunks(memory)
 
     def _prune_memory_index(self, artifact_ids: set[str]) -> None:
         rows = self.conn.execute("SELECT id FROM memories").fetchall()
@@ -971,27 +1356,21 @@ class Store:
         placeholders = ", ".join("?" for _ in missing)
         self.conn.execute(f"DELETE FROM memory_links WHERE source_id IN ({placeholders})", missing)
         self.conn.execute(f"DELETE FROM memory_links WHERE target_id IN ({placeholders})", missing)
+        self.conn.execute(f"DELETE FROM memory_chunk_embeddings WHERE memory_id IN ({placeholders})", missing)
+        self.conn.execute(f"DELETE FROM memory_chunk_fts WHERE chunk_id IN (SELECT id FROM memory_chunks WHERE memory_id IN ({placeholders}))", missing)
+        self.conn.execute(f"DELETE FROM memory_chunks WHERE memory_id IN ({placeholders})", missing)
         self.conn.execute(f"DELETE FROM memory_fts WHERE memory_id IN ({placeholders})", missing)
         self.conn.execute(f"DELETE FROM memory_embeddings WHERE memory_id IN ({placeholders})", missing)
         self.conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", missing)
 
     def _delete_memory_index(self, memory_id: str) -> None:
         self.conn.execute("DELETE FROM memory_links WHERE source_id = ? OR target_id = ?", (memory_id, memory_id))
+        self.conn.execute("DELETE FROM memory_chunk_embeddings WHERE memory_id = ?", (memory_id,))
+        self.conn.execute("DELETE FROM memory_chunk_fts WHERE chunk_id IN (SELECT id FROM memory_chunks WHERE memory_id = ?)", (memory_id,))
+        self.conn.execute("DELETE FROM memory_chunks WHERE memory_id = ?", (memory_id,))
         self.conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))
         self.conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
         self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-
-    def _refresh_embedding_cache(self, memory: Memory, *, profile_id: str | None = None) -> None:
-        try:
-            from .embedding_profiles import get_embedding_profile
-            from .embeddings import ensure_memory_embedding
-        except ImportError:
-            return
-        try:
-            profile = get_embedding_profile(profile_id, mem_dir=self.path.parent)
-        except Exception:
-            return
-        ensure_memory_embedding(self, memory, profile=profile)
 
     def _with_index_telemetry(self, memory: Memory) -> Memory:
         row = self.conn.execute(
@@ -1021,6 +1400,15 @@ def _fts_query(query: str) -> str:
     return " OR ".join(f'"{token}"' for token in deduped[:8])
 
 
+def _source_quote_query_is_transient_response(query: str) -> bool:
+    lowered = query.lower()
+    has_response_marker = any(marker in lowered for marker in ("응답", "답변", "reply", "respond"))
+    has_ok_marker = "ok" in lowered or "오케이" in lowered
+    has_only_marker = any(marker in lowered for marker in ("only", "만", "그냥"))
+    token_count = len(re.findall(r"[A-Za-z0-9_가-힣]+", lowered))
+    return has_response_marker and (has_ok_marker or has_only_marker or token_count <= 2)
+
+
 def _memory_index_text(
     *,
     content: str,
@@ -1028,13 +1416,10 @@ def _memory_index_text(
     paths: list[str],
     status: str,
 ) -> str:
-    section = "verifier" if type == "workflow" else "context"
     return " ".join(
         part
         for part in [
             content,
-            f"type {type}",
-            f"section {section}",
             f"status {status}",
             "tags " + " ".join(tags) if tags else "",
             "paths " + " ".join(paths) if paths else "",
@@ -1071,6 +1456,28 @@ def _with_required_timestamps(memory: Memory) -> Memory:
     return replace(memory, created_at=created_at, updated_at=updated_at)
 
 
+def _chunk_from_row(row: sqlite3.Row) -> MemoryChunk:
+    return MemoryChunk(
+        id=str(row["id"]),
+        memory_id=str(row["memory_id"]),
+        project_id=_optional_str(row["project_id"]),
+        scope_type=str(row["scope_type"]),
+        status=str(row["status"]),
+        chunk_index=int(row["chunk_index"] or 0),
+        chunk_kind=str(row["chunk_kind"]),
+        content=str(row["content"]),
+        content_hash=str(row["content_hash"]),
+        tags=_json_string_list(row["tags_json"]),
+        paths=_json_string_list(row["paths_json"]),
+        source_ids=_json_string_list(row["source_ids_json"]),
+        source_ref=_optional_str(row["source_ref"]),
+        start_offset=_optional_int(row["start_offset"]),
+        end_offset=_optional_int(row["end_offset"]),
+        created_at=str(row["created_at"]),
+        indexed_at=str(row["indexed_at"]),
+    )
+
+
 def _memory_in_scope(memory: Memory, *, project_id: str | None, include_global: bool) -> bool:
     if project_id and include_global:
         return memory.project_id == project_id or memory.scope_type == "global"
@@ -1083,3 +1490,27 @@ def _memory_in_scope(memory: Memory, *, project_id: str | None, include_global: 
 
 def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_string_list(value: object) -> list[str]:
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if str(item)]
