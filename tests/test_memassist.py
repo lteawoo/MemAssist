@@ -40,7 +40,6 @@ from memassist.memory_judge import (
     pending_memory_source_events,
 )
 from memassist.models import MEMORY_STATUSES, Memory
-from memassist.verification_config import default_verification_config_yaml, load_verification_config
 from memassist.project import detect_project, detect_project_for_init
 from memassist.retrieval import analyze_query_intent, build_memory_pack, render_prompt_context
 from memassist.source_ledger import load_source_records
@@ -223,16 +222,10 @@ class MemassistTest(unittest.TestCase):
         self.assertEqual(decision.status, "candidate")
         self.assertEqual(decision.decision, "keep_candidate")
 
-    def test_init_creates_project_policy(self) -> None:
+    def test_init_creates_project_memory_home(self) -> None:
         with isolated_env() as (_root, project, _home):
             code = main(["init"])
             self.assertEqual(code, 0)
-            config_path = project / ".memassist" / "verification.yaml"
-            self.assertTrue(config_path.exists())
-            config_text = config_path.read_text(encoding="utf-8")
-            self.assertIn("verification_commands: []", config_text)
-            self.assertNotIn(".env", config_text)
-            self.assertNotIn("rm -rf", config_text)
             self.assertTrue((project / ".memassist" / "ignore").exists())
             self.assertTrue((project / ".memassist" / "memories" / "active").exists())
             self.assertTrue((project / ".memassist" / "memories" / "candidates").exists())
@@ -257,9 +250,7 @@ class MemassistTest(unittest.TestCase):
                 self.assertEqual(detected.root, project.resolve())
                 code = main(["init", "--tools", "codex"])
                 self.assertEqual(code, 0)
-                self.assertTrue((project / ".memassist" / "verification.yaml").exists())
                 self.assertTrue((project / ".codex" / "hooks.json").exists())
-                self.assertFalse((fake_home / ".memassist" / "verification.yaml").exists())
                 self.assertFalse((fake_home / ".codex" / "hooks.json").exists())
             finally:
                 os.chdir(old_cwd)
@@ -294,7 +285,6 @@ class MemassistTest(unittest.TestCase):
                 self.assertEqual(detected.root, project.resolve())
                 code = main(["init", "--tools", "codex"])
                 self.assertEqual(code, 0)
-                self.assertTrue((project / ".memassist" / "verification.yaml").exists())
                 self.assertTrue((project / ".memassist" / "memassist.db").exists())
                 self.assertTrue((project / ".codex" / "hooks.json").exists())
                 self.assertFalse((parent / ".codex" / "hooks.json").exists())
@@ -411,7 +401,6 @@ class MemassistTest(unittest.TestCase):
             report = json.loads(out.getvalue())
             self.assertTrue(report["passed"])
             checks = {check["name"]: check for check in report["checks"]}
-            self.assertEqual(checks["project_config"]["status"], "pass")
             self.assertEqual(checks["tool_integrations"]["status"], "pass")
 
     def test_doctor_reports_judge_backend_and_warns_when_executable_missing(self) -> None:
@@ -2078,8 +2067,6 @@ class MemassistTest(unittest.TestCase):
             with patch("sys.stdin", StringIO(json.dumps(payload))), patch("sys.stdout", StringIO()) as out:
                 self.assertEqual(main(["hook", "pre-tool-use"]), 0)
                 self.assertEqual("", out.getvalue())
-            config_text = (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8")
-            self.assertNotIn("src/auth/session.py", config_text)
             with Store() as store:
                 events = store.trace_events("sess_embedding_profile_pretool")
             self.assertEqual(1, len(events))
@@ -2093,7 +2080,7 @@ class MemassistTest(unittest.TestCase):
         )
         self.assertEqual(files, ["src/auth/refresh-token-policy.ts"])
 
-    def test_session_summary_and_verify(self) -> None:
+    def test_session_summary_reports_commands_and_files(self) -> None:
         with isolated_env():
             main(["init"])
             project = detect_project()
@@ -2119,9 +2106,9 @@ class MemassistTest(unittest.TestCase):
                 )
                 out = StringIO()
                 with patch("sys.stdout", out):
-                    code = main(["verify", "--session", "sess_verify"])
-                self.assertEqual(code, 1)
-                self.assertIn("no test command", out.getvalue())
+                    code = main(["session", "sess_verify"])
+                self.assertEqual(code, 0)
+                self.assertIn("src/session/session-config.ts", out.getvalue())
 
                 store.add_trace_event(
                     session_id="sess_verify",
@@ -2132,9 +2119,9 @@ class MemassistTest(unittest.TestCase):
                 )
                 out = StringIO()
                 with patch("sys.stdout", out):
-                    code = main(["verify", "--session", "sess_verify"])
+                    code = main(["session", "sess_verify"])
                 self.assertEqual(code, 0)
-                self.assertIn("PASS", out.getvalue())
+                self.assertIn("npm test", out.getvalue())
             finally:
                 store.close()
 
@@ -2273,10 +2260,6 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 memory = store.get_memory(candidate_id)
                 self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
-            self.assertNotIn(
-                "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
-            )
 
     def test_stop_records_source_event_without_direct_memory_when_judge_unavailable(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -2305,7 +2288,6 @@ class MemassistTest(unittest.TestCase):
             self.assertIn("memory_source_observed", event_types)
             self.assertIn("memory_judged", event_types)
             self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
-            self.assertNotIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "verification.yaml").read_text())
 
     def test_stop_async_enqueues_source_and_spawns_without_judging(self) -> None:
         old_mode = os.environ.pop("MEMASSIST_STOP_INGEST_MODE", None)
@@ -2377,7 +2359,7 @@ class MemassistTest(unittest.TestCase):
 
             out = StringIO()
             with patch("sys.stdout", out):
-                self.assertEqual(main(["daemon", "once", "--session", "sess_daemon_ingest", "--skip-eval", "--json"]), 0)
+                self.assertEqual(main(["daemon", "once", "--session", "sess_daemon_ingest", "--json"]), 0)
             result = json.loads(out.getvalue())
             self.assertEqual("ok", result["ingestion"]["status"])
             self.assertEqual(1, result["ingestion"]["processed"])
@@ -2412,7 +2394,7 @@ class MemassistTest(unittest.TestCase):
             out = StringIO()
             with patch("sys.stdout", out):
                 self.assertEqual(
-                    main(["daemon", "once", "--session", "sess_daemon_batch", "--batch-limit", "1", "--skip-eval", "--json"]),
+                    main(["daemon", "once", "--session", "sess_daemon_batch", "--batch-limit", "1", "--json"]),
                     0,
                 )
             result = json.loads(out.getvalue())
@@ -2480,7 +2462,7 @@ class MemassistTest(unittest.TestCase):
             with patch("memassist.async_ingestion.process_memory_intent_event", side_effect=RuntimeError("boom")):
                 out = StringIO()
                 with patch("sys.stdout", out):
-                    self.assertEqual(main(["daemon", "once", "--session", "sess_async_failure", "--skip-eval", "--json"]), 1)
+                    self.assertEqual(main(["daemon", "once", "--session", "sess_async_failure", "--json"]), 1)
             result = json.loads(out.getvalue())
             self.assertEqual("failed", result["ingestion"]["status"])
             self.assertIn("boom", result["ingestion"]["error"])
@@ -2659,10 +2641,6 @@ class MemassistTest(unittest.TestCase):
                 traces = store.trace_events("sess_direct_policy_upgrade_candidate")
                 self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
             self.assertFalse(any(event["event_type"] == "memory_intent_observed" for event in traces))
-            self.assertNotIn(
-                "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
-            )
 
     def test_user_prompt_directive_becomes_active_retrieval_context_without_policy(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -2716,10 +2694,6 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(direct_memories[0].paths, [])
             self.assertTrue(any(event["event_type"] == "memory_source_observed" for event in traces))
             self.assertTrue(any(event["event_type"] == "memory_judged" for event in traces))
-            self.assertNotIn(
-                "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
-            )
 
             rag_payload = {
                 "session_id": "sess_direct_policy_rag",
@@ -2884,8 +2858,6 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
                 traces = store.trace_events("sess_typo_warn_policy")
-            config_text = (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8")
-            self.assertNotIn("src/auth/refresh-token-policy.ts", config_text)
             self.assertTrue(
                 any(
                     memory.status == "active"
@@ -3076,10 +3048,6 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
             self.assertTrue(any(memory.status == "candidate" for memory in memories))
-            self.assertNotIn(
-                "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
-            )
 
     def test_judge_created_memory_is_path_independent(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -3110,8 +3078,6 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
             self.assertTrue(any(memory.status == "active" and not memory.paths for memory in memories))
-            self.assertNotIn("outside.txt", (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"))
-            self.assertNotIn("/etc/passwd", (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"))
 
     def test_uncertain_source_without_paths_does_not_compile_policy(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -3141,10 +3107,6 @@ class MemassistTest(unittest.TestCase):
                 else:
                     os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = old_fixture
 
-            self.assertNotIn(
-                "src/auth/session.py",
-                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
-            )
 
     def test_invalid_judge_output_does_not_mutate_policy(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
@@ -3187,10 +3149,6 @@ class MemassistTest(unittest.TestCase):
                 memories = store.list_memories(project_id=project.id, include_global=False, status=None)
                 traces = store.trace_events("sess_invalid_interpreter")
             self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
-            self.assertNotIn(
-                "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "verification.yaml").read_text(encoding="utf-8"),
-            )
             judged = [event for event in traces if event["event_type"] == "memory_judged"]
             self.assertEqual(len(judged), 1)
             self.assertIn("invalid judge output", judged[0]["input_json"])
@@ -3268,7 +3226,7 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 self.assertEqual(store.get_memory(expired_id).status, "archived")  # type: ignore[union-attr]
 
-    def test_lesson_from_session_does_not_promote_memory_to_policy(self) -> None:
+    def test_lesson_from_session_creates_candidate_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
             project = detect_project()
@@ -3316,55 +3274,12 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 memory = store.get_memory(lesson_id)
                 self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
-            self.assertNotIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "verification.yaml").read_text())
-
-            eval_out = StringIO()
-            with patch("sys.stdout", eval_out):
-                code = main(["eval", "run", "--session", "sess_eval", "--json"])
-            self.assertEqual(code, 0)
-            result = json.loads(eval_out.getvalue())
-            self.assertTrue(result["passed"])
-            self.assertGreaterEqual(result["candidate_count"], 1)
 
             with patch("sys.stdout", StringIO()):
                 code = main(["memory", "deactivate", lesson_id])
             self.assertEqual(code, 0)
             with Store() as store:
                 memory = store.get_memory(lesson_id)
-                self.assertEqual(memory.status, "archived")  # type: ignore[union-attr]
-            self.assertNotIn(
-                "src/auth/refresh-token-policy.ts",
-                (project_dir / ".memassist" / "verification.yaml").read_text(),
-            )
-
-    def test_memory_deactivate_does_not_remove_manual_sensitive_path(self) -> None:
-        with isolated_env() as (_root, project_dir, _home):
-            main(["init"])
-            project = detect_project()
-            config_path = project_dir / ".memassist" / "verification.yaml"
-            config_path.write_text(
-                '# memassist project verification config\nsensitive_paths:\n  - "src/auth/session.py"\nprotected_paths: []\ndangerous_commands: []\nverification_commands: []\n',
-                encoding="utf-8",
-            )
-            with Store() as store:
-                store.upsert_project(project)
-                memory_id = store.add_memory(
-                    scope_type="project",
-                    project_id=project.id,
-                    type="directive",
-                    content="Warn before changing src/auth/session.py.",
-                    paths=["src/auth/session.py"],
-                    status="active",
-                    source_kind="test",
-                )
-
-            with patch("sys.stdout", StringIO()):
-                code = main(["memory", "deactivate", memory_id])
-            self.assertEqual(code, 0)
-            config_text = (project_dir / ".memassist" / "verification.yaml").read_text()
-            self.assertIn("src/auth/session.py", config_text)
-            with Store() as store:
-                memory = store.get_memory(memory_id)
                 self.assertEqual(memory.status, "archived")  # type: ignore[union-attr]
 
     def test_memory_export_import_project_bundle(self) -> None:
@@ -3410,7 +3325,7 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(imported[0]["status"], "candidate")
             self.assertIn("billing migration", imported[0]["content"])
 
-    def test_daemon_once_runs_maintenance_eval_and_candidate_storage(self) -> None:
+    def test_daemon_once_runs_ingestion_and_cleanup(self) -> None:
         with isolated_env():
             main(["init"])
             project = detect_project()
@@ -3437,9 +3352,9 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(code, 0)
             result = json.loads(out.getvalue())
             self.assertEqual(result["session_id"], "sess_daemon")
-            self.assertTrue(result["eval"]["passed"])
+            self.assertNotIn("eval", result)
             self.assertEqual(len(result["stored_candidates"]), 0)
-            self.assertEqual(len(result["lifecycle"]["active"]), 0)
+            self.assertIn(expired_id, result["cleanup"]["archived"])
 
             with Store() as store:
                 self.assertEqual(store.get_memory(expired_id).status, "archived")  # type: ignore[union-attr]

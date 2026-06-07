@@ -36,7 +36,7 @@ Users SHALL NOT need to know about memory commands or explicitly request memory 
 
 ### Requirement: memassist SHALL stage policy-like memory separately from policy compilation
 
-When the isolated judge identifies a directive that affects approval, warning, blocking, sensitive paths, or protected paths, memassist SHALL store it as source-language memory with retrieval metadata. memassist SHALL NOT compile judged memories into project verification config during `UserPromptSubmit`, activation, lifecycle processing, or any automatic memory workflow.
+When the isolated judge identifies a directive that affects approval, warning, blocking, sensitive paths, or protected paths, memassist SHALL store it as source-language memory with retrieval metadata. memassist SHALL NOT compile judged memories into project config during `UserPromptSubmit`, activation, lifecycle processing, or any automatic memory workflow.
 
 #### Scenario: Approval-before-edit directive becomes retrievable memory
 
@@ -283,4 +283,3 @@ Judge output SHALL be recorded with source evidence before it affects managed me
 - **WHEN** Stop processing completes
 - **THEN** memassist SHALL NOT create an active memory artifact
 - **AND** memassist MAY record a lifecycle or event entry for audit
-

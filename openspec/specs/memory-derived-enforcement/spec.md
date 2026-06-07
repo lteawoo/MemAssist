@@ -5,8 +5,8 @@ UserPromptSubmit 시 context로 주입되며, **agent가 그 context를 읽고 �
 멈추거나 승인을 요청하는 자율적 판단**이 실제 집행이다.
 
 deterministic PolicyEngine 기반 PreToolUse allow/warn/block 집행은 memassist의
-책임이 아니므로 제거되었다. `verification_commands`는 집행이 아닌 검증 reminder
-데이터로 보존된다.
+책임이 아니므로 제거되었다. 테스트 명령이나 확인 절차는 별도 설정 파일이 아니라
+memory retrieval의 verifier reminder로 표현된다.
 
 ## Requirements
 
@@ -31,26 +31,13 @@ or equivalent mechanical policy logic. 사용자 지시는 memory로 저장되�
 - **AND** agent가 그 context를 읽고 승인을 요청하거나 멈추는 것은 agent의 자율 판단이다
 - **AND** memassist는 PreToolUse에서 기계적으로 차단하지 않는다
 
-### Requirement: verification_commands SHALL be preserved as retrieval reminders
+### Requirement: memassist SHALL NOT create verification policy config
 
-`verification.yaml`의 `verification_commands` SHALL be treated as retrieval reminders,
-not allow/warn/block caution_level data. `load_verification_config`는 이 필드를 읽어 verifier 섹션
-retrieval과 verify/eval에서 사용한다.
+memassist SHALL NOT create or mutate a project verification policy config file.
+Test commands and verification procedures SHALL be stored as ordinary memories
+and retrieved through the verifier reminder section when relevant.
 
-#### Scenario: verification_commands 보존
-
-- **GIVEN** `verification.yaml`에 `verification_commands`가 설정되어 있다
-- **WHEN** `load_verification_config`가 호출된다
-- **THEN** `verification_commands`는 로드된다
-- **AND** 이 데이터는 `verifier` memory 섹션 retrieval과 verify/eval에서 사용된다
-
-### Requirement: generated verification config files SHALL NOT include caution_level keys
-
-새로 생성되는 `verification.yaml` SHALL NOT include `sensitive_paths`, `protected_paths`,
-or `dangerous_commands` keys.
-
-#### Scenario: 기본 verification config 파일 형식
+#### Scenario: init does not create verification config
 
 - **WHEN** `memassist init`이 실행된다
-- **THEN** 생성된 `verification.yaml`은 `verification_commands: []`만 포함한다
-- **AND** `sensitive_paths`, `protected_paths`, `dangerous_commands`는 포함하지 않는다
+- **THEN** `.memassist/verification.yaml`은 생성되지 않는다

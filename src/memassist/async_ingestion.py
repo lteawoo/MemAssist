@@ -213,7 +213,6 @@ def spawn_async_ingestion_worker(project: Project, *, session_id: str) -> Worker
         "once",
         "--session",
         "all",
-        "--skip-eval",
         "--quiet",
         "--json",
     ]

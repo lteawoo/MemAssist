@@ -1,7 +1,7 @@
 # project-local-storage Specification
 
 ## Purpose
-Define how memassist scopes a project initialization to the current working directory, treating `<project>/.memassist` as the default project home for memory data, policy, ignore files, and hook-pinned runtime state, while never adopting a parent or user/global `.memassist` as the project root.
+Define how memassist scopes a project initialization to the current working directory, treating `<project>/.memassist` as the default project home for memory data, ignore files, and hook-pinned runtime state, while never adopting a parent or user/global `.memassist` as the project root.
 ## Requirements
 ### Requirement: memassist SHALL initialize plain directories as local projects
 When `memassist init` runs in a directory without `.git` or an existing project `.memassist`, memassist SHALL initialize the current working directory as the project root rather than adopting a parent directory.
@@ -13,15 +13,14 @@ When `memassist init` runs in a directory without `.git` or an existing project 
 - **WHEN** the user runs `memassist init`
 - **THEN** memassist SHALL create `/work/plain-project/.memassist`
 - **AND** memassist SHALL store the project root as `/work/plain-project`
-- **AND** memassist SHALL NOT write project verification config or hooks into the parent directory
+- **AND** memassist SHALL NOT write hooks into the parent directory
 
 ### Requirement: memassist SHALL use project `.memassist` as the default project home
-For project-scoped initialization, memassist SHALL use `<project>/.memassist` as the default home for project memory data, policy, ignore files, and hook-pinned runtime state.
+For project-scoped initialization, memassist SHALL use `<project>/.memassist` as the default home for project memory data, ignore files, and hook-pinned runtime state.
 
 #### Scenario: Project DB is created under project `.memassist`
 - **WHEN** a user runs `memassist init` in a project directory
-- **THEN** memassist SHALL create `<project>/.memassist/verification.yaml`
-- **AND** memassist SHALL create or use `<project>/.memassist/memassist.db` for project memory storage
+- **THEN** memassist SHALL create or use `<project>/.memassist/memassist.db` for project memory storage
 
 #### Scenario: Project hook pins local memory home
 - **WHEN** `memassist init --tools codex` installs project-scoped hooks
@@ -189,4 +188,3 @@ Embedding vector cache rows and profile cache metadata SHALL live under the proj
 - **WHEN** memassist builds memory embeddings for a project profile
 - **THEN** the derived memory vector rows SHALL be stored in the project `.memassist` home or project-local SQLite database
 - **AND** the provider model cache location SHALL NOT redefine project memory ownership
-

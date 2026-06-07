@@ -27,7 +27,6 @@ from .embedding_profiles import (
     load_embedding_profile_config,
 )
 from .embeddings import build_memory_embeddings, install_embedding_model
-from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .integrations import install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
 from .lesson import lesson_from_session
@@ -45,10 +44,6 @@ from .memory_eval import (
 )
 from .memory_artifacts import ensure_memory_artifact_dirs
 from .paths import db_path, memassist_home, project_memassist_home
-from .verification_config import (
-    default_verification_config_yaml,
-    load_verification_config,
-)
 from .project import detect_project, detect_project_for_init
 from .rag_eval import RagCase, RagExpectation, evaluate_rag, load_rag_cases
 from .retrieval import build_memory_pack, render_prompt_context
@@ -58,7 +53,6 @@ from .source_ledger import ensure_source_ledger
 from .storage import Store
 from .sync import export_memories, import_memories
 from .trace import record_tool_event
-from .verifier import verify_session
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -211,17 +205,8 @@ def build_parser() -> argparse.ArgumentParser:
     session.add_argument("--json", action="store_true")
     session.set_defaults(func=cmd_session)
 
-    verify = sub.add_parser("verify", help="verify a traced session against memory and verification reminders")
-    verify.add_argument("--session", default="latest")
-    verify.add_argument("--json", action="store_true")
-    verify.set_defaults(func=cmd_verify)
-
-    eval_parser = sub.add_parser("eval", help="run memassist session evaluation")
+    eval_parser = sub.add_parser("eval", help="run memassist retrieval and memory evaluations")
     eval_sub = eval_parser.add_subparsers(required=True)
-    eval_run = eval_sub.add_parser("run", help="run verification and extraction checks")
-    eval_run.add_argument("--session", default="latest")
-    eval_run.add_argument("--json", action="store_true")
-    eval_run.set_defaults(func=cmd_eval_run)
     eval_retrieval = eval_sub.add_parser("retrieval", help="evaluate memory retrieval cases")
     eval_retrieval.add_argument("--case-file")
     eval_retrieval.add_argument("--query")
@@ -281,7 +266,6 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_once = daemon_sub.add_parser("once", help="process latest session once")
     daemon_once.add_argument("--session", default="latest")
     daemon_once.add_argument("--batch-limit", type=int)
-    daemon_once.add_argument("--skip-eval", action="store_true")
     daemon_once.add_argument("--quiet", action="store_true")
     daemon_once.add_argument("--json", action="store_true")
     daemon_once.set_defaults(func=cmd_daemon_once)
@@ -296,16 +280,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     ensure_memory_artifact_dirs(mem_dir)
     ensure_source_ledger(mem_dir)
     ensure_embedding_profiles(mem_dir)
-    config_path = mem_dir / "verification.yaml"
-    if not config_path.exists():
-        config_path.write_text(default_verification_config_yaml(), encoding="utf-8")
     ignore_path = mem_dir / "ignore"
     if not ignore_path.exists():
         ignore_path.write_text("# Add paths memassist should not record.\n", encoding="utf-8")
     with Store(mem_dir / "memassist.db") as store:
         store.upsert_project(project)
     print(f"Initialized memassist for {project.id}")
-    print(f"Project config: {config_path}")
     if not args.skip_embedding_install and not _env_truthy("MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL"):
         if _install_active_embedding_for_init(mem_dir, force=args.force_embedding_install) != 0:
             return 1
@@ -719,50 +699,6 @@ def cmd_session(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_verify(args: argparse.Namespace) -> int:
-    project = detect_project()
-    with _store() as store:
-        session_id = _resolve_session_id(store, args.session, project.id)
-        if not session_id:
-            print("No traced session found.")
-            return 1
-        memories = store.list_memories(project_id=project.id, include_global=True)
-        result = verify_session(
-            store.trace_events(session_id),
-            memories=memories,
-            verification_config=load_verification_config(project.root),
-        )
-    if args.json:
-        _print_json(result.as_dict())
-    else:
-        print("PASS" if result.passed else "FAIL")
-        for issue in result.issues:
-            print(f"issue: {issue}")
-        for warning in result.warnings:
-            print(f"warning: {warning}")
-    return 0 if result.passed else 1
-
-
-def cmd_eval_run(args: argparse.Namespace) -> int:
-    project = detect_project()
-    with _store() as store:
-        session_id = _resolve_session_id(store, args.session, project.id)
-        if not session_id:
-            print("No traced session found.")
-            return 1
-        result = run_eval(
-            store.trace_events(session_id),
-            memories=store.list_memories(project_id=project.id, include_global=True),
-            verification_config=load_verification_config(project.root),
-        )
-    if args.json:
-        _print_json(result.as_dict())
-    else:
-        print("PASS" if result.passed else "FAIL")
-        print(f"candidate_count: {result.candidate_count}")
-    return 0 if result.passed else 1
-
-
 def cmd_eval_retrieval(args: argparse.Namespace) -> int:
     project = detect_project()
     if args.case_file:
@@ -1037,11 +973,9 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
         process_all_sessions = str(args.session).lower() in {"all", "*", "project"}
         session_id = None if process_all_sessions else _resolve_session_id(store, args.session, project.id)
         stored: list[str] = []
-        eval_result = None
         lifecycle_result = None
         ingestion_result = None
         if session_id or process_all_sessions:
-            events = store.trace_events(session_id, project_id=project.id, limit=200)
             ingestion_result = run_async_ingestion_once(
                 store,
                 project=project,
@@ -1054,12 +988,6 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
                 for decision in ingestion_result.decisions
                 if decision.get("memory_id")
             ]
-            if not args.skip_eval:
-                eval_result = run_eval(
-                    events,
-                    memories=store.list_memories(project_id=project.id, include_global=True),
-                    verification_config=load_verification_config(project.root),
-                )
         cleanup_result = lifecycle_result.cleanup if lifecycle_result else cleanup_memories(store)
     output_session_id = "all" if process_all_sessions else session_id
     payload = {
@@ -1068,7 +996,6 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
         "ingestion": ingestion_result.as_dict() if ingestion_result else None,
         "lifecycle": lifecycle_result.as_dict() if lifecycle_result else None,
         "cleanup": cleanup_result.as_dict(),
-        "eval": eval_result.as_dict() if eval_result else None,
     }
     if args.json:
         _print_json(payload)
@@ -1078,11 +1005,9 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
         if ingestion_result:
             print(f"ingestion: {ingestion_result.status} processed={ingestion_result.processed}")
         print(f"archived: {len(cleanup_result.archived)}")
-        if eval_result:
-            print("eval: " + ("PASS" if eval_result.passed else "FAIL"))
     if ingestion_result and ingestion_result.status == "failed":
         return 1
-    return 0 if eval_result is None or eval_result.passed else 1
+    return 0
 
 
 def _read_json_stdin() -> dict[str, Any]:

@@ -19,7 +19,6 @@ from .integrations.registry import SUPPORTED_TOOLS, status_tools
 from .memory_artifacts import load_memory_artifacts
 from .models import Memory
 from .paths import db_path
-from .verification_config import load_verification_config
 from .project import Project, detect_project
 
 
@@ -33,7 +32,6 @@ READ_ONLY_API_ROUTES = (
     "/api/memories",
     "/api/traces",
     "/api/lifecycle",
-    "/api/verification-config",
     "/api/tools",
 )
 SECRET_VALUE_RE = re.compile(
@@ -64,8 +62,6 @@ GUI_I18N = {
         "traceEvents": "Trace events",
         "lifecycle": "Lifecycle",
         "lifecycleEvents": "Lifecycle events",
-        "verification": "Verification",
-        "rawVerificationConfig": "Raw verification config",
         "toolDecision": "Tool decision",
         "tools": "Tools",
         "type": "Type",
@@ -133,8 +129,6 @@ GUI_I18N = {
         "traceEvents": "트레이스 이벤트",
         "lifecycle": "라이프사이클",
         "lifecycleEvents": "라이프사이클 이벤트",
-        "verification": "검증",
-        "rawVerificationConfig": "원본 검증 설정",
         "toolDecision": "도구 결정",
         "tools": "도구",
         "type": "유형",
@@ -231,8 +225,6 @@ class MemassistRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(_api_traces(query))
             elif parsed.path == "/api/lifecycle":
                 self._send_json(_api_lifecycle(query))
-            elif parsed.path == "/api/verification-config":
-                self._send_json(_api_verification_config(query))
             elif parsed.path == "/api/tools":
                 self._send_json(_api_tools(query))
             else:
@@ -419,21 +411,6 @@ def _api_lifecycle(query: dict[str, str]) -> dict[str, Any]:
         "scope": scope.as_dict(),
         "filters": {"session_id": session_id, "limit": limit},
         "lifecycle": [_lifecycle_row(row) for row in rows],
-    }
-
-
-def _api_verification_config(query: dict[str, str]) -> dict[str, Any]:
-    project = _resolve_project(query.get("project_id"))
-    config = load_verification_config(project.root)
-    path = project.root / ".memassist" / "verification.yaml"
-    return {
-        "project": _project_as_dict(project),
-        "path": str(path),
-        "exists": path.exists(),
-        "verification_config": {
-            "verification_commands": config.verification_commands,
-        },
-        "raw": _redact_value(path.read_text(encoding="utf-8")) if path.exists() else "",
     }
 
 
@@ -1164,7 +1141,6 @@ def _dashboard_html() -> str:
         <button data-view="memories" class="active">Memories</button>
         <button data-view="traces">Traces</button>
         <button data-view="lifecycle">Lifecycle</button>
-        <button data-view="verification">Verification</button>
         <button data-view="tools">Tools</button>
       </div>
     </div>
@@ -1172,10 +1148,6 @@ def _dashboard_html() -> str:
     <section class="panel" id="memoriesView"><h2 id="memoriesTitle">Memories</h2><div id="memories"></div></section>
     <section class="panel hidden" id="tracesView"><h2 id="tracesTitle">Traces</h2><div id="traces"></div></section>
     <section class="panel hidden" id="lifecycleView"><h2 id="lifecycleTitle">Lifecycle</h2><div id="lifecycle"></div></section>
-    <section class="two hidden" id="verificationView">
-      <div class="panel"><h2 id="verificationTitle">Verification</h2><div id="verification"></div></div>
-      <div class="panel"><h2 id="rawVerificationConfigTitle">Raw verification config</h2><pre id="rawVerificationConfig"></pre></div>
-    </section>
     <section class="panel hidden" id="toolsView"><h2 id="toolsTitle">Tools</h2><div id="tools"></div></section>
   </main>
   <script>
@@ -1254,13 +1226,10 @@ def _dashboard_html() -> str:
       el("memoriesTitle").textContent = t("memories");
       el("tracesTitle").textContent = t("traces");
       el("lifecycleTitle").textContent = t("lifecycle");
-      el("verificationTitle").textContent = t("verification");
-      el("rawVerificationConfigTitle").textContent = t("rawVerificationConfig");
       el("toolsTitle").textContent = t("tools");
       document.querySelector('[data-view="memories"]').textContent = t("memories");
       document.querySelector('[data-view="traces"]').textContent = t("traces");
       document.querySelector('[data-view="lifecycle"]').textContent = t("lifecycle");
-      document.querySelector('[data-view="verification"]').textContent = t("verification");
       document.querySelector('[data-view="tools"]').textContent = t("tools");
       if (el("status").textContent !== t("error")) el("status").textContent = t("ready");
     }}
@@ -1283,11 +1252,10 @@ def _dashboard_html() -> str:
       if (state.view === "memories") loadMemories();
       if (state.view === "traces") loadTraces();
       if (state.view === "lifecycle") loadLifecycle();
-      if (state.view === "verification") loadVerificationConfig();
       if (state.view === "tools") loadTools();
     }}
     function showView() {{
-      ["memories", "traces", "lifecycle", "verification", "tools"].forEach(name => {{
+      ["memories", "traces", "lifecycle", "tools"].forEach(name => {{
         el(name + "View").classList.toggle("hidden", state.view !== name);
       }});
     }}
@@ -1300,7 +1268,6 @@ def _dashboard_html() -> str:
         if (state.view === "memories") await loadMemories();
         if (state.view === "traces") await loadTraces();
         if (state.view === "lifecycle") await loadLifecycle();
-        if (state.view === "verification") await loadVerificationConfig();
         if (state.view === "tools") await loadTools();
         el("status").textContent = t("ready");
       }} catch (error) {{
@@ -1380,12 +1347,6 @@ def _dashboard_html() -> str:
         <td style="width: 16%">${{esc(l.memory_id || "")}}</td>
       </tr>`).join("");
       el("lifecycle").innerHTML = table([th("time"), th("decision"), th("reason"), th("memory")], rows);
-    }}
-    async function loadVerificationConfig() {{
-      const data = await getJson("/api/verification-config", {{ project_id: projectQuery() }});
-      const p = data.verification_config || {{}};
-      el("verification").innerHTML = table([th("key"), th("values")], Object.entries(p).map(([key, values]) => `<tr><td style="width: 28%">${{esc(key)}}</td><td>${{(values || []).map(v => `<span class="pill">${{esc(v)}}</span>`).join("") || `<span class='muted'>${{esc(t("emptyValue"))}}</span>`}}</td></tr>`).join(""));
-      el("rawVerificationConfig").textContent = data.raw || "";
     }}
     async function loadTools() {{
       const data = await getJson("/api/tools", {{ project_id: projectQuery() }});

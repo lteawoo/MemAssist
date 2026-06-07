@@ -60,7 +60,7 @@ CODEX_MEMASSIST_HOOKS = {
                     "type": "command",
                     "command": "python3 -m memassist hook stop",
                     "timeout": 30,
-                    "statusMessage": "memassist verification check",
+                    "statusMessage": "memassist memory lifecycle",
                 }
             ],
         }

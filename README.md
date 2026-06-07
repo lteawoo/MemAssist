@@ -4,7 +4,7 @@
 작동하는 로컬 메모리 레이어입니다.
 
 사용자는 평소처럼 AI 코딩 도구를 사용합니다. `memassist`는 그 세션을 관찰하면서
-프로젝트 규칙, 반복되는 작업 방식, 자주 쓰는 검증 명령, 조심해야 할 파일이나 정책을
+프로젝트 규칙, 반복되는 작업 방식, 자주 쓰는 검증 명령, 조심해야 할 파일이나 주의사항을
 기억합니다. 다음 세션에서는 관련 기억을 다시 찾아 AI 코딩 도구의 prompt context에
 넣어 줍니다.
 
@@ -13,7 +13,7 @@
 > 같은 프로젝트 설명, 같은 테스트 명령, 같은 주의사항을 매번 다시 말하지 않게 한다.
 
 `memassist`는 로컬 우선 도구입니다. 프로젝트에서 `memassist init`을 실행하면
-프로젝트 루트의 `.memassist/` 하나에 정책, ignore 파일, Markdown memory, trace, embedding profile,
+프로젝트 루트의 `.memassist/` 하나에 ignore 파일, Markdown memory, trace, embedding profile,
 재생성 가능한 SQLite 검색 인덱스/텔레메트리/embedding 캐시가 함께 저장됩니다. `~/.memassist`는 아직 초기화하지 않은 경로나 명시적인 전역 사용을 위한
 fallback/global home입니다.
 
@@ -92,7 +92,7 @@ memassist doctor --json
 Codex는 hook 신뢰 설정이 필요합니다. Codex integration을 설치하거나 변경한 뒤에는
 Codex CLI에서 `/hooks`를 열고 프로젝트 `.codex` layer와 hook 정의를 신뢰해야 합니다.
 프로젝트 scope로 설치된 hook은 `MEMASSIST_HOME=<project>/.memassist`를 고정해서,
-hook 실행 중에도 같은 프로젝트 DB와 정책 파일을 사용합니다.
+hook 실행 중에도 같은 프로젝트 DB를 사용합니다.
 
 ## 설치하면 무엇이 자동으로 되나요?
 
@@ -192,7 +192,6 @@ stateDiagram-v2
 
 ```bash
 memassist session latest --json
-memassist verify --session latest --json
 memassist memory candidates --session latest --json
 memassist memory list --all
 ```
@@ -242,16 +241,12 @@ flowchart TD
     K --> L[Relevant memassist memory로 주입]
 ```
 
-기본 검증 설정 파일은 호환성을 위해 `.memassist/verification.yaml` 이름을 유지합니다.
-이 파일은 `verification_commands`(테스트 실행 reminder)만 보관합니다. `memassist`는
-PreToolUse에서 경고나 차단을 수행하지 않습니다. 사용자 지시는 memory retrieval을 통해
-agent context에 주입되며, 집행은 agent의 자율 판단에 맡겨집니다.
+`memassist`는 별도 검증 설정 파일을 만들지 않습니다. 테스트 명령이나 확인 절차는
+`workflow` memory 또는 `verification`/`test` 태그가 붙은 memory로 저장되어 관련 요청 때
+verifier reminder로 검색됩니다. PreToolUse에서 경고나 차단을 수행하지 않으며, 사용자 지시는
+memory retrieval을 통해 agent context에 주입되고 집행은 agent의 자율 판단에 맡겨집니다.
 
-```yaml
-verification_commands: []
-```
-
-memory를 명시적으로 활성화해도 정책 파일은 변경되지 않습니다. 활성화는 retrieval 대상에
+memory를 명시적으로 활성화해도 설정 파일은 변경되지 않습니다. 활성화는 retrieval 대상에
 포함할지를 바꾸는 memory lifecycle 동작입니다. judge가 만든 memory를 retrieval에서 제외하려면
 archive/deactivate합니다.
 
@@ -500,13 +495,6 @@ memassist memory cleanup
 이 항목은 자동 삭제하지 않고 `suspect_echo_or_drift`로 노출해서 사용자가 확인한 뒤
 deactivate할 수 있게 합니다.
 
-세션 검증:
-
-```bash
-memassist verify --session latest
-memassist eval run --session latest --json
-```
-
 저장소 테스트:
 
 ```bash
@@ -519,7 +507,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 - Stop에서 관찰한 memory source evidence는 프로젝트 루트의 `.memassist/sources.jsonl`에 compact JSONL ledger로 저장됩니다.
 - embedding profile 설정은 프로젝트 루트의 `.memassist/embedding-profiles.yaml`에 저장됩니다.
 - 기본 SQLite 인덱스는 프로젝트 루트의 `.memassist/memassist.db`에 저장되는 파생 검색 인덱스/텔레메트리/profile별 embedding 캐시입니다.
-- 프로젝트 정책과 ignore 파일도 같은 `.memassist/`에 저장됩니다.
+- 프로젝트 ignore 파일도 같은 `.memassist/`에 저장됩니다.
 - memory와 trace는 기본적으로 로컬에 남습니다.
 - 민감 파일이나 생성물은 `.memassist/ignore`에 추가해 trace-derived memory 후보에서 제외할 수 있습니다.
 - Markdown memory를 직접 편집하거나 SQLite 파일을 삭제한 뒤에는 `memassist memory rebuild-index`로 SQLite 검색 인덱스를 다시 만들 수 있습니다.

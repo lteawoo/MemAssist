@@ -203,7 +203,6 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                     "/api/summary",
                     "/api/projects",
                     "/api/memories",
-                    "/api/verification-config",
                     "/api/tools",
                 ):
                     status, _headers, payload = client.get_json(endpoint)
@@ -216,7 +215,6 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                     or _contains_text(payloads["/api/projects"], project.id)
                 )
                 self.assertTrue(_contains_text(payloads["/api/memories"], "Keep GUI API read only."))
-                self.assertTrue(_contains_text(payloads["/api/verification-config"], "verification_commands"))
                 for tool in ("codex", "claude", "opencode"):
                     self.assertTrue(_contains_text(payloads["/api/tools"], tool), tool)
                 self.assertTrue(_has_summary_signal(payloads["/api/summary"]))
@@ -233,7 +231,6 @@ class GuiReadOnlyApiTest(unittest.TestCase):
                     "/api/summary",
                     "/api/projects",
                     "/api/memories",
-                    "/api/verification-config",
                     "/api/tools",
                 ):
                     for method in ("POST", "PUT", "PATCH", "DELETE"):
@@ -377,9 +374,6 @@ class GuiReadOnlyApiTest(unittest.TestCase):
 
     def _seed_project(self) -> Any:
         self.assertEqual(main(["init", "--tools", "codex"]), 0)
-        config_path = Path.cwd() / ".memassist" / "verification.yaml"
-        with config_path.open("a", encoding="utf-8") as file:
-            file.write('\nverification_commands:\n  - "pytest tests/test_gui.py"\n')
         project = detect_project()
         with Store() as store:
             store.upsert_project(project)
