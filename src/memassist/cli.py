@@ -27,7 +27,6 @@ from .embedding_profiles import (
     load_embedding_profile_config,
 )
 from .embeddings import build_memory_embeddings, install_embedding_model
-from .extraction import extract_candidates, store_candidates
 from .integrations import install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
 from .lesson import lesson_from_session
 from .lifecycle import cleanup_memories, process_session_lifecycle
@@ -117,12 +116,6 @@ def build_parser() -> argparse.ArgumentParser:
     mem_pack.add_argument("--profile")
     mem_pack.add_argument("--json", action="store_true")
     mem_pack.set_defaults(func=cmd_memory_pack)
-
-    mem_candidates = memory_sub.add_parser("candidates", help="show or store memory candidates")
-    mem_candidates.add_argument("--session", default="latest")
-    mem_candidates.add_argument("--store", action="store_true")
-    mem_candidates.add_argument("--json", action="store_true")
-    mem_candidates.set_defaults(func=cmd_memory_candidates)
 
     mem_links = memory_sub.add_parser("links", help="show related memories")
     mem_links.add_argument("id")
@@ -399,31 +392,6 @@ def cmd_memory_pack(args: argparse.Namespace) -> int:
         _print_json(pack.as_dict())
     else:
         print(render_prompt_context(pack))
-    return 0
-
-
-def cmd_memory_candidates(args: argparse.Namespace) -> int:
-    project = detect_project()
-    with _store() as store:
-        session_id = _resolve_session_id(store, args.session, project.id)
-        if not session_id:
-            print("No traced session found.")
-            return 1
-        events = store.trace_events(session_id)
-        if args.store:
-            ids = store_candidates(events, store.add_memory, project_id=project.id)
-            if args.json:
-                _print_json({"session_id": session_id, "stored": ids})
-            else:
-                for memory_id in ids:
-                    print(memory_id)
-            return 0
-        candidates = extract_candidates(events)
-    if args.json:
-        _print_json([candidate.as_dict() for candidate in candidates])
-    else:
-        for candidate in candidates:
-            print(f"[{candidate.type}] {candidate.content}")
     return 0
 
 

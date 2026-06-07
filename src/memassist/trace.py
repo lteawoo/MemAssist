@@ -52,20 +52,6 @@ def summarize_output(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def command_is_test(command: str) -> bool:
-    normalized = command.strip()
-    patterns = [
-        r"(^|\s)npm\s+test(\s|$)",
-        r"(^|\s)pnpm\s+test(\s|$)",
-        r"(^|\s)yarn\s+test(\s|$)",
-        r"(^|\s)pytest(\s|$)",
-        r"(^|\s)python3?\s+-m\s+unittest(\s|$)",
-        r"(^|\s)go\s+test(\s|$)",
-        r"(^|\s)cargo\s+test(\s|$)",
-    ]
-    return any(re.search(pattern, normalized) for pattern in patterns)
-
-
 def _command_text(payload: dict[str, Any]) -> str:
     command = payload.get("command")
     if isinstance(command, str):

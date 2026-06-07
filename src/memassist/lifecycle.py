@@ -46,16 +46,7 @@ def process_session_lifecycle(
     session_id: str | None,
     project_id: str | None,
 ) -> LifecycleResult:
-    """Run maintenance lifecycle operations for a session.
-
-    D5: Deterministic heuristic candidate extraction has been removed.
-    Memory ingestion now happens exclusively through the isolated judge path
-    (process_pending_memory_intents → store_judge_result), which includes
-    conflict resolution and duplicate reinforcement before storage.
-
-    This function now handles only operational maintenance:
-    cleanup_memories handles expiry-based archival and exact duplicate cleanup.
-    """
+    """Run maintenance lifecycle operations for a session."""
     cleanup = cleanup_memories(store)
     return LifecycleResult(
         session_id=session_id,

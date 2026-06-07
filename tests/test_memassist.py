@@ -29,8 +29,6 @@ from memassist.embeddings import (
     install_embedding_model,
     register_embedding_provider,
 )
-from memassist.evaluator import evaluate_candidate
-from memassist.extraction import MemoryCandidate, extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from memassist.memory_artifacts import find_memory_artifact
 from memassist.memory_judge import (
@@ -191,37 +189,6 @@ def _collect_hook_commands(obj: object) -> list[str]:
 
 
 class MemassistTest(unittest.TestCase):
-    def test_evaluator_activates_explicit_directive_from_source_metadata(self) -> None:
-        candidate = MemoryCandidate(
-            type="directive",
-            content="앞으로 refresh token 변경은 묻지 않고 수정하지마",
-            tags=["explicit", "user_prompt", "auth", "token"],
-            importance=0.85,
-            confidence=0.85,
-            reason="User explicitly asked to remember this future behavior.",
-        )
-
-        decision = evaluate_candidate(candidate, existing_memories=[])
-
-        self.assertEqual(decision.status, "active")
-        self.assertEqual(decision.decision, "activate")
-        self.assertEqual(decision.risk, "low")
-
-    def test_evaluator_keeps_inferred_rule_candidate_without_explicit_source(self) -> None:
-        candidate = MemoryCandidate(
-            type="rule",
-            content="Do not change refresh token policy without asking.",
-            tags=["lesson"],
-            importance=0.8,
-            confidence=0.7,
-            reason="Inferred from trace behavior, not a direct user source.",
-        )
-
-        decision = evaluate_candidate(candidate, existing_memories=[])
-
-        self.assertEqual(decision.status, "candidate")
-        self.assertEqual(decision.decision, "keep_candidate")
-
     def test_init_creates_project_memory_home(self) -> None:
         with isolated_env() as (_root, project, _home):
             code = main(["init"])
@@ -2209,25 +2176,6 @@ class MemassistTest(unittest.TestCase):
             ]
             self.assertEqual(len(heuristic_candidates), 0)
 
-    def test_extract_candidates_ignores_assistant_echo_memory_wording(self) -> None:
-        with isolated_env():
-            main(["init"])
-            project = detect_project()
-            with Store() as store:
-                store.upsert_project(project)
-                store.add_trace_event(
-                    session_id="sess_explicit_line",
-                    project_id=project.id,
-                    event_type="stop",
-                    input_json={
-                        "last_assistant_message": "`npm test` passed.\n\n앞으로 refresh token 정책은 묻지 않고 수정하지 않습니다."
-                    },
-                )
-                candidates = extract_candidates(store.trace_events("sess_explicit_line"))
-
-            contents = [candidate.content for candidate in candidates]
-            self.assertNotIn("앞으로 refresh token 정책은 묻지 않고 수정하지 않습니다.", contents)
-
     def test_user_prompt_short_reply_does_not_activate_candidate_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):
             main(["init"])
@@ -3274,6 +3222,9 @@ class MemassistTest(unittest.TestCase):
             with Store() as store:
                 memory = store.get_memory(lesson_id)
                 self.assertEqual(memory.status, "candidate")  # type: ignore[union-attr]
+                self.assertIn("Observed commands:", memory.content)  # type: ignore[union-attr]
+                self.assertIn("npm test", memory.content)  # type: ignore[union-attr]
+                self.assertNotIn("Verification observed", memory.content)  # type: ignore[union-attr]
 
             with patch("sys.stdout", StringIO()):
                 code = main(["memory", "deactivate", lesson_id])
@@ -3890,7 +3841,7 @@ class AdaptiveSignalTest(unittest.TestCase):
         self.assertNotIn("test_commands", as_dict)
 
     def test_build_judge_payload_includes_session_trace_signals(self) -> None:
-        """D4/D5: build_judge_payload includes raw_commands, touched_files, denied_tool_events."""
+        """build_judge_payload includes raw_commands, touched_files, denied_tool_events."""
         from memassist.memory_judge import build_judge_payload
         from memassist.project import Project
         from pathlib import Path
@@ -4142,11 +4093,7 @@ def _insert_legacy_sqlite_only_memory(store: Store, *, project_id: str, status: 
 
 
 class JudgeDuplicateReinforceTest(unittest.TestCase):
-    """D5: Judge path absorbs duplicate detection and reinforce_memory calls.
-
-    When the same content arrives via the judge a second time, it must not create
-    a new memory row but must call reinforce_memory so strength/recurrence rise.
-    """
+    """Judge duplicate handling reinforces existing memory rows."""
 
     def _fixture_response(self, content: str, memory_type: str = "directive") -> str:
         return judge_fixture(content, memory_type=memory_type, source_integrity="clean", reason="test duplicate reinforce")
