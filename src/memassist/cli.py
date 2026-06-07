@@ -8,6 +8,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .async_ingestion import (
+    async_batch_limit,
+    async_ingestion_enabled_for_hook,
+    hook_mode,
+    pending_source_count,
+    run_async_ingestion_once,
+    spawn_async_ingestion_worker,
+    stop_ingest_mode,
+    sync_ingestion_enabled_for_hook,
+)
 from .doctor import run_doctor
 from .embedding_profiles import (
     EmbeddingProfileError,
@@ -270,6 +280,9 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_sub = daemon.add_subparsers(required=True)
     daemon_once = daemon_sub.add_parser("once", help="process latest session once")
     daemon_once.add_argument("--session", default="latest")
+    daemon_once.add_argument("--batch-limit", type=int)
+    daemon_once.add_argument("--skip-eval", action="store_true")
+    daemon_once.add_argument("--quiet", action="store_true")
     daemon_once.add_argument("--json", action="store_true")
     daemon_once.set_defaults(func=cmd_daemon_once)
 
@@ -646,16 +659,31 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
             payload=payload,
         )
         if args.hook_event == "stop":
-            observe_turn_end_memory_source(
+            if hook_mode() != "full":
+                return 0
+            source_event = observe_turn_end_memory_source(
                 store,
                 session_id=session_id,
                 project_id=project.id,
                 payload=payload,
             )
-            # Memory ingestion runs through the judge and conflict resolver. The
-            # lifecycle pass only performs operational cleanup after ingestion.
-            process_pending_memory_intents(store, project=project, session_id=session_id)
-            process_session_lifecycle(store, session_id=session_id, project_id=project.id)
+            if sync_ingestion_enabled_for_hook():
+                # Debug/test mode: preserve the historical synchronous turn-end
+                # ingestion path for deterministic local runs.
+                process_pending_memory_intents(store, project=project, session_id=session_id)
+                process_session_lifecycle(store, session_id=session_id, project_id=project.id)
+            elif async_ingestion_enabled_for_hook() and source_event and pending_source_count(store, project_id=project.id):
+                spawned = spawn_async_ingestion_worker(project, session_id=session_id)
+                store.add_trace_event(
+                    session_id=session_id,
+                    project_id=project.id,
+                    event_type="async_ingestion_requested",
+                    tool_name="memassist",
+                    input_json={
+                        "mode": stop_ingest_mode(),
+                        "spawned": spawned.as_dict(),
+                    },
+                )
     return 0
 
 
@@ -1006,35 +1034,54 @@ def cmd_daemon_once(args: argparse.Namespace) -> int:
     project = detect_project()
     with _store() as store:
         store.upsert_project(project)
-        session_id = _resolve_session_id(store, args.session, project.id)
+        process_all_sessions = str(args.session).lower() in {"all", "*", "project"}
+        session_id = None if process_all_sessions else _resolve_session_id(store, args.session, project.id)
         stored: list[str] = []
         eval_result = None
         lifecycle_result = None
-        if session_id:
-            events = store.trace_events(session_id)
-            lifecycle_result = process_session_lifecycle(store, session_id=session_id, project_id=project.id)
-            stored = lifecycle_result.stored
-            eval_result = run_eval(
-                events,
-                memories=store.list_memories(project_id=project.id, include_global=True),
-                verification_config=load_verification_config(project.root),
+        ingestion_result = None
+        if session_id or process_all_sessions:
+            events = store.trace_events(session_id, project_id=project.id, limit=200)
+            ingestion_result = run_async_ingestion_once(
+                store,
+                project=project,
+                session_id=session_id,
+                batch_limit=args.batch_limit or async_batch_limit(),
             )
+            lifecycle_result = ingestion_result.lifecycle
+            stored = [
+                str(decision["memory_id"])
+                for decision in ingestion_result.decisions
+                if decision.get("memory_id")
+            ]
+            if not args.skip_eval:
+                eval_result = run_eval(
+                    events,
+                    memories=store.list_memories(project_id=project.id, include_global=True),
+                    verification_config=load_verification_config(project.root),
+                )
         cleanup_result = lifecycle_result.cleanup if lifecycle_result else cleanup_memories(store)
+    output_session_id = "all" if process_all_sessions else session_id
     payload = {
-        "session_id": session_id,
+        "session_id": output_session_id,
         "stored_candidates": stored,
+        "ingestion": ingestion_result.as_dict() if ingestion_result else None,
         "lifecycle": lifecycle_result.as_dict() if lifecycle_result else None,
         "cleanup": cleanup_result.as_dict(),
         "eval": eval_result.as_dict() if eval_result else None,
     }
     if args.json:
         _print_json(payload)
-    else:
+    elif not args.quiet:
         print(f"session: {session_id or '-'}")
         print(f"stored_candidates: {len(stored)}")
+        if ingestion_result:
+            print(f"ingestion: {ingestion_result.status} processed={ingestion_result.processed}")
         print(f"archived: {len(cleanup_result.archived)}")
         if eval_result:
             print("eval: " + ("PASS" if eval_result.passed else "FAIL"))
+    if ingestion_result and ingestion_result.status == "failed":
+        return 1
     return 0 if eval_result is None or eval_result.passed else 1
 
 

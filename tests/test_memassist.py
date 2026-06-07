@@ -12,6 +12,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from memassist.async_ingestion import WorkerSpawnResult, pending_source_count, stop_ingest_mode, worker_lock_path
 from memassist.cli import main
 from memassist.embedding_profiles import (
     EmbeddingProfile,
@@ -32,7 +33,12 @@ from memassist.evaluator import evaluate_candidate
 from memassist.extraction import MemoryCandidate, extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
 from memassist.memory_artifacts import find_memory_artifact
-from memassist.memory_judge import INTERPRETER_ACTIVE_ENV, build_judge_payload, observe_turn_end_memory_source
+from memassist.memory_judge import (
+    INTERPRETER_ACTIVE_ENV,
+    build_judge_payload,
+    observe_turn_end_memory_source,
+    pending_memory_source_events,
+)
 from memassist.models import MEMORY_STATUSES, Memory
 from memassist.verification_config import default_verification_config_yaml, load_verification_config
 from memassist.project import detect_project, detect_project_for_init
@@ -57,6 +63,7 @@ class _TestEmbeddingProvider:
 
 register_embedding_provider("test", _TestEmbeddingProvider)
 os.environ.setdefault("MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL", "1")
+os.environ.setdefault("MEMASSIST_STOP_INGEST_MODE", "sync")
 
 
 def judge_fixture(
@@ -164,7 +171,8 @@ def _stop_for(payload: dict) -> int:
         if payload.get(key):
             stop_payload[key] = payload.get(key)
             break
-    return _fire_hook("stop", stop_payload)
+    with patch.dict(os.environ, {"MEMASSIST_STOP_INGEST_MODE": "sync", "MEMASSIST_HOOK_MODE": "full"}):
+        return _fire_hook("stop", stop_payload)
 
 
 def _collect_hook_commands(obj: object) -> list[str]:
@@ -1506,7 +1514,9 @@ class MemassistTest(unittest.TestCase):
                     "cwd": str(project_dir),
                     "prompt": "앞으로 리프레시 토큰 변경은 나에게 확인 받고 수정해.",
                 }
-                with patch("sys.stdin", StringIO(json.dumps(payload, ensure_ascii=False))), patch("sys.stdout", StringIO()):
+                with patch.dict(os.environ, {"MEMASSIST_STOP_INGEST_MODE": "sync", "MEMASSIST_HOOK_MODE": "full"}), patch(
+                    "sys.stdin", StringIO(json.dumps(payload, ensure_ascii=False))
+                ), patch("sys.stdout", StringIO()):
                     self.assertEqual(main(["hook", "stop"]), 0)
             finally:
                 if old_fixture is None:
@@ -2296,6 +2306,217 @@ class MemassistTest(unittest.TestCase):
             self.assertIn("memory_judged", event_types)
             self.assertFalse(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
             self.assertNotIn("src/auth/refresh-token-policy.ts", (project_dir / ".memassist" / "verification.yaml").read_text())
+
+    def test_stop_async_enqueues_source_and_spawns_without_judging(self) -> None:
+        old_mode = os.environ.pop("MEMASSIST_STOP_INGEST_MODE", None)
+        try:
+            self.assertEqual("async", stop_ingest_mode())
+        finally:
+            if old_mode is not None:
+                os.environ["MEMASSIST_STOP_INGEST_MODE"] = old_mode
+
+        with isolated_env() as (_root, project_dir, _home), patch.dict(
+            os.environ,
+            {"MEMASSIST_STOP_INGEST_MODE": "async", "MEMASSIST_HOOK_MODE": "full"},
+        ):
+            self.assertEqual(main(["init", "--tools", "codex"]), 0)
+            payload = {
+                "session_id": "sess_async_stop",
+                "cwd": str(project_dir),
+                "prompt": "앞으로 API schema 변경 전에는 migration 테스트를 먼저 실행해줘",
+            }
+            with patch(
+                "memassist.cli.spawn_async_ingestion_worker",
+                return_value=WorkerSpawnResult(status="spawned", session_id="sess_async_stop", pid=123),
+            ) as spawn, patch(
+                "memassist.cli.process_pending_memory_intents"
+            ) as process:
+                self.assertEqual(_fire_hook("stop", payload), 0)
+            spawn.assert_called_once()
+            process.assert_not_called()
+            with Store() as store:
+                events = [dict(event) for event in store.trace_events("sess_async_stop")]
+            event_types = [event["event_type"] for event in events]
+            self.assertIn("stop", event_types)
+            self.assertIn("memory_source_observed", event_types)
+            self.assertIn("async_ingestion_requested", event_types)
+            self.assertNotIn("memory_judged", event_types)
+
+    def test_daemon_once_processes_pending_source_into_retrievable_memory(self) -> None:
+        with isolated_env() as (_root, project_dir, _home), patch.dict(
+            os.environ,
+            {
+                "MEMASSIST_STOP_INGEST_MODE": "off",
+                "MEMASSIST_HOOK_MODE": "full",
+                "MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE": judge_fixture(
+                    "API schema changes should run migration tests first.",
+                    source_quote="앞으로 API schema 변경 전에는 migration 테스트를 먼저 실행해줘",
+                    memory_type="workflow",
+                ),
+            },
+        ):
+            self.assertEqual(main(["init", "--tools", "codex"]), 0)
+            payload = {
+                "session_id": "sess_daemon_ingest",
+                "cwd": str(project_dir),
+                "prompt": "앞으로 API schema 변경 전에는 migration 테스트를 먼저 실행해줘",
+            }
+            self.assertEqual(_fire_hook("stop", payload), 0)
+            with Store() as store:
+                before_events = [event["event_type"] for event in store.trace_events("sess_daemon_ingest")]
+            self.assertIn("memory_source_observed", before_events)
+            self.assertNotIn("memory_judged", before_events)
+            self.assertNotIn("async_ingestion_requested", before_events)
+            doctor_out = StringIO()
+            with patch("sys.stdout", doctor_out):
+                self.assertEqual(main(["doctor", "--json"]), 0)
+            doctor = json.loads(doctor_out.getvalue())
+            async_check = next(check for check in doctor["checks"] if check["name"] == "async_ingestion")
+            self.assertEqual("warn", async_check["status"])
+            self.assertIn("pending=1", async_check["detail"])
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["daemon", "once", "--session", "sess_daemon_ingest", "--skip-eval", "--json"]), 0)
+            result = json.loads(out.getvalue())
+            self.assertEqual("ok", result["ingestion"]["status"])
+            self.assertEqual(1, result["ingestion"]["processed"])
+            project = detect_project()
+            with Store() as store:
+                memories = store.list_memories(project_id=project.id, include_global=False, status=None)
+                pack = build_memory_pack(store, query="migration test API schema", project_id=project.id)
+            self.assertTrue(any(memory.source_kind == "isolated_memory_judge" for memory in memories))
+            self.assertTrue(any("API schema changes" in item["content"] for item in pack.as_dict()["context"]))
+
+    def test_daemon_once_respects_async_batch_limit(self) -> None:
+        with isolated_env() as (_root, project_dir, _home), patch.dict(
+            os.environ,
+            {
+                "MEMASSIST_STOP_INGEST_MODE": "off",
+                "MEMASSIST_HOOK_MODE": "full",
+                "MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE": judge_fixture(
+                    "Run migration tests before API schema changes.",
+                    memory_type="workflow",
+                ),
+            },
+        ):
+            self.assertEqual(main(["init", "--tools", "codex"]), 0)
+            for index in range(2):
+                payload = {
+                    "session_id": "sess_daemon_batch",
+                    "cwd": str(project_dir),
+                    "prompt": f"앞으로 API schema 변경 전 migration 테스트 {index}를 기억해",
+                }
+                self.assertEqual(_fire_hook("stop", payload), 0)
+
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(
+                    main(["daemon", "once", "--session", "sess_daemon_batch", "--batch-limit", "1", "--skip-eval", "--json"]),
+                    0,
+                )
+            result = json.loads(out.getvalue())
+            self.assertEqual(1, result["ingestion"]["processed"])
+            with Store() as store:
+                judged = [event for event in store.trace_events("sess_daemon_batch") if event["event_type"] == "memory_judged"]
+                self.assertEqual(1, len(judged))
+                self.assertEqual(1, pending_source_count(store, project_id=detect_project().id, session_id="sess_daemon_batch"))
+
+    def test_trace_hook_mode_stop_does_not_enqueue_or_spawn_ingestion(self) -> None:
+        with isolated_env() as (_root, project_dir, _home), patch.dict(
+            os.environ,
+            {"MEMASSIST_STOP_INGEST_MODE": "async", "MEMASSIST_HOOK_MODE": "trace"},
+        ):
+            self.assertEqual(main(["init", "--tools", "codex", "--mode", "trace"]), 0)
+            payload = {
+                "session_id": "sess_trace_stop",
+                "cwd": str(project_dir),
+                "prompt": "앞으로 trace 모드에서는 memory ingest를 하지 않는다",
+            }
+            with patch("memassist.cli.spawn_async_ingestion_worker") as spawn:
+                self.assertEqual(_fire_hook("stop", payload), 0)
+            spawn.assert_not_called()
+            with Store() as store:
+                event_types = [event["event_type"] for event in store.trace_events("sess_trace_stop")]
+            self.assertIn("stop", event_types)
+            self.assertNotIn("memory_source_observed", event_types)
+            self.assertNotIn("async_ingestion_requested", event_types)
+
+    def test_stop_async_skips_spawn_when_worker_lock_is_active(self) -> None:
+        with isolated_env() as (_root, project_dir, _home), patch.dict(
+            os.environ,
+            {"MEMASSIST_STOP_INGEST_MODE": "async", "MEMASSIST_HOOK_MODE": "full"},
+        ):
+            self.assertEqual(main(["init", "--tools", "codex"]), 0)
+            lock_path = worker_lock_path(project_dir / ".memassist")
+            lock_path.write_text('{"pid": 1}\n', encoding="utf-8")
+            payload = {
+                "session_id": "sess_async_locked",
+                "cwd": str(project_dir),
+                "prompt": "앞으로 locked worker 테스트를 기억해",
+            }
+            self.assertEqual(_fire_hook("stop", payload), 0)
+            with Store() as store:
+                requests = [
+                    json.loads(str(event["input_json"] or "{}"))
+                    for event in store.trace_events("sess_async_locked")
+                    if event["event_type"] == "async_ingestion_requested"
+                ]
+            self.assertEqual(1, len(requests))
+            self.assertEqual("skipped_locked", requests[0]["spawned"]["status"])
+
+    def test_daemon_once_records_async_failure_diagnostics(self) -> None:
+        with isolated_env() as (_root, project_dir, _home), patch.dict(
+            os.environ,
+            {"MEMASSIST_STOP_INGEST_MODE": "off", "MEMASSIST_HOOK_MODE": "full"},
+        ):
+            self.assertEqual(main(["init", "--tools", "codex"]), 0)
+            payload = {
+                "session_id": "sess_async_failure",
+                "cwd": str(project_dir),
+                "prompt": "앞으로 실패 진단 테스트를 기억해",
+            }
+            self.assertEqual(_fire_hook("stop", payload), 0)
+            with patch("memassist.async_ingestion.process_memory_intent_event", side_effect=RuntimeError("boom")):
+                out = StringIO()
+                with patch("sys.stdout", out):
+                    self.assertEqual(main(["daemon", "once", "--session", "sess_async_failure", "--skip-eval", "--json"]), 1)
+            result = json.loads(out.getvalue())
+            self.assertEqual("failed", result["ingestion"]["status"])
+            self.assertIn("boom", result["ingestion"]["error"])
+            with Store() as store:
+                event_types = [event["event_type"] for event in store.trace_events("sess_async_failure")]
+            self.assertIn("async_ingestion_worker_failed", event_types)
+
+    def test_pending_source_lookup_finds_old_pending_beyond_recent_trace_window(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                pending_id = store.add_trace_event(
+                    session_id="sess_old_pending",
+                    project_id=project.id,
+                    event_type="memory_source_observed",
+                    tool_name="memassist",
+                    input_json={"content": "old pending source", "source_ref": "old", "status": "pending"},
+                )
+                for index in range(250):
+                    source_id = store.add_trace_event(
+                        session_id=f"sess_processed_{index}",
+                        project_id=project.id,
+                        event_type="memory_source_observed",
+                        tool_name="memassist",
+                        input_json={"content": f"processed source {index}", "source_ref": str(index), "status": "pending"},
+                    )
+                    store.add_trace_event(
+                        session_id=f"sess_processed_{index}",
+                        project_id=project.id,
+                        event_type="memory_judged",
+                        tool_name="memassist",
+                        input_json={"source_event_id": source_id, "candidate": None},
+                    )
+                pending = pending_memory_source_events(store, project_id=project.id, limit=1)
+            self.assertEqual(pending_id, pending[0]["id"])
 
     def test_stop_without_source_evidence_does_not_judge_memory(self) -> None:
         with isolated_env() as (_root, project_dir, _home):

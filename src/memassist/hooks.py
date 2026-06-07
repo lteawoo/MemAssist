@@ -140,11 +140,11 @@ def _codex_memassist_hooks(*, mode: str = "full", memassist_home: Path | None = 
         for group in groups:
             for hook in group.get("hooks", []):
                 hook_event = str(hook["command"]).rsplit(" ", 1)[-1]
-                hook["command"] = _python_hook_command(hook_event, memassist_home=memassist_home)
+                hook["command"] = _python_hook_command(hook_event, memassist_home=memassist_home, mode=mode)
     return hooks
 
 
-def _python_hook_command(hook_event: str, *, memassist_home: Path | None = None) -> str:
+def _python_hook_command(hook_event: str, *, memassist_home: Path | None = None, mode: str | None = None) -> str:
     env: list[str] = []
     source_root = Path(__file__).resolve().parents[1]
     if (source_root / "memassist").exists():
@@ -152,6 +152,8 @@ def _python_hook_command(hook_event: str, *, memassist_home: Path | None = None)
     home = str(memassist_home) if memassist_home else os.environ.get("MEMASSIST_HOME")
     if home:
         env.append(f"MEMASSIST_HOME={shlex.quote(home)}")
+    if mode:
+        env.append(f"MEMASSIST_HOOK_MODE={shlex.quote(mode)}")
     prefix = " ".join(env)
     command = f"python3 -m memassist hook {hook_event}"
     return f"{prefix} {command}" if prefix else command

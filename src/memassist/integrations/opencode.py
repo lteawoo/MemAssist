@@ -67,7 +67,7 @@ def _plugin_path(project: Project, scope: str) -> Path:
 def _plugin_source(mode: ToolMode, *, memassist_home: Path | None = None) -> str:
     events = set(MODE_EVENTS[mode])
     command_by_event = {
-        event: _python_hook_command(hook_event, memassist_home=memassist_home)
+        event: _python_hook_command(hook_event, memassist_home=memassist_home, mode=mode)
         for event, hook_event in {
             "UserPromptSubmit": "user-prompt-submit",
             "PreToolUse": "pre-tool-use",

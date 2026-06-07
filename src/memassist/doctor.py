@@ -4,12 +4,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .async_ingestion import async_ingestion_diagnostics, stop_ingest_mode
 from .integrations import status_tools
 from .embedding_profiles import EmbeddingProfileError, get_embedding_profile
 from .embeddings import embedding_model_status
 from .memory_judge import judge_backend_diagnostics
 from .paths import db_path, memassist_home
 from .project import Project
+from .storage import Store
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,7 @@ def run_doctor(project: Project) -> DoctorReport:
             detail=str(judge["detail"]),
         )
     )
+    checks.append(_async_ingestion_check(project))
 
     checks.append(
         DoctorCheck(
@@ -141,3 +144,33 @@ def _embedding_detail(value: dict[str, object]) -> str:
     if isinstance(detail, str) and detail:
         parts.append(detail)
     return "; ".join(parts)
+
+
+def _async_ingestion_check(project: Project) -> DoctorCheck:
+    path = project.root / ".memassist" / "memassist.db"
+    if not path.exists():
+        return DoctorCheck(
+            name="async_ingestion",
+            status="pass",
+            detail=f"mode={stop_ingest_mode()}; pending=0; database not created yet",
+        )
+    with Store(path) as store:
+        diagnostics = async_ingestion_diagnostics(store, project=project)
+    pending = int(diagnostics.get("pending_sources") or 0)
+    lock = diagnostics.get("lock")
+    lock_detail = ""
+    if isinstance(lock, dict):
+        lock_detail = str(lock.get("detail") or "")
+    last_failure = diagnostics.get("last_failure")
+    detail_parts = [
+        f"mode={diagnostics.get('mode')}",
+        f"pending={pending}",
+        f"lock={lock_detail or 'unknown'}",
+    ]
+    if last_failure:
+        detail_parts.append(f"last_failure={last_failure}")
+    return DoctorCheck(
+        name="async_ingestion",
+        status="warn" if pending or last_failure else "pass",
+        detail="; ".join(detail_parts),
+    )

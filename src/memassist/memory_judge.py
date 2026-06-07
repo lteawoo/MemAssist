@@ -230,11 +230,8 @@ def process_pending_memory_intents(
     session_id: str,
     limit: int = 10,
 ) -> list[StoredJudgment]:
-    processed = _processed_source_event_ids(store, session_id=session_id)
     results: list[StoredJudgment] = []
-    for event in store.trace_events(session_id, limit=200):
-        if event["event_type"] != SOURCE_EVENT_TYPE or event["id"] in processed:
-            continue
+    for event in pending_memory_source_events(store, session_id=session_id, limit=limit):
         results.append(
             process_memory_intent_event(
                 store,
@@ -243,9 +240,27 @@ def process_pending_memory_intents(
                 source_event_id=str(event["id"]),
             )
         )
-        if len(results) >= limit:
-            break
     return results
+
+
+def pending_memory_source_events(
+    store: Store,
+    *,
+    session_id: str | None = None,
+    project_id: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    processed = _terminal_source_event_ids(store, session_id=session_id, project_id=project_id)
+    rows = _source_event_rows(store, session_id=session_id, project_id=project_id)
+    pending: list[dict[str, Any]] = []
+    for row in rows:
+        event = dict(row)
+        if event["id"] in processed:
+            continue
+        pending.append(event)
+        if len(pending) >= limit:
+            break
+    return pending
 
 
 def build_judge_payload(
@@ -758,12 +773,47 @@ def _trace_event_by_id(store: Store, event_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def _processed_source_event_ids(store: Store, *, session_id: str) -> set[str]:
+def _source_event_rows(
+    store: Store,
+    *,
+    session_id: str | None,
+    project_id: str | None,
+) -> list[Any]:
+    where = ["event_type = ?"]
+    params: list[object] = [SOURCE_EVENT_TYPE]
+    if session_id:
+        where.append("session_id = ?")
+        params.append(session_id)
+    if project_id:
+        where.append("project_id = ?")
+        params.append(project_id)
+    return store.conn.execute(
+        f"SELECT * FROM trace_events WHERE {' AND '.join(where)} ORDER BY created_at",
+        params,
+    ).fetchall()
+
+
+def _terminal_source_event_ids(
+    store: Store,
+    *,
+    session_id: str | None,
+    project_id: str | None,
+) -> set[str]:
+    where = ["event_type = ?"]
+    params: list[object] = ["memory_judged"]
+    if session_id:
+        where.append("session_id = ?")
+        params.append(session_id)
+    if project_id:
+        where.append("project_id = ?")
+        params.append(project_id)
+    rows = store.conn.execute(
+        f"SELECT input_json FROM trace_events WHERE {' AND '.join(where)}",
+        params,
+    ).fetchall()
     processed: set[str] = set()
-    for event in store.trace_events(session_id, limit=200):
-        if event["event_type"] != "memory_judged":
-            continue
-        source_event_id = _event_input(dict(event)).get("source_event_id")
+    for row in rows:
+        source_event_id = _event_input({"input_json": row["input_json"]}).get("source_event_id")
         if isinstance(source_event_id, str):
             processed.add(source_event_id)
     return processed

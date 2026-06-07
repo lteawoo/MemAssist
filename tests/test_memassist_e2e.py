@@ -18,6 +18,7 @@ from memassist.storage import Store
 
 
 os.environ.setdefault("MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL", "1")
+os.environ.setdefault("MEMASSIST_STOP_INGEST_MODE", "sync")
 
 
 def judge_fixture(
@@ -103,7 +104,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                 self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
             # WRITE happens at turn end (Stop); the creating prompt cannot inject memory
             # it has not stored yet. Next-turn injection is verified via rag_payload below.
-            with patch(
+            with patch.dict(os.environ, {"MEMASSIST_STOP_INGEST_MODE": "sync", "MEMASSIST_HOOK_MODE": "full"}), patch(
                 "sys.stdin",
                 StringIO(
                     json.dumps(
@@ -223,7 +224,9 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
         with patch("sys.stdin", StringIO(json.dumps(submit))), patch("sys.stdout", StringIO()):
             self.assertEqual(main(["hook", "user-prompt-submit"]), 0)
         stop = {"session_id": "sess_judge_e2e", "cwd": str(project), "prompt": self._MIXED_PROMPT}
-        with patch("sys.stdin", StringIO(json.dumps(stop))), patch("sys.stdout", StringIO()):
+        with patch.dict(os.environ, {"MEMASSIST_STOP_INGEST_MODE": "sync", "MEMASSIST_HOOK_MODE": "full"}), patch(
+            "sys.stdin", StringIO(json.dumps(stop))
+        ), patch("sys.stdout", StringIO()):
             self.assertEqual(main(["hook", "stop"]), 0)
 
     def _judged_memories(self) -> list:

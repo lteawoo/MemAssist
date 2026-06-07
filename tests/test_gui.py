@@ -18,6 +18,7 @@ from memassist.storage import Store
 
 
 os.environ.setdefault("MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL", "1")
+os.environ.setdefault("MEMASSIST_STOP_INGEST_MODE", "sync")
 
 
 @contextmanager
