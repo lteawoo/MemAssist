@@ -64,7 +64,7 @@ Retrieval & Injection
 
 ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
 │ UserPromptSubmit │──▶│ Build query      │──▶│ Hybrid search    │
-│ new prompt       │   │ prompt + context │   │ local memories   │
+│ new prompt       │   │ prompt + context │   │ BM25 + cosine    │
 └──────────────────┘   └──────────────────┘   └────────┬─────────┘
                                                         │
                                                         ▼
@@ -78,10 +78,10 @@ Retrieval & Injection
 
 | 신호 | 기준 |
 | --- | --- |
-| Lexical | chunked memory text에 대한 SQLite FTS5 |
-| Vector | 활성 로컬 embedding profile 기반 chunk vector similarity |
+| Lexical | chunked memory text에 대한 SQLite FTS5 BM25 ranking |
+| Vector | 활성 로컬 embedding profile의 cosine similarity |
 | Structure | tags, paths, links, status, chunk type |
-| Fusion | 채널별 결과를 Reciprocal Rank Fusion (RRF-style)로 결합 |
+| Fusion | lexical, vector, metadata, link/path 채널을 Reciprocal Rank Fusion (RRF-style)로 결합 |
 | Usage | `retrieval_count`, `last_used_at`, `utility`, `strength` |
 
 주입되는 결과는 현재 요청을 위한 memory pack입니다. 그 컨텍스트를 어떻게 사용할지는
@@ -115,6 +115,50 @@ Memory Ingestion
 - resolver가 중복, 충돌, lifecycle 상태, 링크를 정리합니다.
 - Markdown memory artifact가 source of truth입니다.
 - SQLite, FTS, vector embedding, telemetry는 파생 데이터입니다.
+
+## 메모리 생명주기
+
+memassist 메모리는 lifecycle 상태에 따라 세 Markdown artifact 버킷에
+저장됩니다. `active/`는 이후 턴의 검색/주입 대상이고, `candidates/`는
+불확실하거나 충돌 가능성이 있어 검토를 기다리는 후보이며, `archived/`는
+기록은 보존하지만 일반 검색과 주입에서는 제외되는 상태입니다. SQLite는 이
+artifact를 빠르게 찾기 위한 재생성 가능한 index/cache입니다.
+
+```text
+위치 결정
+
++----------------+   수락 / clean                +----------------+
+|   Stop turn    | -----------------------------> |    active/     |
+| judge/resolver |                                | 검색 대상      |
++----------------+                                | 이후 턴 주입   |
+        |                                         +----------------+
+        |
+        | 보류 / 불확실 / 충돌
+        v
++----------------+
+|  candidates/   |
+| 후보 / 검토대기 |
+| 기본 주입 제외  |
++----------------+
+
++----------------+   memassist memory add         +----------------+
+|  manual add    | -----------------------------> |    active/     |
++----------------+                                +----------------+
+
+상태 이동
+
++----------------+   memassist memory activate    +----------------+
+|  candidates/   | -----------------------------> |    active/     |
++----------------+                                +--------+-------+
+        |                                                  |
+        | memassist memory deactivate                      |
+        v                                                  |
++----------------+                                         |
+|   archived/    | <---------------------------------------+
+| 보관 기록       |   deactivate / cleanup / 대체됨
+| 검색 제외       |
++----------------+
+```
 
 ## 자주 쓰는 명령
 

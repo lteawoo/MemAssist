@@ -65,7 +65,7 @@ Retrieval & Injection
 
 ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
 │ UserPromptSubmit │──▶│ Build query      │──▶│ Hybrid search    │
-│ new prompt       │   │ prompt + context │   │ local memories   │
+│ new prompt       │   │ prompt + context │   │ BM25 + cosine    │
 └──────────────────┘   └──────────────────┘   └────────┬─────────┘
                                                         │
                                                         ▼
@@ -79,10 +79,10 @@ Hybrid search combines:
 
 | Signal | Source |
 | --- | --- |
-| Lexical | SQLite FTS5 over chunked memory text |
-| Vector | active local embedding profile over memory chunks |
+| Lexical | SQLite FTS5 BM25 ranking over chunked memory text |
+| Vector | active local embedding profile with cosine similarity over memory chunks |
 | Structure | tags, paths, links, status, and chunk type |
-| Fusion | Reciprocal Rank Fusion (RRF-style) across channels |
+| Fusion | Reciprocal Rank Fusion (RRF-style) across lexical, vector, metadata, and link/path channels |
 | Usage | `retrieval_count`, `last_used_at`, `utility`, `strength` |
 
 The injected context is a memory pack for the current request. The agent still
@@ -116,6 +116,50 @@ Memory ingestion is evidence-first:
 - The resolver handles duplicates, conflicts, lifecycle state, and links.
 - Markdown memory artifacts are the source of truth.
 - SQLite, FTS, vector embeddings, and telemetry are derived data.
+
+## Memory Lifecycle
+
+Memories live in three Markdown artifact buckets. The buckets are lifecycle
+states, not separate stores: `active/` feeds later retrieval, `candidates/`
+holds uncertain or conflicting memories for review, and `archived/` keeps
+history out of normal search and injection. SQLite mirrors these artifacts only
+as a rebuildable index/cache.
+
+```text
+Placement
+
++----------------+   accepted / clean             +----------------+
+|   Stop turn    | -----------------------------> |    active/     |
+| judge/resolver |                                | search target  |
++----------------+                                | injected later |
+        |                                         +----------------+
+        |
+        | held / uncertain / conflict
+        v
++----------------+
+|  candidates/   |
+| review queue   |
+| not injected   |
++----------------+
+
++----------------+   memassist memory add         +----------------+
+|  manual add    | -----------------------------> |    active/     |
++----------------+                                +----------------+
+
+Movement
+
++----------------+   memassist memory activate    +----------------+
+|  candidates/   | -----------------------------> |    active/     |
++----------------+                                +--------+-------+
+        |                                                  |
+        | memassist memory deactivate                      |
+        v                                                  |
++----------------+                                         |
+|   archived/    | <---------------------------------------+
+| retained       |   deactivate / cleanup / superseded
+| excluded       |
++----------------+
+```
 
 ## Daily Commands
 
