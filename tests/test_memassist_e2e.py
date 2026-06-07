@@ -17,6 +17,9 @@ from memassist.project import detect_project
 from memassist.storage import Store
 
 
+os.environ.setdefault("MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL", "1")
+
+
 def judge_fixture(
     content: str,
     *,
@@ -84,7 +87,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
             target.write_text("export const refreshTokenRotation = true;\n", encoding="utf-8")
             self.assertEqual(main(["init", "--tools", "codex", "--mode", "full"]), 0)
             os.environ["MEMASSIST_MEMORY_JUDGE_FIXTURE_RESPONSE"] = judge_fixture(
-                "Do not change refresh token policy without asking first.",
+                "리프레시 토큰 정책은 변경 전에 먼저 확인한다.",
                 source_quote="리프레쉬 토큰 정책은 담부터 묻지 않고 고치지마",
                 memory_type="directive",
                 source_integrity="clean",
@@ -123,7 +126,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
                 ]
             self.assertEqual(len(judged), 1)
             self.assertEqual(judged[0]["status"], "active")
-            self.assertEqual(judged[0]["content"], "Do not change refresh token policy without asking first.")
+            self.assertEqual(judged[0]["content"], "리프레시 토큰 정책은 변경 전에 먼저 확인한다.")
             self.assertEqual(judged[0]["paths"], [])
 
             pretool_payload = {
@@ -163,7 +166,7 @@ class MemassistTempProjectE2ETest(unittest.TestCase):
             injected = json.loads(rag_out.getvalue())
             context = injected["hookSpecificOutput"]["additionalContext"]
             self.assertIn("Relevant memassist memory:", context)
-            self.assertIn("Do not change refresh token policy without asking first.", context)
+            self.assertIn("리프레시 토큰 정책은 변경 전에 먼저 확인한다.", context)
             self.assertNotIn("Policy reminders", context)
 
             with Store() as store:

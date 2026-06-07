@@ -16,7 +16,7 @@ from .embedding_profiles import (
     get_embedding_profile,
     load_embedding_profile_config,
 )
-from .embeddings import build_memory_embeddings
+from .embeddings import build_memory_embeddings, install_embedding_model
 from .eval_runner import run_eval
 from .extraction import extract_candidates, store_candidates
 from .integrations import install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
@@ -64,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="initialize .memassist in this project")
     init.add_argument("--tools", help="also install tool integrations: codex, claude, opencode, or all")
     init.add_argument("--mode", choices=["full", "context", "trace"], default="full")
+    init.add_argument("--skip-embedding-install", action="store_true", help="do not prepare the active embedding model")
+    init.add_argument("--force-embedding-install", action="store_true", help="re-download or refresh the active embedding model")
     init.set_defaults(func=cmd_init)
 
     status = sub.add_parser("status", help="show project and storage status")
@@ -254,6 +256,11 @@ def build_parser() -> argparse.ArgumentParser:
     emb_build.add_argument("--profile")
     emb_build.add_argument("--json", action="store_true")
     emb_build.set_defaults(func=cmd_embedding_build)
+    emb_install = embedding_sub.add_parser("install", help="install the selected embedding model locally")
+    emb_install.add_argument("--profile")
+    emb_install.add_argument("--force", action="store_true")
+    emb_install.add_argument("--json", action="store_true")
+    emb_install.set_defaults(func=cmd_embedding_install)
     emb_cleanup = embedding_sub.add_parser("cleanup", help="remove derived embedding cache rows")
     emb_cleanup.add_argument("--profile")
     emb_cleanup.add_argument("--json", action="store_true")
@@ -286,6 +293,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         store.upsert_project(project)
     print(f"Initialized memassist for {project.id}")
     print(f"Project config: {config_path}")
+    if not args.skip_embedding_install and not _env_truthy("MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL"):
+        if _install_active_embedding_for_init(mem_dir, force=args.force_embedding_install) != 0:
+            return 1
     tools = _tools_or_error(args.tools)
     if tools is None:
         return 2
@@ -935,6 +945,27 @@ def cmd_embedding_build(args: argparse.Namespace) -> int:
     return 0 if result.get("status") in {"ok", "partial"} else 1
 
 
+def cmd_embedding_install(args: argparse.Namespace) -> int:
+    project = detect_project()
+    mem_dir = project_memassist_home(project.root)
+    try:
+        profile = get_embedding_profile(args.profile, mem_dir=mem_dir)
+    except EmbeddingProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    result = install_embedding_model(profile, mem_dir=mem_dir, force=args.force)
+    if args.json:
+        _print_json(result.as_dict())
+    else:
+        print(f"profile: {result.profile_id}")
+        print(f"status: {result.status}")
+        if result.path:
+            print(f"path: {result.path}")
+        if result.detail:
+            print(f"detail: {result.detail}")
+    return 0 if result.status in {"ok", "disabled"} else 1
+
+
 def cmd_embedding_cleanup(args: argparse.Namespace) -> int:
     with _store() as store:
         profile_id = args.profile
@@ -946,6 +977,29 @@ def cmd_embedding_cleanup(args: argparse.Namespace) -> int:
         target = profile_id or "all profiles"
         print(f"removed {removed} embedding cache rows for {target}")
     return 0
+
+
+def _install_active_embedding_for_init(mem_dir: Path, *, force: bool) -> int:
+    try:
+        profile = get_embedding_profile(None, mem_dir=mem_dir)
+    except EmbeddingProfileError as exc:
+        print(f"Embedding model: skipped ({exc})")
+        return 1
+    result = install_embedding_model(profile, mem_dir=mem_dir, force=force)
+    if result.status == "ok":
+        location = f" at {result.path}" if result.path else ""
+        print(f"Embedding model: installed{location}")
+        return 0
+    if result.status == "disabled":
+        print("Embedding model: disabled")
+        return 0
+    print(f"Embedding model: {result.status}" + (f" ({result.detail})" if result.detail else ""))
+    return 1
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 def cmd_daemon_once(args: argparse.Namespace) -> int:

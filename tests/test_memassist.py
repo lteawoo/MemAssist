@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import sys
 import tempfile
+import types
 import unittest
 from contextlib import contextmanager
 from io import StringIO
@@ -18,7 +20,14 @@ from memassist.embedding_profiles import (
     load_embedding_profile_config,
     save_embedding_profile_config,
 )
-from memassist.embeddings import build_memory_embeddings, register_embedding_provider
+from memassist.embeddings import (
+    EmbeddingModelInstallResult,
+    Model2VecEmbeddingProvider,
+    build_memory_embeddings,
+    embedding_model_status,
+    install_embedding_model,
+    register_embedding_provider,
+)
 from memassist.evaluator import evaluate_candidate
 from memassist.extraction import MemoryCandidate, extract_candidates
 from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
@@ -47,6 +56,7 @@ class _TestEmbeddingProvider:
 
 
 register_embedding_provider("test", _TestEmbeddingProvider)
+os.environ.setdefault("MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL", "1")
 
 
 def judge_fixture(
@@ -424,6 +434,17 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual(checks["memory_judge"]["status"], "pass")
             self.assertIn("claude", checks["memory_judge"]["detail"])
             self.assertNotIn("directive_interpreter", checks)
+
+    def test_doctor_reports_embedding_model_installation_status(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            out = StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(main(["doctor", "--json"]), 0)
+            checks = {check["name"]: check for check in json.loads(out.getvalue())["checks"]}
+            self.assertEqual("warn", checks["embedding_model"]["status"])
+            self.assertIn("missing_model", checks["embedding_model"]["detail"])
+            self.assertIn("local-default", checks["embedding_model"]["detail"])
 
     def test_init_tools_all_installs_supported_project_integrations(self) -> None:
         with isolated_env() as (_root, project, _home):
@@ -1669,6 +1690,45 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual("test-alt", parent_config.active)
             self.assertTrue(embedding_profiles_path(project / ".memassist").exists())
 
+    def test_init_installs_active_embedding_profile_unless_skipped(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            result = EmbeddingModelInstallResult(
+                profile_id="local-default",
+                status="ok",
+                path=str(project / ".memassist" / "models" / "local-default"),
+                detail="installed",
+            )
+            with patch.dict(os.environ, {"MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL": "0"}):
+                with patch("memassist.cli.install_embedding_model", return_value=result) as installer:
+                    with patch("sys.stdout", StringIO()) as out:
+                        self.assertEqual(main(["init"]), 0)
+            installer.assert_called_once()
+            profile_arg = installer.call_args.args[0]
+            self.assertEqual("local-default", profile_arg.id)
+            self.assertEqual((project / ".memassist").resolve(), installer.call_args.kwargs["mem_dir"].resolve())
+            self.assertIn("Embedding model: installed", out.getvalue())
+
+    def test_init_can_skip_embedding_install_explicitly(self) -> None:
+        with isolated_env():
+            with patch.dict(os.environ, {"MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL": "0"}):
+                with patch("memassist.cli.install_embedding_model") as installer:
+                    self.assertEqual(main(["init", "--skip-embedding-install"]), 0)
+            installer.assert_not_called()
+
+    def test_init_fails_when_active_embedding_install_fails(self) -> None:
+        with isolated_env():
+            result = EmbeddingModelInstallResult(
+                profile_id="local-default",
+                status="install_error",
+                path=None,
+                detail="network unavailable",
+            )
+            with patch.dict(os.environ, {"MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL": "0"}):
+                with patch("memassist.cli.install_embedding_model", return_value=result):
+                    with patch("sys.stdout", StringIO()) as out:
+                        self.assertEqual(main(["init"]), 1)
+            self.assertIn("Embedding model: install_error", out.getvalue())
+
     def test_default_profile_reports_missing_dependency_without_breaking_retrieval(self) -> None:
         with isolated_env():
             self.assertEqual(main(["init"]), 0)
@@ -1688,21 +1748,23 @@ class MemassistTest(unittest.TestCase):
             self.assertEqual("missing_dependency", payload["diagnostics"]["vector_status"])
             self.assertTrue(payload["context"])
 
-    def test_embedding_download_allowed_only_by_explicit_build_env(self) -> None:
-        from memassist.embeddings import _embedding_download_allowed
-
-        profile = EmbeddingProfile(
-            id="download-option",
-            provider="model2vec",
-            model="example/model",
-            quantization="int8",
-            dimension=256,
-            options={"allow_download": True},
-        )
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(_embedding_download_allowed(profile))
-            os.environ["MEMASSIST_EMBEDDING_ALLOW_DOWNLOAD"] = "1"
-            self.assertTrue(_embedding_download_allowed(profile))
+    def test_default_profile_reports_missing_model_without_runtime_download(self) -> None:
+        with isolated_env():
+            self.assertEqual(main(["init"]), 0)
+            project = detect_project()
+            with Store() as store:
+                store.add_memory(
+                    scope_type="project",
+                    project_id=project.id,
+                    type="decision",
+                    content="Lexical retrieval remains available when the embedding model is not installed.",
+                    tags=["retrieval"],
+                    status="active",
+                )
+                pack = build_memory_pack(store, query="embedding model not installed lexical", project_id=project.id)
+            payload = pack.as_dict()
+            self.assertEqual("missing_model", payload["diagnostics"]["vector_status"])
+            self.assertTrue(payload["context"])
 
     def test_none_profile_reports_disabled_vector_status(self) -> None:
         with isolated_env():
@@ -1889,6 +1951,98 @@ class MemassistTest(unittest.TestCase):
             self.assertIn(content, rendered)
             self.assertNotIn(source_quote, rendered)
             self.assertFalse(any(snippet.chunk_kind == "source_quote" for snippet in pack.snippets))
+
+    def test_embedding_install_cli_installs_selected_profile(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            self.assertEqual(main(["init"]), 0)
+            _write_test_embedding_profiles(project / ".memassist")
+            result = EmbeddingModelInstallResult(
+                profile_id="test-local",
+                status="ok",
+                path=str(project / ".memassist" / "models" / "test-local"),
+                detail="installed",
+            )
+            with patch("memassist.cli.install_embedding_model", return_value=result) as installer:
+                with patch("sys.stdout", StringIO()) as out:
+                    self.assertEqual(main(["embedding", "install", "--profile", "test-local", "--json"]), 0)
+            payload = json.loads(out.getvalue())
+            self.assertEqual("ok", payload["status"])
+            self.assertEqual("test-local", installer.call_args.args[0].id)
+            self.assertEqual((project / ".memassist").resolve(), installer.call_args.kwargs["mem_dir"].resolve())
+
+    def test_install_embedding_model_downloads_remote_model_to_profile_cache_dir(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            self.assertEqual(main(["init"]), 0)
+            profile = load_embedding_profile_config(project / ".memassist").active_profile
+            expected_path = project / ".memassist" / "models" / "local-default"
+            validated = EmbeddingModelInstallResult(profile_id=profile.id, status="ok", path=str(expected_path))
+            with patch("huggingface_hub.snapshot_download") as snapshot:
+                with patch("memassist.embeddings._validate_installed_profile", return_value=validated):
+                    result = install_embedding_model(profile, mem_dir=project / ".memassist")
+            self.assertEqual("ok", result.status)
+            self.assertEqual(str(expected_path), snapshot.call_args.kwargs["local_dir"])
+            self.assertEqual(profile.model, snapshot.call_args.kwargs["repo_id"])
+
+    def test_install_embedding_model_rejects_unsupported_provider(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            self.assertEqual(main(["init"]), 0)
+            profile = EmbeddingProfile(id="st-local", provider="sentence-transformers", model="sentence/model", dimension=384)
+            result = install_embedding_model(profile, mem_dir=project / ".memassist")
+            self.assertEqual("unsupported", result.status)
+            self.assertIn("sentence-transformers", result.detail or "")
+
+    def test_embedding_model_status_validates_cache_by_loading_provider(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            self.assertEqual(main(["init"]), 0)
+            mem_dir = project / ".memassist"
+            profile = load_embedding_profile_config(mem_dir).active_profile
+            cache_dir = mem_dir / "models" / "local-default"
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "README.txt").write_text("not a model\n", encoding="utf-8")
+
+            class FakeStaticModel:
+                @classmethod
+                def from_pretrained(cls, *_args: object, **_kwargs: object) -> "FakeStaticModel":
+                    raise RuntimeError("invalid model layout")
+
+            fake_module = types.SimpleNamespace(StaticModel=FakeStaticModel)
+            with patch.dict(sys.modules, {"model2vec": fake_module}):
+                status = embedding_model_status(profile, mem_dir=mem_dir)
+            self.assertEqual("missing_model", status.status)
+            self.assertIn("invalid model layout", status.detail or "")
+
+    def test_model2vec_provider_passes_profile_loading_options_without_force_download(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeStaticModel:
+            dim = 256
+
+            @classmethod
+            def from_pretrained(cls, path: object, **kwargs: object) -> "FakeStaticModel":
+                captured["path"] = path
+                captured.update(kwargs)
+                return cls()
+
+            def encode(self, texts: list[str]) -> list[list[float]]:
+                assert texts
+                return [[1.0, 0.0]]
+
+        profile = EmbeddingProfile(
+            id="local-default",
+            provider="model2vec",
+            model="/tmp/local-model",
+            quantization="int8",
+            dimension=256,
+            normalize=True,
+        )
+        fake_module = types.SimpleNamespace(StaticModel=FakeStaticModel)
+        with patch.dict(sys.modules, {"model2vec": fake_module}):
+            provider = Model2VecEmbeddingProvider(profile)
+        self.assertEqual("/tmp/local-model", captured["path"])
+        self.assertEqual("int8", captured["quantize_to"])
+        self.assertEqual(256, captured["dimensionality"])
+        self.assertEqual(False, captured["force_download"])
+        self.assertEqual(256, provider.dimension)
 
     def test_embedding_profile_diagnostics_do_not_create_pretool_policy(self) -> None:
         with isolated_env() as (_root, project_dir, _home):

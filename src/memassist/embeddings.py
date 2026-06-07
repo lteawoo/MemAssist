@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import math
-import os
-from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Iterator, Protocol
+from typing import Callable, Protocol
 
 from .chunks import chunk_embedding_text
 from .embedding_profiles import EmbeddingProfile, get_embedding_profile
@@ -46,6 +44,22 @@ class EmbeddingResult:
     quantization: str
     dimension: int
     vector: list[float]
+
+
+@dataclass(frozen=True)
+class EmbeddingModelInstallResult:
+    profile_id: str
+    status: str
+    path: str | None = None
+    detail: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "profile_id": self.profile_id,
+            "status": self.status,
+            "path": self.path,
+            "detail": self.detail,
+        }
 
 
 @dataclass(frozen=True)
@@ -121,13 +135,58 @@ def selected_embedding_profile(profile_id: str | None = None, *, store: Store | 
     return get_embedding_profile(profile_id, mem_dir=mem_dir)
 
 
-def instantiate_embedding_provider(profile: EmbeddingProfile) -> EmbeddingProvider:
+def instantiate_embedding_provider(
+    profile: EmbeddingProfile,
+    *,
+    mem_dir: Path | None = None,
+    local_only: bool = True,
+) -> EmbeddingProvider:
     if profile.disabled:
         raise EmbeddingDisabledError("vector retrieval is disabled for the active embedding profile")
     factory = _PROVIDER_FACTORIES.get(profile.provider)
     if not factory:
         raise EmbeddingMissingDependencyError(f"embedding provider is not registered: {profile.provider}")
-    return factory(profile)
+    return factory(_runtime_profile(profile, mem_dir=mem_dir, local_only=local_only))
+
+
+def embedding_model_install_path(profile: EmbeddingProfile, *, mem_dir: Path) -> Path | None:
+    if profile.disabled:
+        return None
+    if profile.cache_dir:
+        path = Path(profile.cache_dir).expanduser()
+        return path if path.is_absolute() else mem_dir / path
+    if profile.provider in {"model2vec", "sentence-transformers", "flagembedding"} and _looks_like_remote_model_id(profile.model):
+        return mem_dir / "models" / _safe_path_component(profile.id)
+    return None
+
+
+def embedding_model_status(profile: EmbeddingProfile, *, mem_dir: Path) -> EmbeddingModelInstallResult:
+    if profile.disabled:
+        return EmbeddingModelInstallResult(profile.id, "disabled", detail="vector retrieval is disabled for this profile")
+    if profile.provider not in _PROVIDER_FACTORIES:
+        return EmbeddingModelInstallResult(profile.id, "missing_dependency", detail=f"embedding provider is not registered: {profile.provider}")
+    installed_model = _installed_model_path(profile, mem_dir=mem_dir)
+    if installed_model:
+        return _validate_installed_profile(profile, mem_dir=mem_dir)
+    install_path = embedding_model_install_path(profile, mem_dir=mem_dir)
+    if install_path:
+        return EmbeddingModelInstallResult(profile.id, "missing_model", path=str(install_path), detail="embedding model is not installed")
+    return EmbeddingModelInstallResult(profile.id, "unknown", detail="embedding model installation path cannot be inferred")
+
+
+def install_embedding_model(
+    profile: EmbeddingProfile,
+    *,
+    mem_dir: Path,
+    force: bool = False,
+) -> EmbeddingModelInstallResult:
+    if profile.disabled:
+        return EmbeddingModelInstallResult(profile.id, "disabled", detail="vector retrieval is disabled for this profile")
+    if profile.provider not in _PROVIDER_FACTORIES:
+        return EmbeddingModelInstallResult(profile.id, "missing_dependency", detail=f"embedding provider is not registered: {profile.provider}")
+    if profile.provider == "model2vec":
+        return _install_model2vec_model(profile, mem_dir=mem_dir, force=force)
+    return EmbeddingModelInstallResult(profile.id, "unsupported", detail=f"embedding install is not supported for provider: {profile.provider}")
 
 
 def memory_embedding_text(memory: Memory) -> str:
@@ -151,7 +210,7 @@ def ensure_memory_embedding(
     if profile.disabled:
         return None
     try:
-        provider = instantiate_embedding_provider(profile)
+        provider = instantiate_embedding_provider(profile, mem_dir=store.path.parent, local_only=True)
         vector = provider.embed(profile.document_text(memory_embedding_text(memory)))
     except EmbeddingProviderError:
         return None
@@ -187,7 +246,7 @@ def ensure_memory_chunk_embedding(
     if profile.disabled:
         return None
     try:
-        provider = instantiate_embedding_provider(profile)
+        provider = instantiate_embedding_provider(profile, mem_dir=store.path.parent, local_only=True)
         vector = provider.embed(profile.document_text(chunk_embedding_text(chunk)))
     except EmbeddingProviderError:
         return None
@@ -224,7 +283,7 @@ def build_memory_embeddings(
     skipped: list[str] = []
     errors: list[dict[str, str]] = []
     try:
-        instantiate_embedding_provider(profile)
+        instantiate_embedding_provider(profile, mem_dir=store.path.parent, local_only=True)
     except EmbeddingProviderError as exc:
         return {
             "profile_id": profile.id,
@@ -272,7 +331,7 @@ def vector_search(
     if profile.disabled:
         return VectorSearchResult([], "disabled", profile)
     try:
-        provider = instantiate_embedding_provider(profile)
+        provider = instantiate_embedding_provider(profile, mem_dir=store.path.parent, local_only=True)
         query_vector = provider.embed(profile.query_text(query))
     except EmbeddingProviderError as exc:
         return VectorSearchResult([], exc.status, profile, error=str(exc))
@@ -319,7 +378,7 @@ def vector_search_chunks(
     if profile.disabled:
         return ChunkVectorSearchResult([], "disabled", profile)
     try:
-        provider = instantiate_embedding_provider(profile)
+        provider = instantiate_embedding_provider(profile, mem_dir=store.path.parent, local_only=True)
         query_vector = provider.embed(profile.query_text(query))
     except EmbeddingProviderError as exc:
         return ChunkVectorSearchResult([], exc.status, profile, error=str(exc))
@@ -372,21 +431,14 @@ class Model2VecEmbeddingProvider:
             from model2vec import StaticModel  # type: ignore[import-not-found]
         except ImportError as exc:
             raise EmbeddingMissingDependencyError("model2vec is not installed") from exc
-        allow_download = _embedding_download_allowed(profile)
-        if not allow_download and not _model2vec_model_available(profile.model):
-            raise EmbeddingMissingModelError(
-                f"embedding model is not installed locally: {profile.model}; run `memassist embedding build --profile {profile.id}`"
-            )
         try:
-            quantize_to = profile.quantization if profile.quantization not in {"", "none"} else None
-            with _hf_offline_unless_download_allowed(profile):
-                self.model = StaticModel.from_pretrained(
-                    profile.model,
-                    normalize=profile.normalize,
-                    quantize_to=quantize_to,
-                    dimensionality=profile.dimension,
-                    force_download=False,
-                )
+            self.model = StaticModel.from_pretrained(
+                profile.model,
+                normalize=profile.normalize,
+                quantize_to=_quantization_arg(profile),
+                dimensionality=_dimension_arg(profile),
+                force_download=False,
+            )
         except Exception as exc:
             raise EmbeddingMissingModelError(str(exc)) from exc
         self.dimension = int(profile.dimension or getattr(self.model, "dim", 0) or 0)
@@ -407,13 +459,8 @@ class SentenceTransformersEmbeddingProvider:
             from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
         except ImportError as exc:
             raise EmbeddingMissingDependencyError("sentence-transformers is not installed") from exc
-        if not _embedding_download_allowed(profile) and not _hf_model_available(profile.model, ("modules.json", "config.json")):
-            raise EmbeddingMissingModelError(
-                f"embedding model is not installed locally: {profile.model}; run `memassist embedding build --profile {profile.id}`"
-            )
         try:
-            with _hf_offline_unless_download_allowed(profile):
-                self.model = SentenceTransformer(profile.model)
+            self.model = SentenceTransformer(profile.model)
         except Exception as exc:
             raise EmbeddingMissingModelError(str(exc)) from exc
         self.dimension = int(profile.dimension or 0)
@@ -433,13 +480,8 @@ class FlagEmbeddingProvider:
             from FlagEmbedding import BGEM3FlagModel  # type: ignore[import-not-found]
         except ImportError as exc:
             raise EmbeddingMissingDependencyError("FlagEmbedding is not installed") from exc
-        if not _embedding_download_allowed(profile) and not _hf_model_available(profile.model, ("config.json",)):
-            raise EmbeddingMissingModelError(
-                f"embedding model is not installed locally: {profile.model}; run `memassist embedding build --profile {profile.id}`"
-            )
         try:
-            with _hf_offline_unless_download_allowed(profile):
-                self.model = BGEM3FlagModel(profile.model, use_fp16=False)
+            self.model = BGEM3FlagModel(profile.model, use_fp16=False)
         except Exception as exc:
             raise EmbeddingMissingModelError(str(exc)) from exc
         self.dimension = int(profile.dimension or 0)
@@ -469,53 +511,130 @@ def _normalize(vector: list[float]) -> list[float]:
     return [round(value / norm, 8) for value in vector]
 
 
-def _embedding_download_allowed(_profile: EmbeddingProfile) -> bool:
-    return os.environ.get("MEMASSIST_EMBEDDING_ALLOW_DOWNLOAD") == "1"
-
-
-@contextmanager
-def _hf_offline_unless_download_allowed(profile: EmbeddingProfile) -> Iterator[None]:
-    if _embedding_download_allowed(profile):
-        yield
-        return
-    keys = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
-    previous = {key: os.environ.get(key) for key in keys}
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+def _install_model2vec_model(profile: EmbeddingProfile, *, mem_dir: Path, force: bool) -> EmbeddingModelInstallResult:
     try:
-        yield
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        from model2vec import StaticModel  # type: ignore[import-not-found]
+    except ImportError as exc:
+        return EmbeddingModelInstallResult(profile.id, "missing_dependency", detail=str(exc))
+    local_model = _existing_local_model_path(profile, mem_dir=mem_dir)
+    if local_model:
+        try:
+            StaticModel.from_pretrained(
+                local_model,
+                normalize=profile.normalize,
+                quantize_to=_quantization_arg(profile),
+                dimensionality=_dimension_arg(profile),
+                force_download=False,
+            )
+        except Exception as exc:
+            return EmbeddingModelInstallResult(profile.id, "missing_model", path=str(local_model), detail=str(exc))
+        return EmbeddingModelInstallResult(profile.id, "ok", path=str(local_model), detail="embedding model is available locally")
+    install_path = embedding_model_install_path(profile, mem_dir=mem_dir)
+    if not install_path:
+        return EmbeddingModelInstallResult(profile.id, "missing_model", detail="embedding model has no local install path")
+    if _path_has_files(install_path) and not force:
+        validation = _validate_installed_profile(profile, mem_dir=mem_dir)
+        if validation.status == "ok":
+            return validation
+    if not _looks_like_remote_model_id(profile.model):
+        return EmbeddingModelInstallResult(profile.id, "missing_model", path=str(install_path), detail=f"local model path does not exist: {profile.model}")
+    try:
+        from huggingface_hub import snapshot_download  # type: ignore[import-not-found]
+    except ImportError as exc:
+        return EmbeddingModelInstallResult(profile.id, "missing_dependency", detail=str(exc))
+    try:
+        install_path.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=profile.model,
+            repo_type="model",
+            revision=profile.revision,
+            local_dir=str(install_path),
+            force_download=force,
+        )
+    except Exception as exc:
+        return EmbeddingModelInstallResult(profile.id, "install_error", path=str(install_path), detail=str(exc))
+    return _validate_installed_profile(profile, mem_dir=mem_dir)
+
+
+def _validate_installed_profile(profile: EmbeddingProfile, *, mem_dir: Path) -> EmbeddingModelInstallResult:
+    path = _installed_model_path(profile, mem_dir=mem_dir) or embedding_model_install_path(profile, mem_dir=mem_dir)
+    try:
+        instantiate_embedding_provider(profile, mem_dir=mem_dir, local_only=True)
+    except EmbeddingProviderError as exc:
+        return EmbeddingModelInstallResult(profile.id, exc.status, path=str(path) if path else None, detail=str(exc))
+    except Exception as exc:
+        return EmbeddingModelInstallResult(profile.id, "install_error", path=str(path) if path else None, detail=str(exc))
+    return EmbeddingModelInstallResult(profile.id, "ok", path=str(path) if path else None, detail="embedding model is installed and loadable")
+
+
+def _runtime_profile(profile: EmbeddingProfile, *, mem_dir: Path | None, local_only: bool) -> EmbeddingProfile:
+    if profile.provider not in {"model2vec", "sentence-transformers", "flagembedding"}:
+        return profile
+    if mem_dir:
+        installed_model = _installed_model_path(profile, mem_dir=mem_dir)
+        if installed_model:
+            return replace(profile, model=str(installed_model))
+        if local_only:
+            raise EmbeddingMissingModelError(
+                f"embedding model is not installed for profile {profile.id}; run `memassist embedding install --profile {profile.id}`"
+            )
+    if local_only and _looks_like_remote_model_id(profile.model):
+        raise EmbeddingMissingModelError(
+            f"embedding model is not installed for profile {profile.id}; run `memassist embedding install --profile {profile.id}`"
+        )
+    return profile
+
+
+def _installed_model_path(profile: EmbeddingProfile, *, mem_dir: Path) -> Path | None:
+    local_model = _existing_local_model_path(profile, mem_dir=mem_dir)
+    if local_model:
+        return local_model
+    install_path = embedding_model_install_path(profile, mem_dir=mem_dir)
+    if install_path and _path_has_files(install_path):
+        return install_path
+    return None
+
+
+def _existing_local_model_path(profile: EmbeddingProfile, *, mem_dir: Path) -> Path | None:
+    raw = Path(profile.model).expanduser()
+    candidates = [raw]
+    if not raw.is_absolute():
+        candidates.append(mem_dir / raw)
+    for candidate in candidates:
+        if _path_has_files(candidate):
+            return candidate
+    return None
+
+
+def _path_has_files(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    try:
+        next(path.iterdir())
+    except StopIteration:
+        return False
+    except OSError:
+        return False
+    return True
+
+
+def _looks_like_remote_model_id(model: str) -> bool:
+    return model.count("/") == 1 and not model.startswith((".", "/", "~"))
+
+
+def _safe_path_component(value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in value)
+    return safe or "default"
+
+
+def _quantization_arg(profile: EmbeddingProfile) -> str | None:
+    return None if profile.quantization in {"", "none"} else profile.quantization
+
+
+def _dimension_arg(profile: EmbeddingProfile) -> int | None:
+    return profile.dimension if profile.dimension and profile.dimension > 0 else None
 
 
 register_embedding_provider("model2vec", Model2VecEmbeddingProvider)
 register_embedding_provider("sentence-transformers", SentenceTransformersEmbeddingProvider)
 register_embedding_provider("flagembedding", FlagEmbeddingProvider)
-
-
-def _model2vec_model_available(model: str) -> bool:
-    return _hf_model_available(model, ("config.json",))
-
-
-def _hf_model_available(model: str, filenames: tuple[str, ...]) -> bool:
-    path = Path(model).expanduser()
-    if path.exists():
-        return True
-    if "/" not in model:
-        return False
-    try:
-        from huggingface_hub import try_to_load_from_cache  # type: ignore[import-not-found]
-    except ImportError:
-        return False
-    for filename in filenames:
-        try:
-            cached = try_to_load_from_cache(model, filename)
-        except Exception:
-            continue
-        if isinstance(cached, str) and bool(cached):
-            return True
-    return False

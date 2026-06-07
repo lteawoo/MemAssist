@@ -125,6 +125,7 @@ def default_embedding_profile_config() -> EmbeddingProfileConfig:
             quantization="int8",
             dimension=256,
             normalize=True,
+            cache_dir="models/local-default",
         ),
     }
     return EmbeddingProfileConfig(active="local-default", profiles=profiles)

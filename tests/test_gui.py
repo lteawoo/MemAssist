@@ -17,6 +17,9 @@ from memassist.project import detect_project
 from memassist.storage import Store
 
 
+os.environ.setdefault("MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL", "1")
+
+
 @contextmanager
 def isolated_env():
     with tempfile.TemporaryDirectory() as tmp:

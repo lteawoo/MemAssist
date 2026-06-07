@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Project-local memory RAG and trace helper for AI coding agents"
 requires-python = ">=3.10"
 dependencies = [
+    "huggingface-hub",
     "model2vec",
 ]
 

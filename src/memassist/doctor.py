@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from .integrations import status_tools
+from .embedding_profiles import EmbeddingProfileError, get_embedding_profile
+from .embeddings import embedding_model_status
 from .memory_judge import judge_backend_diagnostics
 from .paths import db_path, memassist_home
 from .project import Project
@@ -65,6 +67,24 @@ def run_doctor(project: Project) -> DoctorReport:
             detail=str(db_path()) if db_path().exists() else "No database exists yet; this is normal before first use.",
         )
     )
+    try:
+        profile = get_embedding_profile(None, mem_dir=root / ".memassist")
+        embedding = embedding_model_status(profile, mem_dir=root / ".memassist")
+        checks.append(
+            DoctorCheck(
+                name="embedding_model",
+                status="pass" if embedding.status in {"ok", "disabled"} else "warn",
+                detail=_embedding_detail(embedding.as_dict()),
+            )
+        )
+    except EmbeddingProfileError as exc:
+        checks.append(
+            DoctorCheck(
+                name="embedding_model",
+                status="warn",
+                detail=f"Embedding profile is not readable: {exc}",
+            )
+        )
 
     statuses = status_tools(project, tools=[], scope="project")
     installed_tools = [status.tool for status in statuses if status.installed]
@@ -108,3 +128,16 @@ def _path_check(name: str, path: Path, remediation: str) -> DoctorCheck:
     if path.exists():
         return DoctorCheck(name=name, status="pass", detail=str(path))
     return DoctorCheck(name=name, status="fail", detail=f"Missing {path}; {remediation}.")
+
+
+def _embedding_detail(value: dict[str, object]) -> str:
+    status = str(value.get("status") or "")
+    profile_id = str(value.get("profile_id") or "")
+    path = value.get("path")
+    detail = value.get("detail")
+    parts = [f"profile={profile_id}", f"status={status}"]
+    if isinstance(path, str) and path:
+        parts.append(f"path={path}")
+    if isinstance(detail, str) and detail:
+        parts.append(detail)
+    return "; ".join(parts)
