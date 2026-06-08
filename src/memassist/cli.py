@@ -69,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--mode", choices=["full", "context", "trace"], default="full")
     init.add_argument("--skip-embedding-install", action="store_true", help="do not prepare the active embedding model")
     init.add_argument("--force-embedding-install", action="store_true", help="re-download or refresh the active embedding model")
+    init.add_argument(
+        "--insecure-embedding-install",
+        action="store_true",
+        help="disable TLS certificate verification while downloading the embedding model (unsafe; for trusted proxies only)",
+    )
     init.set_defaults(func=cmd_init)
 
     status = sub.add_parser("status", help="show project and storage status")
@@ -247,6 +252,11 @@ def build_parser() -> argparse.ArgumentParser:
     emb_install = embedding_sub.add_parser("install", help="install the selected embedding model locally")
     emb_install.add_argument("--profile")
     emb_install.add_argument("--force", action="store_true")
+    emb_install.add_argument(
+        "--insecure",
+        action="store_true",
+        help="disable TLS certificate verification while downloading (unsafe; for trusted proxies only)",
+    )
     emb_install.add_argument("--json", action="store_true")
     emb_install.set_defaults(func=cmd_embedding_install)
     emb_cleanup = embedding_sub.add_parser("cleanup", help="remove derived embedding cache rows")
@@ -280,7 +290,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         store.upsert_project(project)
     print(f"Initialized memassist for {project.id}")
     if not args.skip_embedding_install and not _env_truthy("MEMASSIST_INIT_SKIP_EMBEDDING_INSTALL"):
-        if _install_active_embedding_for_init(mem_dir, force=args.force_embedding_install) != 0:
+        if _install_active_embedding_for_init(
+            mem_dir,
+            force=args.force_embedding_install,
+            insecure=args.insecure_embedding_install,
+        ) != 0:
             return 1
     tools = _tools_or_error(args.tools)
     if tools is None:
@@ -885,7 +899,13 @@ def cmd_embedding_install(args: argparse.Namespace) -> int:
     except EmbeddingProfileError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    result = install_embedding_model(profile, mem_dir=mem_dir, force=args.force)
+    if args.insecure:
+        print(
+            "warning: TLS certificate verification is disabled for this download; "
+            "downloaded model files are not protected against tampering",
+            file=sys.stderr,
+        )
+    result = install_embedding_model(profile, mem_dir=mem_dir, force=args.force, insecure=args.insecure)
     if args.json:
         _print_json(result.as_dict())
     else:
@@ -911,13 +931,19 @@ def cmd_embedding_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
-def _install_active_embedding_for_init(mem_dir: Path, *, force: bool) -> int:
+def _install_active_embedding_for_init(mem_dir: Path, *, force: bool, insecure: bool = False) -> int:
     try:
         profile = get_embedding_profile(None, mem_dir=mem_dir)
     except EmbeddingProfileError as exc:
         print(f"Embedding model: skipped ({exc})")
         return 1
-    result = install_embedding_model(profile, mem_dir=mem_dir, force=force)
+    if insecure:
+        print(
+            "warning: TLS certificate verification is disabled for this download; "
+            "downloaded model files are not protected against tampering",
+            file=sys.stderr,
+        )
+    result = install_embedding_model(profile, mem_dir=mem_dir, force=force, insecure=insecure)
     if result.status == "ok":
         location = f" at {result.path}" if result.path else ""
         print(f"Embedding model: installed{location}")

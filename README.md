@@ -202,6 +202,8 @@ memassist embedding install --profile local-default
 memassist embedding build --profile local-default
 ```
 
+> If a TLS-intercepting proxy blocks the download with a certificate error, you can disable verification with `memassist embedding install --insecure` (or `memassist init --insecure-embedding-install`). This exposes downloads to MITM tampering, so use it only in trusted environments — prefer pointing `REQUESTS_CA_BUNDLE` at your corporate CA instead of disabling verification.
+
 Set the active profile once, then normal memory retrieval uses it automatically.
 
 ## Storage

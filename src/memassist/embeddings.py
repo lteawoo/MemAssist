@@ -179,14 +179,69 @@ def install_embedding_model(
     *,
     mem_dir: Path,
     force: bool = False,
+    insecure: bool = False,
 ) -> EmbeddingModelInstallResult:
     if profile.disabled:
         return EmbeddingModelInstallResult(profile.id, "disabled", detail="vector retrieval is disabled for this profile")
     if profile.provider not in _PROVIDER_FACTORIES:
         return EmbeddingModelInstallResult(profile.id, "missing_dependency", detail=f"embedding provider is not registered: {profile.provider}")
+    if insecure:
+        _disable_download_tls_verification()
     if profile.provider == "model2vec":
         return _install_model2vec_model(profile, mem_dir=mem_dir, force=force)
     return EmbeddingModelInstallResult(profile.id, "unsupported", detail=f"embedding install is not supported for provider: {profile.provider}")
+
+
+def _disable_download_tls_verification() -> bool:
+    """Disable TLS certificate verification for huggingface_hub downloads.
+
+    Routes every huggingface_hub HTTP request through an HTTP client with
+    certificate verification turned off, covering both ``snapshot_download``
+    and the implicit ``from_pretrained`` downloads. Supports both backends:
+
+    - huggingface_hub >= 1.0 uses ``httpx`` (``set_client_factory``)
+    - older releases use ``requests`` (``configure_http_backend``)
+
+    Returns ``True`` if verification was successfully disabled. This exposes
+    downloads to MITM tampering and must only be used as an explicit opt-in
+    (e.g. behind a corporate TLS-intercepting proxy).
+    """
+    import warnings
+
+    # huggingface_hub >= 1.0: httpx-based backend.
+    try:
+        import httpx  # type: ignore[import-not-found]
+        from huggingface_hub import set_client_factory  # type: ignore[import-not-found]
+    except ImportError:
+        pass
+    else:
+        def _insecure_client() -> "httpx.Client":
+            return httpx.Client(verify=False, follow_redirects=True, trust_env=True)
+
+        set_client_factory(_insecure_client)
+        return True
+
+    # huggingface_hub < 1.0: requests-based backend.
+    try:
+        from huggingface_hub import configure_http_backend  # type: ignore[import-not-found]
+        import requests  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+
+    try:
+        from urllib3.exceptions import InsecureRequestWarning  # type: ignore[import-not-found]
+
+        warnings.simplefilter("ignore", InsecureRequestWarning)
+    except ImportError:
+        pass
+
+    def _insecure_backend() -> "requests.Session":
+        session = requests.Session()
+        session.verify = False
+        return session
+
+    configure_http_backend(backend_factory=_insecure_backend)
+    return True
 
 
 def memory_embedding_text(memory: Memory) -> str:

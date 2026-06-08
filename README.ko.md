@@ -201,6 +201,8 @@ memassist embedding install --profile local-default
 memassist embedding build --profile local-default
 ```
 
+> TLS 가로채기 프록시 등으로 다운로드가 인증서 오류로 막히면 `memassist embedding install --insecure`(또는 `memassist init --insecure-embedding-install`)로 검증을 끌 수 있습니다. MITM 변조 위험이 있으니 신뢰할 수 있는 환경에서만 쓰고, 가능하면 검증을 끄는 대신 `REQUESTS_CA_BUNDLE`로 사내 CA를 지정하세요.
+
 활성 profile을 한 번 정하면 일반 메모리 검색은 그 profile을 자동으로 사용합니다.
 
 ## 저장 위치
