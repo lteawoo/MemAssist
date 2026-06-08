@@ -29,18 +29,21 @@ from memassist.embeddings import (
     install_embedding_model,
     register_embedding_provider,
 )
-from memassist.hooks import codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
+from memassist.hooks import _python_hook_command, codex_hooks_status, install_codex_hooks, uninstall_codex_hooks
+from memassist.integrations.base import TurnSource
+from memassist.integrations.registry import extract_turn_source
 from memassist.memory_artifacts import find_memory_artifact
 from memassist.memory_judge import (
     INTERPRETER_ACTIVE_ENV,
     build_judge_payload,
+    extract_turn_end_memory_source,
     observe_turn_end_memory_source,
     pending_memory_source_events,
 )
 from memassist.models import MEMORY_STATUSES, Memory
 from memassist.project import detect_project, detect_project_for_init
 from memassist.retrieval import analyze_query_intent, build_memory_pack, render_prompt_context
-from memassist.source_ledger import load_source_records
+from memassist.source_ledger import append_source_record, load_source_records
 from memassist.storage import Store, now_iso
 from memassist.trace import extract_files
 
@@ -5080,6 +5083,102 @@ class JudgeDuplicateReinforceTest(unittest.TestCase):
                 self.assertEqual(old_memory.status, "archived")  # type: ignore[union-attr]
                 self.assertEqual(old_memory.superseded_by, memory_id)  # type: ignore[union-attr]
                 self.assertEqual(duplicate_memory.status, "active")  # type: ignore[union-attr]
+
+class AgentSourceExtractionTest(unittest.TestCase):
+    def _write_jsonl(self, lines: list[dict]) -> str:
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+        for obj in lines:
+            handle.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        handle.close()
+        self.addCleanup(lambda: os.unlink(handle.name))
+        return handle.name
+
+    def test_claude_transcript_source_extraction_succeeds(self) -> None:
+        # Regression guard: the Claude transcript shape must yield the latest user text.
+        path = self._write_jsonl(
+            [
+                {"type": "user", "message": {"role": "user", "content": "이전 발화"}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "답"}},
+                {"type": "user", "message": {"role": "user", "content": "리프레시 토큰 TTL은 14일"}},
+            ]
+        )
+        source = extract_turn_end_memory_source({"transcript_path": path}, session_id="s", agent="claude")
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertEqual(source.content, "리프레시 토큰 TTL은 14일")
+        self.assertEqual(source.source_kind, "transcript")
+
+    def test_claude_transcript_content_blocks_are_flattened(self) -> None:
+        path = self._write_jsonl(
+            [{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "블록 텍스트"}]}}]
+        )
+        source = extract_turn_end_memory_source({"transcript_path": path}, session_id="s", agent="claude")
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertEqual(source.content, "블록 텍스트")
+
+    def test_codex_transcript_extraction_equivalence(self) -> None:
+        path = self._write_jsonl([{"payload": {"message": {"role": "user", "content": "코덱스 발화"}}}])
+        source = extract_turn_end_memory_source({"transcript_path": path}, session_id="s", agent="codex")
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertEqual(source.content, "코덱스 발화")
+
+    def test_direct_payload_prompt_honored_regardless_of_agent(self) -> None:
+        for agent in ("claude", "codex", "opencode", None, "bogus"):
+            source = extract_turn_end_memory_source({"prompt": "직접 프롬프트"}, session_id="s", agent=agent)
+            self.assertIsNotNone(source, f"agent={agent}")
+            assert source is not None
+            self.assertEqual(source.content, "직접 프롬프트")
+            self.assertEqual(source.source_kind, "hook_payload")
+
+    def test_missing_or_unknown_agent_falls_back_to_compatible_extraction(self) -> None:
+        path = self._write_jsonl([{"type": "user", "message": {"role": "user", "content": "폴백 발화"}}])
+        for agent in (None, "bogus"):
+            source = extract_turn_end_memory_source({"transcript_path": path}, session_id="s", agent=agent)
+            self.assertIsNotNone(source, f"agent={agent}")
+            assert source is not None
+            self.assertEqual(source.content, "폴백 발화")
+
+    def test_unknown_agent_with_unparseable_payload_does_not_raise(self) -> None:
+        self.assertIsNone(extract_turn_end_memory_source({}, session_id="no-such-session", agent="bogus"))
+
+    def test_python_hook_command_includes_agent_identifier(self) -> None:
+        command = _python_hook_command("stop", mode="full", agent="claude")
+        self.assertIn("hook stop", command)
+        self.assertIn("--agent claude", command)
+
+    def test_source_ledger_records_agent_and_stays_compatible_without_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with_agent = append_source_record(
+                home, kind="transcript", text="a", session_id="s", project_id="p", source_ref="r1", agent="claude"
+            )
+            self.assertEqual(with_agent.agent, "claude")
+            self.assertIn("agent", with_agent.as_dict())
+            without_agent = append_source_record(
+                home, kind="transcript", text="b", session_id="s", project_id="p", source_ref="r2"
+            )
+            self.assertIsNone(without_agent.agent)
+            self.assertNotIn("agent", without_agent.as_dict())
+            records = {record.source_ref: record for record in load_source_records(home)}
+            self.assertEqual(records["r1"].agent, "claude")
+            self.assertIsNone(records["r2"].agent)
+
+    def test_init_tools_all_embeds_per_agent_identifier_in_hook_commands(self) -> None:
+        with isolated_env() as (_root, project, _home):
+            self.assertEqual(main(["init", "--tools", "all", "--skip-embedding-install"]), 0)
+            claude_settings = json.loads((project / ".claude" / "settings.json").read_text(encoding="utf-8"))
+            codex_hooks = json.loads((project / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+            opencode_plugin = (project / ".opencode" / "plugins" / "memassist.js").read_text(encoding="utf-8")
+            claude_cmds = _collect_hook_commands(claude_settings)
+            codex_cmds = _collect_hook_commands(codex_hooks)
+            self.assertTrue(claude_cmds)
+            self.assertTrue(all("--agent claude" in command for command in claude_cmds))
+            self.assertTrue(codex_cmds)
+            self.assertTrue(all("--agent codex" in command for command in codex_cmds))
+            self.assertIn("--agent opencode", opencode_plugin)
+
 
 if __name__ == "__main__":
     unittest.main()

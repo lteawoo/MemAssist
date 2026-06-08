@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from typing import Any
+
 from memassist.project import Project
 
-from .base import InstallResult, IntegrationStatus, ToolIntegration, ToolMode
+from .base import InstallResult, IntegrationStatus, ToolIntegration, ToolMode, TurnSource, payload_prompt
 from .claude import ClaudeIntegration
 from .codex import CodexIntegration
 from .opencode import OpenCodeIntegration
@@ -54,3 +56,25 @@ def repair_tools(project: Project, *, tools: list[str], mode: ToolMode, scope: s
 def status_tools(project: Project, *, tools: list[str], scope: str) -> list[IntegrationStatus]:
     selected = tools or list(SUPPORTED_TOOLS)
     return [_REGISTRY[tool].status(project, scope=scope) for tool in selected]
+
+
+def extract_turn_source(agent: str | None, payload: dict[str, Any], *, session_id: str) -> TurnSource | None:
+    """Dispatch turn-end source extraction to the calling agent's adapter.
+
+    Order: (1) a prompt carried directly in the payload (agent-independent),
+    (2) the adapter registered for ``agent`` when the identifier is known,
+    (3) a compatible fallback that tries every registered adapter when the
+    identifier is absent or unrecognized. Adding a new agent only requires
+    registering its adapter; this dispatch needs no per-agent branching.
+    """
+    direct = payload_prompt(payload)
+    if direct.strip():
+        return TurnSource(content=direct, source_ref="hook_payload", source_kind="hook_payload")
+    integration = _REGISTRY.get(agent) if agent else None
+    if integration is not None:
+        return integration.extract_turn_source(payload, session_id=session_id)
+    for candidate in _REGISTRY.values():
+        source = candidate.extract_turn_source(payload, session_id=session_id)
+        if source is not None:
+            return source
+    return None

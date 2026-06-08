@@ -3,11 +3,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from typing import Any
+
 from memassist.hooks import _is_memassist_group, _python_hook_command
 from memassist.paths import project_memassist_home
 from memassist.project import Project
 
-from .base import MODE_EVENTS, InstallResult, IntegrationStatus, ToolMode, lifecycle_capabilities
+from .base import (
+    MODE_EVENTS,
+    InstallResult,
+    IntegrationStatus,
+    ToolMode,
+    TurnSource,
+    content_text,
+    iter_transcript_objects,
+    lifecycle_capabilities,
+)
 
 CLAUDE_EVENT_TO_HOOK = {
     "UserPromptSubmit": "user-prompt-submit",
@@ -75,6 +86,28 @@ class ClaudeIntegration:
             lifecycle_capabilities(events, isolated_memory_judgment=bool(events)),
         )
 
+    def extract_turn_source(self, payload: dict[str, Any], *, session_id: str) -> TurnSource | None:
+        transcript_path = str(payload.get("transcript_path") or payload.get("transcriptPath") or "")
+        if not transcript_path:
+            return None
+        latest = ""
+        for obj in iter_transcript_objects(Path(transcript_path)):
+            text = _claude_user_text(obj)
+            if text:
+                latest = text
+        if not latest.strip():
+            return None
+        return TurnSource(content=latest, source_ref=transcript_path, source_kind="transcript")
+
+
+def _claude_user_text(obj: dict[str, Any]) -> str:
+    # Claude Code transcript line: {"type":"user","message":{"role":"user","content": str|list}}
+    message = obj.get("message")
+    is_user = obj.get("type") == "user" or (isinstance(message, dict) and message.get("role") == "user")
+    if is_user and isinstance(message, dict):
+        return content_text(message.get("content"))
+    return ""
+
 
 def _settings_path(project: Project, scope: str) -> Path:
     if scope == "project":
@@ -96,7 +129,7 @@ def _group(event: str, *, mode: ToolMode = "full", memassist_home: Path | None =
         "hooks": [
             {
                 "type": "command",
-                "command": _python_hook_command(hook_event, memassist_home=memassist_home, mode=mode),
+                "command": _python_hook_command(hook_event, memassist_home=memassist_home, mode=mode, agent="claude"),
                 "timeout": 30,
             }
         ]

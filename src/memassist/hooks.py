@@ -140,11 +140,19 @@ def _codex_memassist_hooks(*, mode: str = "full", memassist_home: Path | None = 
         for group in groups:
             for hook in group.get("hooks", []):
                 hook_event = str(hook["command"]).rsplit(" ", 1)[-1]
-                hook["command"] = _python_hook_command(hook_event, memassist_home=memassist_home, mode=mode)
+                hook["command"] = _python_hook_command(
+                    hook_event, memassist_home=memassist_home, mode=mode, agent="codex"
+                )
     return hooks
 
 
-def _python_hook_command(hook_event: str, *, memassist_home: Path | None = None, mode: str | None = None) -> str:
+def _python_hook_command(
+    hook_event: str,
+    *,
+    memassist_home: Path | None = None,
+    mode: str | None = None,
+    agent: str | None = None,
+) -> str:
     env: list[str] = []
     source_root = Path(__file__).resolve().parents[1]
     if (source_root / "memassist").exists():
@@ -156,6 +164,12 @@ def _python_hook_command(hook_event: str, *, memassist_home: Path | None = None,
         env.append(f"MEMASSIST_HOOK_MODE={shlex.quote(mode)}")
     prefix = " ".join(env)
     command = f"python3 -m memassist hook {hook_event}"
+    # The agent identifier is a positional CLI argument appended after the hook
+    # event, not part of the env prefix, so it behaves the same regardless of the
+    # shell that runs the command (broader POSIX/python3 shell compatibility of
+    # the env prefix is intentionally left to a separate change).
+    if agent:
+        command = f"{command} --agent {shlex.quote(agent)}"
     return f"{prefix} {command}" if prefix else command
 
 

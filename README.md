@@ -52,6 +52,14 @@ memassist init --tools all
 memassist tools status --json
 ```
 
+Each integration tags its hook commands with the calling agent (for example
+`--agent claude`). At turn end memassist uses that identifier to parse the
+agent's own transcript format and to record which agent produced each source in
+`sources.jsonl`, so source origin stays attributable when several tools are
+installed. If you installed memassist before this, re-run `memassist init
+--tools <...>` or `memassist tools repair <...>` to refresh existing hook
+commands; hooks without an identifier still work through a compatible fallback.
+
 ## Core Flow
 
 `memassist` has separate read and write paths.

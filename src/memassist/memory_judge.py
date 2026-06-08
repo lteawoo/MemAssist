@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 from .conflict_resolver import MemoryDraft, resolve_memory_conflicts
 from .integrations import status_tools
+from .integrations.base import TurnSource
+from .integrations.registry import extract_turn_source as _dispatch_turn_source
 from .models import MEMORY_TYPES
 from .project import Project
 from .source_ledger import append_source_record
@@ -94,11 +96,9 @@ class StoredJudgment:
     decision: str
 
 
-@dataclass(frozen=True)
-class TurnEndMemorySource:
-    content: str
-    source_ref: str
-    source_kind: str
+# Turn-end source type now lives in integrations.base so agent adapters can
+# produce it without importing memory_judge. Alias kept for internal references.
+TurnEndMemorySource = TurnSource
 
 
 class MemoryJudge(Protocol):
@@ -112,31 +112,15 @@ def extract_turn_end_memory_source(
     payload: dict[str, Any],
     *,
     session_id: str,
-) -> TurnEndMemorySource | None:
-    direct = _payload_prompt(payload)
-    if direct:
-        return TurnEndMemorySource(
-            content=direct,
-            source_ref="hook_payload",
-            source_kind="hook_payload",
-        )
-    transcript_path = str(payload.get("transcript_path") or payload.get("transcriptPath") or "")
-    if transcript_path:
-        transcript = _latest_user_prompt_from_transcript(Path(transcript_path))
-        if transcript:
-            return TurnEndMemorySource(
-                content=transcript,
-                source_ref=transcript_path,
-                source_kind="transcript",
-            )
-    history = _latest_user_prompt_from_codex_history(session_id)
-    if history:
-        return TurnEndMemorySource(
-            content=history,
-            source_ref=f"codex_history:{session_id}",
-            source_kind="codex_history",
-        )
-    return None
+    agent: str | None = None,
+) -> TurnSource | None:
+    """Extract the turn-end user source via the calling agent's adapter.
+
+    Dispatch order (direct payload prompt -> known agent adapter -> compatible
+    fallback) lives in ``integrations.registry`` so per-agent parsing stays in
+    the adapters and adding a new agent needs no change here.
+    """
+    return _dispatch_turn_source(agent, payload, session_id=session_id)
 
 
 def observe_turn_end_memory_source(
@@ -145,8 +129,9 @@ def observe_turn_end_memory_source(
     session_id: str,
     project_id: str,
     payload: dict[str, Any],
+    agent: str | None = None,
 ) -> MemorySourceEvent | None:
-    source = extract_turn_end_memory_source(payload, session_id=session_id)
+    source = extract_turn_end_memory_source(payload, session_id=session_id, agent=agent)
     if not source or not source.content.strip():
         return None
     source_record = append_source_record(
@@ -156,6 +141,7 @@ def observe_turn_end_memory_source(
         session_id=session_id,
         project_id=project_id,
         source_ref=source.source_ref,
+        agent=agent,
     )
     existing = _find_existing_source_event(
         store,
@@ -177,6 +163,7 @@ def observe_turn_end_memory_source(
             "content": source.content,
             "source_ref": source.source_ref,
             "source_kind": source.source_kind,
+            "agent": agent,
             "status": "pending",
         },
     )
@@ -841,93 +828,6 @@ def _event_input(event: dict[str, Any]) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
-
-
-def _payload_prompt(payload: dict[str, Any]) -> str:
-    for key in ("prompt", "message", "content", "user_prompt", "userPrompt"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-    return ""
-
-
-def _latest_user_prompt_from_transcript(path: Path) -> str:
-    if not path.exists():
-        return ""
-    latest = ""
-    try:
-        with path.open(encoding="utf-8", errors="replace") as file:
-            for line in file:
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                candidate = _user_text_from_transcript_obj(obj)
-                if candidate:
-                    latest = candidate
-    except OSError:
-        return ""
-    return latest
-
-
-def _user_text_from_transcript_obj(obj: object) -> str:
-    if not isinstance(obj, dict):
-        return ""
-    payload = obj.get("payload")
-    if isinstance(payload, dict):
-        if payload.get("type") == "user_message":
-            message = payload.get("message")
-            if isinstance(message, str):
-                return message
-        message = payload.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            text = _content_text(content)
-            if text:
-                return text
-    if obj.get("role") == "user":
-        text = _content_text(obj.get("content"))
-        if text:
-            return text
-    return ""
-
-
-def _content_text(content: object) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(parts)
-    return ""
-
-
-def _latest_user_prompt_from_codex_history(session_id: str) -> str:
-    if not session_id:
-        return ""
-    history_path = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "history.jsonl"
-    if not history_path.exists():
-        return ""
-    latest = ""
-    try:
-        with history_path.open(encoding="utf-8", errors="replace") as file:
-            for line in file:
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(obj, dict) or obj.get("session_id") != session_id:
-                    continue
-                text = obj.get("text")
-                if isinstance(text, str) and text.strip():
-                    latest = text
-    except OSError:
-        return ""
-    return latest
 
 
 def _session_trace_signals(store: Store, *, session_id: str) -> dict[str, object]:

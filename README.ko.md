@@ -51,6 +51,14 @@ memassist init --tools all
 memassist tools status --json
 ```
 
+각 통합은 hook 명령에 호출 에이전트 식별자를 함께 심습니다(예: `--agent
+claude`). 턴 종료 시 memassist는 이 식별자로 해당 에이전트의 transcript 형식을
+파싱하고, 어느 에이전트가 만든 source인지 `sources.jsonl`에 기록합니다. 따라서
+여러 도구를 동시에 설치해도 source 출처를 구분할 수 있습니다. 이전에 설치한
+경우 `memassist init --tools <...>` 또는 `memassist tools repair <...>`를 다시
+실행해 기존 hook 명령을 갱신하세요. 식별자가 없는 기존 hook도 호환 fallback으로
+계속 동작합니다.
+
 ## 핵심 흐름
 
 `memassist`는 읽기 경로와 쓰기 경로를 분리합니다.

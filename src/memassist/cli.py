@@ -27,7 +27,7 @@ from .embedding_profiles import (
     load_embedding_profile_config,
 )
 from .embeddings import build_memory_embeddings, install_embedding_model
-from .integrations import install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
+from .integrations import SUPPORTED_TOOLS, install_tools, normalize_tools, repair_tools, status_tools, uninstall_tools
 from .lesson import lesson_from_session
 from .lifecycle import cleanup_memories, process_session_lifecycle
 from .memory_judge import (
@@ -191,6 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     hook_sub = hook.add_subparsers(required=True)
     for name in ("pre-tool-use", "post-tool-use", "user-prompt-submit", "stop"):
         hook_cmd = hook_sub.add_parser(name)
+        hook_cmd.add_argument("--agent", default=None, help=argparse.SUPPRESS)
         hook_cmd.set_defaults(func=cmd_hook_event, hook_event=name)
 
     logs = sub.add_parser("logs", help="show recent trace events")
@@ -573,6 +574,12 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
     payload = _read_json_stdin()
     project = detect_project(Path(payload.get("cwd", os.getcwd())))
     session_id = str(payload.get("sessionId") or payload.get("session_id") or "unknown")
+    # The calling agent identifier comes from the installed hook command. Treat
+    # anything that is not a registered tool as unknown so the dispatcher falls
+    # back to compatible extraction instead of trusting an unrecognized name.
+    agent = getattr(args, "agent", None)
+    if agent not in SUPPORTED_TOOLS:
+        agent = None
     tool_name = str(payload.get("toolName") or payload.get("tool_name") or payload.get("tool") or "")
     tool_args = _coerce_tool_args(payload)
     with Store(project_memassist_home(project.root) / "memassist.db") as store:
@@ -628,6 +635,7 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
                 session_id=session_id,
                 project_id=project.id,
                 payload=payload,
+                agent=agent,
             )
             if sync_ingestion_enabled_for_hook():
                 # Debug/test mode: preserve the historical synchronous turn-end

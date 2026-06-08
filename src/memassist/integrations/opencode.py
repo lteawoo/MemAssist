@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from memassist.hooks import _python_hook_command
 from memassist.paths import project_memassist_home
 from memassist.project import Project
 
-from .base import MODE_EVENTS, InstallResult, IntegrationStatus, ToolMode, lifecycle_capabilities
+from .base import (
+    MODE_EVENTS,
+    InstallResult,
+    IntegrationStatus,
+    ToolMode,
+    TurnSource,
+    lifecycle_capabilities,
+)
 
 
 class OpenCodeIntegration:
@@ -55,6 +63,12 @@ class OpenCodeIntegration:
             lifecycle_capabilities(events, isolated_memory_judgment=False),
         )
 
+    def extract_turn_source(self, payload: dict[str, Any], *, session_id: str) -> TurnSource | None:
+        # The OpenCode plugin sends the prompt directly in the payload, which the
+        # dispatcher already handles before adapters are consulted. A transcript
+        # format adapter can be added here once OpenCode's shape is confirmed.
+        return None
+
 
 def _plugin_path(project: Project, scope: str) -> Path:
     if scope == "project":
@@ -67,7 +81,7 @@ def _plugin_path(project: Project, scope: str) -> Path:
 def _plugin_source(mode: ToolMode, *, memassist_home: Path | None = None) -> str:
     events = set(MODE_EVENTS[mode])
     command_by_event = {
-        event: _python_hook_command(hook_event, memassist_home=memassist_home, mode=mode)
+        event: _python_hook_command(hook_event, memassist_home=memassist_home, mode=mode, agent="opencode")
         for event, hook_event in {
             "UserPromptSubmit": "user-prompt-submit",
             "PreToolUse": "pre-tool-use",

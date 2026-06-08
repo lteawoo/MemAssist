@@ -19,9 +19,10 @@ class SourceRecord:
     text: str
     summary: str | None
     created_at: str
+    agent: str | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        data: dict[str, object] = {
             "id": self.id,
             "kind": self.kind,
             "session_id": self.session_id,
@@ -32,6 +33,11 @@ class SourceRecord:
             "summary": self.summary,
             "created_at": self.created_at,
         }
+        # Keep the agent key out of records with no known origin so legacy
+        # records and new identifier-free hooks serialize identically.
+        if self.agent is not None:
+            data["agent"] = self.agent
+        return data
 
 
 def source_ledger_path(memassist_dir: Path) -> Path:
@@ -55,6 +61,7 @@ def append_source_record(
     project_id: str | None,
     source_ref: str | None = None,
     summary: str | None = None,
+    agent: str | None = None,
 ) -> SourceRecord:
     full_text = text
     source_hash = hash_source(kind=kind, text=full_text, source_ref=source_ref)
@@ -71,6 +78,7 @@ def append_source_record(
         text=full_text,
         summary=summary,
         created_at=now_iso(),
+        agent=agent,
     )
     path = ensure_source_ledger(memassist_dir)
     with path.open("a", encoding="utf-8") as file:
@@ -138,6 +146,7 @@ def _record_from_dict(value: dict[str, Any]) -> SourceRecord | None:
         text=text,
         summary=_optional_str(value.get("summary")),
         created_at=created_at,
+        agent=_optional_str(value.get("agent")),
     )
 
 
