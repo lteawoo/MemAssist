@@ -55,6 +55,11 @@ from .trace import record_tool_event
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Hook JSON output must be UTF-8 regardless of the Windows locale codec
+    # (e.g. cp949); Claude Code decodes hook stdout as UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

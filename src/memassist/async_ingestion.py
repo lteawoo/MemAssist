@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from .embeddings import ensure_memory_chunk_embedding, ensure_memory_embedding, selected_embedding_profile
 from .lifecycle import process_session_lifecycle
 from .memory_judge import pending_memory_source_events, process_memory_intent_event
 from .paths import project_memassist_home
@@ -321,6 +322,26 @@ def run_async_ingestion_once(
             )
             for lifecycle_session_id in lifecycle_session_ids:
                 lifecycle = process_session_lifecycle(store, session_id=lifecycle_session_id, project_id=project.id)
+        if result.stored_memory_ids:
+            try:
+                profile = selected_embedding_profile(store=store)
+                if not profile.disabled:
+                    for memory_id in result.stored_memory_ids:
+                        memory = store.get_memory(memory_id)
+                        if memory is None:
+                            continue
+                        ensure_memory_embedding(store, memory, profile=profile)
+                        chunks = store.list_memory_chunks(
+                            project_id=memory.project_id,
+                            include_global=True,
+                            status="active",
+                        )
+                        for chunk in chunks:
+                            if chunk.memory_id != memory_id:
+                                continue
+                            ensure_memory_chunk_embedding(store, chunk, profile=profile)
+            except Exception:
+                pass  # embedding failures must never break ingestion
         final = AsyncIngestionResult(
             skipped=result.skipped,
             skip_reason=result.skip_reason,

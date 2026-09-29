@@ -120,10 +120,12 @@ class EmbeddingProvider(Protocol):
 
 ProviderFactory = Callable[[EmbeddingProfile], EmbeddingProvider]
 _PROVIDER_FACTORIES: dict[str, ProviderFactory] = {}
+_PROVIDER_CACHE: dict[tuple[str, int, str, str, bool], EmbeddingProvider] = {}
 
 
 def register_embedding_provider(name: str, factory: ProviderFactory) -> None:
     _PROVIDER_FACTORIES[name] = factory
+    _PROVIDER_CACHE.clear()
 
 
 def provider_names() -> list[str]:
@@ -146,7 +148,13 @@ def instantiate_embedding_provider(
     factory = _PROVIDER_FACTORIES.get(profile.provider)
     if not factory:
         raise EmbeddingMissingDependencyError(f"embedding provider is not registered: {profile.provider}")
-    return factory(_runtime_profile(profile, mem_dir=mem_dir, local_only=local_only))
+    # Model loading dominates embedding cost, so reuse providers within the process.
+    cache_key = (profile.provider, id(factory), profile.fingerprint, str(mem_dir or ""), local_only)
+    provider = _PROVIDER_CACHE.get(cache_key)
+    if provider is None:
+        provider = factory(_runtime_profile(profile, mem_dir=mem_dir, local_only=local_only))
+        _PROVIDER_CACHE[cache_key] = provider
+    return provider
 
 
 def embedding_model_install_path(profile: EmbeddingProfile, *, mem_dir: Path) -> Path | None:
